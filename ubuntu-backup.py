@@ -3699,7 +3699,7 @@ def run_tray():
                 message = "Backup cancelled: " + drive_cache["error"]
                 _write_status("cancelled", "cancelled", message)
                 _status_history("cancelled", message)
-            GLib.idle_add(lambda: (show_drive_chooser(), False)[1])
+            GLib.idle_add(lambda: (show_drive_chooser(then_backup=True), False)[1])
             return
         process = launch_terminal("backup-now")
         if process is None:
@@ -3780,7 +3780,7 @@ def run_tray():
             _write_status("failed", "purge", "Purge failed: " + str(exc))
             _status_history("failed", "purge failed: " + str(exc))
 
-    def show_drive_chooser(_item=None):
+    def show_drive_chooser(_item=None, then_backup=False):
         options = []
         for device in attached_drives():
             for mountpoint in device.get("mountpoints", []):
@@ -3823,6 +3823,8 @@ def run_tray():
                 drive_cache["at"] = 0
                 if current_status().get("state") != "running":
                     _write_status("idle", "drive", "Backup drive selected: " + selected)
+                if then_backup:
+                    GLib.idle_add(lambda: (backup_action(), False)[1])
             else:
                 return
         except Exception as exc:
