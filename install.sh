@@ -47,20 +47,27 @@ rm -f "$SYSTEMD/ubuntu-backup-tray.service"
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
 if [[ "${UBUNTU_BACKUP_SKIP_START:-0}" != 1 ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
-    python3 - "$BIN" <<'PY'
-import os, signal, sys
+    python3 - "$BIN/ubuntu-backup.py" <<'PY'
+import os, signal, sys, time
 target = os.path.realpath(sys.argv[1])
+pids = []
 for entry in os.listdir('/proc'):
     if not entry.isdigit():
         continue
     try:
         args = open(f'/proc/{entry}/cmdline', 'rb').read().split(b'\0')
         if target.encode() in args and b'tray' in args:
+            pids.append(int(entry))
             os.kill(int(entry), signal.SIGTERM)
     except (OSError, ValueError):
         pass
+for pid in pids:
+    for _ in range(40):
+        if not os.path.exists(f'/proc/{pid}'):
+            break
+        time.sleep(0.05)
 PY
-    setsid "$BIN" --workspace "$WORKSPACE" tray >/dev/null 2>&1 &
+    setsid --fork "$BIN/ubuntu-backup.py" --workspace "$WORKSPACE" tray >/dev/null 2>&1
     echo "Ubuntu Backup installed and started."
 else
     echo "Ubuntu Backup installed; start the tray with ./refresh after logging in."
