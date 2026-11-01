@@ -1779,6 +1779,7 @@ def backup_everything():
     """Single flow: privileged configuration, configuration backup, full /home."""
     global _STATUS_RUN
     _STATUS_RUN = True
+    _diagnose_previous_status()
     _write_status("running", "preparing", "Preparing backup")
     _ensure_tray()
     try:
@@ -2683,6 +2684,59 @@ def _status_history(state, message, result=None):
         pass
 
 
+VALID_STATUS_STATES = {"idle", "running", "complete", "failed", "cancelled"}
+
+
+def _read_status():
+    try:
+        return json.loads(_status_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _live_backup_pid(pid):
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        args = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        return False
+    return any(b"ubuntu-backup" in arg or b"ubuntu-configuration" in arg for arg in args) and b"tray" not in args
+
+
+def _status_problem(data):
+    if not isinstance(data, dict):
+        return "status record is not an object"
+    state = data.get("state")
+    if state not in VALID_STATUS_STATES:
+        return f"unknown state {state!r}"
+    updated = data.get("updated")
+    if not isinstance(updated, str) or not updated:
+        return "missing updated timestamp"
+    try:
+        dt.datetime.fromisoformat(updated.replace("Z", "+00:00"))
+    except ValueError:
+        return "invalid updated timestamp"
+    if state == "running":
+        pid = data.get("pid")
+        if not isinstance(pid, int):
+            return "running status has no process id"
+        if pid == os.getpid():
+            return "running status points to this process"
+        if not _live_backup_pid(pid):
+            return f"recorded process {pid} is not active"
+    return None
+
+
+def _diagnose_previous_status():
+    data = _read_status()
+    problem = _status_problem(data) if data else None
+    if problem:
+        _status_history("inconsistent", "state=" + str(data.get("state")) +
+                        " pid=" + str(data.get("pid")) + " updated=" + str(data.get("updated")) +
+                        " reason=" + problem)
+
+
 def _ensure_tray():
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return
@@ -3210,24 +3264,28 @@ def run_tray():
 
     stale_marks = set()
 
-    def live_backup(pid):
-        if not isinstance(pid, int) or pid <= 1:
-            return False
-        try:
-            args = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-        except OSError:
-            return False
-        return any(b"ubuntu-backup" in arg or b"ubuntu-configuration" in arg for arg in args) and b"tray" not in args
-
     def current_status():
         data = read_status()
-        if data.get("state") == "running" and not live_backup(data.get("pid")):
-            key = (data.get("pid"), data.get("updated"))
+        problem = _status_problem(data) if data else None
+        if problem:
+            key = (data.get("state"), data.get("pid"), data.get("updated"), problem)
             if key not in stale_marks:
                 stale_marks.add(key)
-                _write_status("cancelled", "cancelled", "Backup cancelled: previous process is no longer running")
-                _status_history("cancelled", "Backup cancelled: previous process is no longer running")
-            return {"state": "cancelled", "phase": "cancelled", "message": "Backup cancelled: previous process is no longer running"}
+                if data.get("state") == "running":
+                    _write_status("cancelled", "cancelled", "Stale running backup: " + problem,
+                                  diagnostic=problem, previous_pid=data.get("pid"),
+                                  previous_updated=data.get("updated"))
+                    _status_history("stale", "state=running pid=" + str(data.get("pid")) +
+                                    " updated=" + str(data.get("updated")) + " reason=" + problem)
+                else:
+                    _write_status("failed", "inconsistent", "Inconsistent backup state: " + problem,
+                                  diagnostic=problem)
+                    _status_history("inconsistent", "state=" + str(data.get("state")) +
+                                    " pid=" + str(data.get("pid")) + " updated=" + str(data.get("updated")) +
+                                    " reason=" + problem)
+            return {"state": "cancelled" if data.get("state") == "running" else "failed",
+                    "phase": "cancelled" if data.get("state") == "running" else "inconsistent",
+                    "message": problem}
         return data
 
     status_item = Gtk.MenuItem(label="Idle")
