@@ -3727,53 +3727,109 @@ def run_tray():
         data = current_status()
         if data.get("state") == "running":
             raise ConfigError("Cancel the active backup before purging data.")
-        try:
-            external = settings().get("external_backup")
-        except (OSError, ValueError):
-            external = None
-        script = SCRIPT_PATH.resolve()
-        for entry in list(KIT.iterdir()):
-            if entry.resolve() == script or script.parent == entry:
-                continue
-            if entry.name == ".tray.lock":
-                continue
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink(missing_ok=True)
-        write_json(KIT / "config/settings.json", json.loads(json.dumps(EMBEDDED_DEFAULT_SETTINGS)))
-        if isinstance(external, dict) and external.get("mount_point"):
-            mount = Path(external["mount_point"])
-            marker = mount / (external.get("subdirectory") or "") / ".ubuntu-configuration-target.json"
+        config = settings()
+        external = config.get("external_backup")
+        if external and (not isinstance(external, dict) or not external.get("mount_point")):
+            raise ConfigError("Saved backup drive settings are incomplete; nothing was purged.")
+        external_dir = None
+        if external:
             try:
-                marker_value = json.loads(marker.read_text())
-            except (OSError, ValueError):
-                marker_value = {}
-            if marker_value.get("format") == "ubuntu-configuration-v1":
-                root = marker.parent
+                external_dir = external_directory(config)
+                if external_dir.is_symlink():
+                    raise ConfigError("Refusing symlinked external backup directory.")
+                marker_value = json.loads((external_dir / ".ubuntu-configuration-target.json").read_text())
+            except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+                raise ConfigError("External backup drive is unavailable; nothing was purged. "
+                                  "Forget the drive first to purge local data only. " + str(exc)) from None
+            if marker_value.get("format") != FORMAT or marker_value.get("id") != external.get("marker_id"):
+                raise ConfigError("External backup drive marker does not match; nothing was purged.")
+        lock_fd = None
+        try:
+            lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise ConfigError("A backup is active; cancel it before purging data.") from None
+            if external_dir is not None:
                 for name in ("baseline", "timeline", "ubuntu-configuration-backups"):
-                    shutil.rmtree(root / name, ignore_errors=True)
-                marker.unlink(missing_ok=True)
-        _write_status("idle", "idle", "All backup data purged")
+                    target = external_dir / name
+                    if target.is_symlink():
+                        raise ConfigError("Refusing to purge symlinked external data: " + str(target))
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    elif target.exists():
+                        target.unlink()
+                (external_dir / ".ubuntu-configuration-target.json").unlink(missing_ok=True)
+            script = SCRIPT_PATH.resolve()
+            for entry in list(KIT.iterdir()):
+                if entry.name in (".tray.lock", ".backup.lock", "config", "status.json"):
+                    continue
+                if entry.resolve() == script or script.parent == entry:
+                    continue
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink(missing_ok=True)
+            config_dir = KIT / "config"
+            if config_dir.is_symlink() or config_dir.is_file():
+                config_dir.unlink()
+            elif config_dir.is_dir():
+                shutil.rmtree(config_dir)
+            status_path = KIT / "status.json"
+            if status_path.is_symlink() or status_path.is_file():
+                status_path.unlink()
+            elif status_path.is_dir():
+                shutil.rmtree(status_path)
+            write_json(KIT / "config/settings.json", json.loads(json.dumps(EMBEDDED_DEFAULT_SETTINGS)))
+            _write_status("idle", "idle", "All backup data purged")
+            _status_history("idle", "all backup data purged")
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
         return True
 
-    purge_state = {"armed": False, "timer": None}
-
-    def reset_purge():
-        purge_state["armed"] = False
-        purge_item.set_label("Purge all data")
-        purge_state["timer"] = None
-        return False
-
-    def purge_action(_item=None):
-        if not purge_state["armed"]:
-            purge_state["armed"] = True
-            purge_item.set_label("Confirm purge all data")
-            if purge_state["timer"] is not None:
-                GLib.source_remove(purge_state["timer"])
-            purge_state["timer"] = GLib.timeout_add_seconds(5, reset_purge)
+    def show_purge_dialog(_item=None):
+        try:
+            config = settings()
+        except (OSError, ValueError, KeyError) as exc:
+            _write_status("failed", "purge", "Cannot read settings: " + str(exc))
             return
-        reset_purge()
+        external = config.get("external_backup")
+        external_text = "No external backup drive is configured."
+        if external:
+            try:
+                directory = external_directory(config)
+            except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+                external_text = (f"External drive {external.get('mount_point')} is unavailable. "
+                                 "Purge would stop before deleting anything; forget the drive first "
+                                 "to purge local data only.")
+            else:
+                external_text = f"External backup data on {directory} will also be deleted."
+        dialog = Gtk.Dialog(title="Purge all backup data", flags=0)
+        dialog.set_modal(True)
+        dialog.set_keep_above(True)
+        dialog.set_position(Gtk.WindowPosition.CENTER)
+        dialog.set_resizable(False)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        purge_button = dialog.add_button("Purge all data", 1)
+        purge_button.get_style_context().add_class("destructive-action")
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        box = dialog.get_content_area()
+        box.set_border_width(12)
+        box.set_spacing(8)
+        for text in (
+            "This permanently deletes local snapshots, backups, history, logs, and settings.",
+            external_text,
+            "The drive itself is not formatted. This cannot be undone.",
+        ):
+            label = Gtk.Label(label=text, xalign=0, wrap=True)
+            label.set_max_width_chars(72)
+            box.add(label)
+        box.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if response != 1:
+            return
         try:
             purge_all_data()
         except Exception as exc:
@@ -3921,7 +3977,7 @@ def run_tray():
 
     backup_item.connect("activate", backup_action)
     drive_option.connect("activate", show_drive_chooser)
-    purge_item.connect("activate", purge_action)
+    purge_item.connect("activate", show_purge_dialog)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
 
