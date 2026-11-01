@@ -3564,7 +3564,10 @@ def run_tray():
             body = "No history yet."
         if body != last_history:
             last_history = body
-            history_view.get_buffer().set_text(body)
+            buffer = history_view.get_buffer()
+            buffer.set_text(body)
+            buffer.place_cursor(buffer.get_end_iter())
+            history_view.scroll_to_mark(buffer.get_insert(), 0.0, True, 0.0, 1.0)
         return True
 
     def show_status(_item=None):
@@ -3596,10 +3599,13 @@ def run_tray():
             scroll.add(history_view)
             history_window.add(scroll)
             last_history = None
-            update_history()
             GLib.timeout_add(1000, update_history)
         history_window.show_all()
         history_window.present()
+        update_history()
+        buffer = history_view.get_buffer()
+        buffer.place_cursor(buffer.get_end_iter())
+        history_view.scroll_to_mark(buffer.get_insert(), 0.0, True, 0.0, 1.0)
 
     def launch_terminal(action):
         import shlex
