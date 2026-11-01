@@ -1891,9 +1891,8 @@ def interactive_backup():
             print("Using previously approved backup drive: " + str(directory))
             return backup()
     else:
-        print("No external backup drive is selected.")
-    selected = wizard_drive()
-    return backup(skip_external=not selected)
+        print("No backup drive is selected. Select one from the tray or menu first; backup cancelled.")
+        return None
 
 
 def backup_everything():
@@ -1907,10 +1906,22 @@ def backup_everything():
     _write_status("running", "preparing", "Preparing backup")
     _ensure_tray()
     try:
+        if not settings().get("external_backup"):
+            message = "Backup cancelled: no backup drive selected."
+            _write_status("cancelled", "cancelled", message)
+            _status_history("cancelled", message)
+            print(message)
+            return None
         _write_status("running", "privileged", "Capturing system-wide configuration")
         capture_root(hide_followup_hint=True)
         _write_status("running", "configuration", "Capturing configuration")
         path = interactive_backup()
+        if path is None:
+            message = "Backup cancelled: no backup drive selected."
+            _write_status("cancelled", "cancelled", message)
+            _status_history("cancelled", message)
+            print(message)
+            return None
         _write_status("running", "full_home", "Capturing full /home")
         print("Starting full /home capture.")
         home_done = wizard_home_backup()
