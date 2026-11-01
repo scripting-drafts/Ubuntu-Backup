@@ -3899,7 +3899,12 @@ def run_tray():
             icon.set_visible(True)
             provider = ("statusicon", icon, None)
 
+    last_icon = [None]
+
     def set_icon(name):
+        if name == last_icon[0]:
+            return
+        last_icon[0] = name
         if provider[0] == "gi-indicator":
             provider[1].set_icon_full(name, "Ubuntu Backup")
         elif provider[0] == "indicator":
