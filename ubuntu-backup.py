@@ -953,6 +953,22 @@ def pinned_external(config):
         os.close(fd)
 
 
+def validate_external_target(external):
+    """Reject source filesystems and non-POSIX/writable backup targets."""
+    with pinned_external({"external_backup": external}) as (root, directory):
+        probe = Path(tempfile.mkdtemp(prefix=".backup-probe-", dir=root))
+        try:
+            source = probe / "file"
+            source.write_text("probe", encoding="utf-8")
+            link = probe / "link"
+            link.symlink_to(source.name)
+            if link.read_text(encoding="utf-8") != "probe":
+                raise ConfigError("Backup drive cannot create valid symlinks.")
+        finally:
+            shutil.rmtree(probe, ignore_errors=True)
+    return directory
+
+
 def copy_external_snapshot(snapshot, config):
     """Publish a dated external configuration timeline with one shared baseline."""
     with pinned_external(config) as (root, directory):
@@ -1010,6 +1026,10 @@ def set_external(mount_point, disable=False):
             raise ConfigError("Supply the mount point of the drive AFTER you prepare and mount it.")
         mount = Path(mount_point).expanduser().resolve()
         information = mount_info(mount)
+        if information["fstype"] in ("vfat", "ntfs", "exfat", "msdos"):
+            raise ConfigError("Backup drive must use a POSIX filesystem with symlink support.")
+        if mount.stat().st_dev in (HOME.stat().st_dev, Path("/").stat().st_dev):
+            raise ConfigError("Backup drive must be on a different filesystem from home and the OS.")
         subdirectory = ""
         directory = mount
         marker = directory / ".ubuntu-configuration-target.json"
@@ -1028,9 +1048,17 @@ def set_external(mount_point, disable=False):
             marker_id = existing["id"]
         else:
             marker_id = str(uuid.uuid4())
+        marker_existed = marker.exists()
         write_json(marker, {"format": FORMAT, "id": marker_id})
-        config["external_backup"] = {"mount_point": str(mount), "filesystem_uuid": information["uuid"],
-                                     "subdirectory": subdirectory, "marker_id": marker_id}
+        external = {"mount_point": str(mount), "filesystem_uuid": information["uuid"],
+                    "subdirectory": subdirectory, "marker_id": marker_id}
+        try:
+            validate_external_target(external)
+        except Exception:
+            if not marker_existed:
+                marker.unlink(missing_ok=True)
+            raise
+        config["external_backup"] = external
     write_json(KIT / "config/settings.json", config)
     print("External backup disabled; existing drive data was not removed." if disable else
           "Backup drive configured at its root. No disk was formatted; the next backup will also copy there.")
@@ -1915,7 +1943,7 @@ def backup_everything():
             print(message)
             return None
         try:
-            external_directory(settings())
+            validate_external_target(settings()["external_backup"])
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             message = f"Backup cancelled: selected drive unavailable: {exc}"
             _write_status("cancelled", "cancelled", message)
@@ -3592,14 +3620,14 @@ def run_tray():
     def drive_ready():
         import time
         now = time.monotonic()
-        if now - drive_cache["at"] < 5:
+        if now - drive_cache["at"] < 30:
             return drive_cache["ready"]
         try:
             if not settings().get("external_backup"):
                 ready = False
             else:
-                directory = external_directory(settings())
-                ready = os.access(directory, os.W_OK)
+                validate_external_target(settings()["external_backup"])
+                ready = True
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
             ready = False
         drive_cache.update(at=now, ready=ready)
@@ -3621,9 +3649,7 @@ def run_tray():
         try:
             if not settings().get("external_backup"):
                 raise ConfigError("No backup drive selected.")
-            directory = external_directory(settings())
-            if not os.access(directory, os.W_OK):
-                raise ConfigError("Backup drive is not writable.")
+            validate_external_target(settings()["external_backup"])
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             message = "Backup cancelled: " + str(exc)
             _write_status("cancelled", "cancelled", message)
