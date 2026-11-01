@@ -1905,9 +1905,8 @@ def backup_everything():
     _write_status("running", "preparing", "Preparing backup")
     _ensure_tray()
     try:
-        if confirm("Refresh system-wide configuration with sudo before backing up?"):
-            _write_status("running", "privileged", "Capturing system-wide configuration")
-            capture_root(hide_followup_hint=True)
+        _write_status("running", "privileged", "Capturing system-wide configuration")
+        capture_root(hide_followup_hint=True)
         _write_status("running", "configuration", "Capturing configuration")
         path = interactive_backup()
         _write_status("running", "full_home", "Capturing full /home")
