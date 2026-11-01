@@ -3475,11 +3475,10 @@ def run_tray():
     backup_item = Gtk.MenuItem(label="Run backup now")
     drive_item = Gtk.MenuItem(label="Choose backup drive")
     live_item = Gtk.MenuItem(label="Live status")
-    history_item = Gtk.MenuItem(label="History")
     options_item = Gtk.MenuItem(label="Options")
     quit_item = Gtk.MenuItem(label="Quit icon")
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, history_item, options_item, Gtk.SeparatorMenuItem(), quit_item):
+    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, options_item, Gtk.SeparatorMenuItem(), quit_item):
         menu.append(item)
     menu.show_all()
 
@@ -3520,25 +3519,6 @@ def run_tray():
             window.add(box)
             refresh_source = GLib.timeout_add(500, update_window)
         window.show_all()
-
-    def show_history(_item=None):
-        data = current_status()
-        body = ""
-        try:
-            body = _history_path().read_text()
-        except OSError:
-            body = "No history yet."
-        dialog = Gtk.Dialog(title="Ubuntu Backup — history", flags=0)
-        dialog.set_default_size(780, 420)
-        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
-        view = Gtk.TextView(editable=False, monospace=True)
-        view.get_buffer().set_text(body)
-        scroll = Gtk.ScrolledWindow()
-        scroll.add(view)
-        dialog.get_content_area().add(scroll)
-        dialog.show_all()
-        dialog.run()
-        dialog.destroy()
 
     def launch_terminal(action):
         import shlex
@@ -3694,7 +3674,6 @@ def run_tray():
     backup_item.connect("activate", launch_backup)
     drive_item.connect("activate", show_drive_chooser)
     live_item.connect("activate", show_status)
-    history_item.connect("activate", show_history)
     options_item.connect("activate", show_options)
 
     provider = None
