@@ -3208,6 +3208,28 @@ def run_tray():
         except (OSError, ValueError):
             return {"state": "idle", "phase": "idle", "message": "No backup running"}
 
+    stale_marks = set()
+
+    def live_backup(pid):
+        if not isinstance(pid, int) or pid <= 1:
+            return False
+        try:
+            args = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            return False
+        return any(b"ubuntu-backup" in arg or b"ubuntu-configuration" in arg for arg in args) and b"tray" not in args
+
+    def current_status():
+        data = read_status()
+        if data.get("state") == "running" and not live_backup(data.get("pid")):
+            key = (data.get("pid"), data.get("updated"))
+            if key not in stale_marks:
+                stale_marks.add(key)
+                _write_status("cancelled", "cancelled", "Backup cancelled: previous process is no longer running")
+                _status_history("cancelled", "Backup cancelled: previous process is no longer running")
+            return {"state": "cancelled", "phase": "cancelled", "message": "Backup cancelled: previous process is no longer running"}
+        return data
+
     status_item = Gtk.MenuItem(label="Idle")
     status_item.set_sensitive(False)
     backup_item = Gtk.MenuItem(label="Run backup now")
@@ -3228,7 +3250,7 @@ def run_tray():
     def update_window():
         if window is None or not window.get_visible():
             return True
-        data = read_status()
+        data = current_status()
         progress.pulse()
         text.set_text(f"State: {data.get('state', 'idle')}\n"
                       f"Phase: {data.get('phase', '')}\n"
@@ -3254,7 +3276,7 @@ def run_tray():
         window.show_all()
 
     def show_history(_item=None):
-        data = read_status()
+        data = current_status()
         body = ""
         try:
             body = _history_path().read_text()
@@ -3341,11 +3363,11 @@ def run_tray():
         try:
             if response == 2:
                 set_external(None, True)
-                if read_status().get("state") != "running":
+                if current_status().get("state") != "running":
                     _write_status("idle", "drive", "Backup drive forgotten")
             elif response == Gtk.ResponseType.OK and selected:
                 set_external(selected)
-                if read_status().get("state") != "running":
+                if current_status().get("state") != "running":
                     _write_status("idle", "drive", "Backup drive selected: " + selected)
             else:
                 return
@@ -3401,7 +3423,7 @@ def run_tray():
     toggle = [False]
 
     def refresh():
-        data = read_status()
+        data = current_status()
         running = data.get("state") == "running"
         label = data.get("message") or data.get("state", "idle")
         status_item.set_label(label[:90])
