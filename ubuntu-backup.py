@@ -1973,6 +1973,8 @@ def main():
         print("Personal configuration data is bundled in this file; it is NOT encrypted.")
         workspace = Path(ask("Private workspace folder", str(workspace)))
     private_workspace(workspace)
+    if command != "tray":
+        _setup_logging()
     if command == "menu":
         menu()
     elif command == "backup":
@@ -2685,6 +2687,69 @@ def _status_history(state, message, result=None):
         with _history_path().open("a") as stream:
             stream.write(line + "\n")
         _history_path().chmod(0o600)
+    except OSError:
+        pass
+
+
+LOG_SEGMENT_BYTES = 256 * 1024 * 1024
+LOG_SEGMENTS = 4
+
+
+class RotatingLog:
+    def __init__(self, path, segment_bytes=LOG_SEGMENT_BYTES, segments=LOG_SEGMENTS):
+        self.path = Path(path)
+        self.segment_bytes = segment_bytes
+        self.segments = segments
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.path.parent.chmod(0o700)
+
+    def _rotate(self):
+        for number in range(self.segments - 1, 0, -1):
+            source = self.path.with_name(self.path.name + "." + str(number))
+            target = self.path.with_name(self.path.name + "." + str(number + 1))
+            if source.exists():
+                os.replace(source, target)
+        oldest = self.path.with_name(self.path.name + "." + str(self.segments))
+        oldest.unlink(missing_ok=True)
+        if self.path.exists():
+            os.replace(self.path, self.path.with_name(self.path.name + ".1"))
+
+    def write(self, text):
+        data = text.encode("utf-8", "replace")
+        try:
+            if self.path.exists() and self.path.stat().st_size + len(data) > self.segment_bytes:
+                self._rotate()
+            with self.path.open("ab") as stream:
+                stream.write(data)
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+
+    def flush(self):
+        pass
+
+
+class Tee:
+    def __init__(self, stream, log):
+        self.stream = stream
+        self.log = log
+
+    def write(self, text):
+        self.log.write(text)
+        return self.stream.write(text)
+
+    def flush(self):
+        self.stream.flush()
+
+    def isatty(self):
+        return getattr(self.stream, "isatty", lambda: False)()
+
+
+def _setup_logging():
+    try:
+        log = RotatingLog(KIT / "logs" / "ubuntu-backup.log")
+        sys.stdout = Tee(sys.stdout, log)
+        sys.stderr = Tee(sys.stderr, log)
     except OSError:
         pass
 
