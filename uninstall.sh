@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Purge the Ubuntu Backup program and runtime traces; preserve every backup file.
+# Remove the Ubuntu Backup program; backups and runtime traces are preserved unless purged.
 set -Eeuo pipefail
 DRY=0
 YES=0
+PURGE_BACKUPS=0
 for argument in "$@"; do
     case "$argument" in
         --dry-run) DRY=1 ;;
         --yes) YES=1 ;;
-        *) echo "Usage: ./uninstall.sh [--dry-run] [--yes]" >&2; exit 2 ;;
+        --purge-backups) PURGE_BACKUPS=1 ;;
+        *) echo "Usage: ./uninstall.sh [--dry-run] [--yes] [--purge-backups]" >&2; exit 2 ;;
     esac
 done
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}"
@@ -29,13 +31,20 @@ echo "Workspaces preserved (backups and runtime traces):"
 for path in "${WORKSPACES[@]}"; do
     [[ -d "$path" ]] && echo "  $path"
 done
+if (( PURGE_BACKUPS )); then
+    echo "Backup data will also be purged: local backups/snapshots/profiles and configured external timelines."
+fi
 if (( DRY )); then
     echo "Dry run only; nothing removed."
     exit 0
 fi
 if (( ! YES )); then
-    read -r -p "Type PURGE PROGRAM to remove program files and keep backups: " answer
+    read -r -p "Type PURGE PROGRAM to remove program files: " answer
     [[ "$answer" == "PURGE PROGRAM" ]] || { echo "Cancelled."; exit 1; }
+fi
+if (( PURGE_BACKUPS )); then
+    read -r -p "Type PURGE ALL BACKUPS to permanently delete backup data: " backup_answer
+    [[ "$backup_answer" == "PURGE ALL BACKUPS" ]] || { echo "Cancelled; backups preserved."; exit 1; }
 fi
 python3 - "$BIN/ubuntu-backup.py" <<'PY'
 import os, signal, sys
@@ -56,8 +65,38 @@ fi
 for path in "${FILES[@]}"; do
     [[ -e "$path" || -L "$path" ]] && rm -rf -- "$path"
 done
-# Workspace backups, status, history, configuration and other runtime traces are preserved.
-# External backup layouts are intentionally left untouched.
+if (( PURGE_BACKUPS )); then
+    python3 - "${WORKSPACES[@]}" <<'PY'
+import json, shutil, sys
+from pathlib import Path
+for workspace in map(Path, sys.argv[1:]):
+    for name in ("backups", "snapshot", ".previous-snapshot", "profiles", "privileged-system"):
+        shutil.rmtree(workspace / name, ignore_errors=True)
+    try:
+        value = json.loads((workspace / "config/settings.json").read_text()).get("external_backup")
+    except (OSError, ValueError):
+        value = None
+    if not isinstance(value, dict) or not value.get("mount_point"):
+        continue
+    mount = Path(value["mount_point"])
+    marker = mount / (value.get("subdirectory") or "") / ".ubuntu-configuration-target.json"
+    try:
+        marker_value = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        continue
+    if marker_value.get("format") != "ubuntu-configuration-v1":
+        continue
+    root = marker.parent
+    for name in ("baseline", "timeline", "ubuntu-configuration-backups"):
+        shutil.rmtree(root / name, ignore_errors=True)
+    marker.unlink(missing_ok=True)
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+    print("Purged backup layout:", root)
+PY
+fi
 if sudo -n true 2>/dev/null; then
     for path in /etc/systemd/system/ubuntu-configuration-system.service \
                 /etc/systemd/system/ubuntu-configuration-system.timer; do
@@ -79,4 +118,8 @@ if [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
 fi
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
-echo "Uninstall complete. Backups and runtime traces were preserved."
+if (( PURGE_BACKUPS )); then
+    echo "Uninstall complete. Program traces removed; backups purged; runtime traces preserved."
+else
+    echo "Uninstall complete. Backups and runtime traces were preserved."
+fi
