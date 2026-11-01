@@ -1899,6 +1899,8 @@ def interactive_backup():
 def backup_everything():
     """Single flow: privileged configuration, configuration backup, full /home."""
     global _STATUS_RUN
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    signal.signal(signal.SIGHUP, signal.default_int_handler)
     _STATUS_RUN = True
     _diagnose_previous_status()
     _status_history("started", "Backup started")
@@ -3564,7 +3566,16 @@ def run_tray():
             else [terminal, "-e", " ".join(shlex.quote(part) for part in command)]
         return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
 
-    def launch_backup(_item=None):
+    def backup_action(_item=None):
+        data = current_status()
+        if data.get("state") == "running":
+            pid = data.get("pid")
+            if isinstance(pid, int):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            return
         process = launch_terminal("backup-now")
         if process is None:
             return
@@ -3701,7 +3712,7 @@ def run_tray():
             _status_history("inconsistent", "drive selection failed: " + str(exc))
 
     quit_item.connect("activate", lambda _item: Gtk.main_quit())
-    backup_item.connect("activate", launch_backup)
+    backup_item.connect("activate", backup_action)
     drive_item.connect("activate", show_drive_chooser)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
@@ -3751,6 +3762,7 @@ def run_tray():
         running = data.get("state") == "running"
         label = data.get("message") or data.get("state", "idle")
         status_item.set_label(label[:90])
+        backup_item.set_label("Stop backup" if running else "Run backup now")
         if running:
             toggle[0] = not toggle[0]
             set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
