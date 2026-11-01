@@ -31,10 +31,10 @@ metadata_path.write_text(json.dumps(metadata, indent=4) + "\n")
 app_path = root / "appIndicator.js"
 app = app_path.read_text()
 marker = "    secondaryActivate(timestamp, x, y) {"
-method = """    showStatus(x, y) {
+method = """    showQuitMenu(x, y) {
         Gio.DBus.session.call(
             'org.ubuntu.Backup', '/org/ubuntu/Backup', 'org.ubuntu.Backup',
-            'ShowStatus', null, null, Gio.DBusCallFlags.NONE, 1000,
+            'ShowQuitMenu', null, null, Gio.DBusCallFlags.NONE, 1000,
             this._cancellable, (_connection, result) => {
                 try {
                     Gio.DBus.session.call_finish(result);
@@ -54,16 +54,16 @@ app_path.write_text(app.replace(marker, method + marker, 1))
 icon_path = root / "indicatorStatusIcon.js"
 icon = icon_path.read_text()
 press_marker = "    vfunc_button_press_event(buttonEvent) {\n"
-press = """        if (buttonEvent.button === 1 && this._indicator.id === 'ubuntu-backup') {
+press = """        if (buttonEvent.button === 3 && this._indicator.id === 'ubuntu-backup') {
             Main.panel.menuManager._closeMenu(true, Main.panel.menuManager.activeMenu);
-            this._indicator.showStatus(buttonEvent.x, buttonEvent.y);
+            this._indicator.showQuitMenu(buttonEvent.x, buttonEvent.y);
             return Clutter.EVENT_STOP;
         }
 
 """
 release_marker = "    vfunc_scroll_event(scrollEvent) {\n"
 release = """    vfunc_button_release_event(buttonEvent) {
-        if (buttonEvent.button === 1 && this._indicator.id === 'ubuntu-backup')
+        if (buttonEvent.button === 3 && this._indicator.id === 'ubuntu-backup')
             return Clutter.EVENT_STOP;
         return Clutter.EVENT_PROPAGATE;
     }

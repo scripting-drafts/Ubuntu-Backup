@@ -3564,10 +3564,8 @@ def run_tray():
     options_menu.append(purge_item)
     options_item = Gtk.MenuItem(label="Options")
     options_item.set_submenu(options_menu)
-    quit_item = Gtk.MenuItem(label="Quit icon")
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), live_item, history_item,
-                 options_item, Gtk.SeparatorMenuItem(), quit_item):
+    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), live_item, history_item, options_item):
         menu.append(item)
     menu.show_all()
 
@@ -3577,6 +3575,8 @@ def run_tray():
     history_window = None
     history_view = None
     last_history = None
+    quit_window = None
+    quit_button = None
 
     def update_status():
         if status_window is None or not status_window.get_visible():
@@ -3830,33 +3830,77 @@ def run_tray():
 
     def reset_quit():
         quit_state["armed"] = False
-        quit_item.set_label("Quit icon")
+        if quit_button is not None:
+            quit_button.set_label("Quit icon")
         quit_state["timer"] = None
         return False
 
     def quit_action(_item=None):
         if not quit_state["armed"]:
             quit_state["armed"] = True
-            quit_item.set_label("Confirm quit")
+            if quit_button is not None:
+                quit_button.set_label("Confirm quit")
             if quit_state["timer"] is not None:
                 GLib.source_remove(quit_state["timer"])
             quit_state["timer"] = GLib.timeout_add_seconds(5, reset_quit)
             return
         Gtk.main_quit()
 
-    quit_item.connect("activate", quit_action)
+    def show_quit_menu():
+        nonlocal quit_window, quit_button
+        if quit_window is None:
+            quit_window = Gtk.Window(title="Ubuntu Backup", type=Gtk.WindowType.TOPLEVEL)
+            quit_window.set_decorated(False)
+            quit_window.set_resizable(False)
+            quit_window.set_skip_taskbar_hint(True)
+            quit_window.set_skip_pager_hint(True)
+            quit_window.set_keep_above(True)
+            quit_window.set_position(Gtk.WindowPosition.MOUSE)
+            quit_window.set_name("ubuntu-backup-quit")
+            quit_window.set_app_paintable(True)
+            visual = quit_window.get_screen().get_rgba_visual()
+            if visual is not None:
+                quit_window.set_visual(visual)
+            css = Gtk.CssProvider()
+            css.load_from_data(b"""
+                #ubuntu-backup-quit { background-color: transparent; }
+                #ubuntu-backup-quit-box {
+                    background-color: @theme_bg_color;
+                    border: 1px solid alpha(@theme_fg_color, 0.18);
+                    border-radius: 10px;
+                    padding: 10px;
+                }
+            """)
+            Gtk.StyleContext.add_provider_for_screen(quit_window.get_screen(), css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.set_name("ubuntu-backup-quit-box")
+            box.pack_start(Gtk.Label(label="Ubuntu Backup", xalign=0), False, False, 0)
+            quit_button = Gtk.Button(label="Quit icon")
+            cancel_button = Gtk.Button(label="Cancel")
+            quit_button.connect("clicked", quit_action)
+            cancel_button.connect("clicked", lambda _button: quit_window.hide())
+            box.pack_start(quit_button, False, False, 0)
+            box.pack_start(cancel_button, False, False, 0)
+            quit_window.add(box)
+            quit_window.connect("delete-event", lambda window, _event: (window.hide(), True)[1])
+        quit_window.show_all()
+        quit_window.present()
+        return False
+
     backup_item.connect("activate", backup_action)
     drive_option.connect("activate", show_drive_chooser)
     purge_item.connect("activate", purge_action)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
 
-    # The patched AppIndicator host calls this service on left-click, keeping the
-    # dbusmenu for right-click only.
+    # The patched AppIndicator host calls this service on right-click so the
+    # full native menu can stay on left-click.
     tray_interface = """
 <node>
   <interface name="org.ubuntu.Backup">
     <method name="ShowStatus"/>
+    <method name="ShowQuitMenu"/>
   </interface>
 </node>
 """
@@ -3866,8 +3910,10 @@ def run_tray():
         try:
             if method == "ShowStatus":
                 show_status()
+            elif method == "ShowQuitMenu":
+                GLib.idle_add(show_quit_menu)
         except Exception as error:
-            print(f"Tray status service failed: {error}", file=sys.stderr)
+            print(f"Tray service failed: {error}", file=sys.stderr)
         finally:
             invocation.return_value(None)
 
