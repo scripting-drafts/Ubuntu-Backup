@@ -50,11 +50,13 @@ command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$
 echo "Installed $BIN/ubuntu-backup.py"
 echo
 echo "Next steps:"
-echo "1. Open Ubuntu Backup from the application menu."
-echo "2. Choose 4 and select the mounted backup drive."
+if (( AUTOSTART )); then
+    echo "1. Log out and back in to start the tray icon."
+else
+    echo "1. Start the tray icon now: $BIN/ubuntu-backup.py tray"
+fi
+echo "2. Open Ubuntu Backup, choose 4, and select the mounted backup drive."
 echo "3. Choose 1 to run the first backup."
 if (( AUTOSTART )); then
     echo "The tray icon starts at next login; run $BIN/ubuntu-backup.py tray to start it now."
-else
-    echo "Run $BIN/ubuntu-backup.py tray when you want the status icon."
 fi
