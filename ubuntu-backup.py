@@ -3597,6 +3597,17 @@ def run_tray():
                 except OSError:
                     pass
             return
+        try:
+            if not settings().get("external_backup"):
+                raise ConfigError("No backup drive selected.")
+            directory = external_directory(settings())
+            if not os.access(directory, os.W_OK):
+                raise ConfigError("Backup drive is not writable.")
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            message = "Backup cancelled: " + str(exc)
+            _write_status("cancelled", "cancelled", message)
+            _status_history("cancelled", message)
+            return
         process = launch_terminal("backup-now")
         if process is None:
             return
