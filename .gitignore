@@ -9,3 +9,6 @@
 !.gitignore
 !tests/
 !tests/*.py
+!extension/
+!extension/*.sh
+!extension/*.md

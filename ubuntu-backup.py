@@ -3512,7 +3512,7 @@ def run_tray():
     import ctypes
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import GLib, Gtk
+    from gi.repository import Gio, GLib, Gtk
 
     try:
         lock_fd = os.open(KIT / ".tray.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -3555,13 +3555,19 @@ def run_tray():
     status_item = Gtk.MenuItem(label="Idle")
     status_item.set_sensitive(False)
     backup_item = Gtk.MenuItem(label="Run backup now")
-    drive_item = Gtk.MenuItem(label="Choose backup drive")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
+    drive_option = Gtk.MenuItem(label="Choose backup drive")
+    purge_item = Gtk.MenuItem(label="Purge all data")
+    options_menu = Gtk.Menu()
+    options_menu.append(drive_option)
+    options_menu.append(purge_item)
     options_item = Gtk.MenuItem(label="Options")
+    options_item.set_submenu(options_menu)
     quit_item = Gtk.MenuItem(label="Quit icon")
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, history_item, options_item, Gtk.SeparatorMenuItem(), quit_item):
+    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), live_item, history_item,
+                 options_item, Gtk.SeparatorMenuItem(), quit_item):
         menu.append(item)
     menu.show_all()
 
@@ -3748,51 +3754,28 @@ def run_tray():
         _write_status("idle", "idle", "All backup data purged")
         return True
 
-    def show_options(_item=None):
-        dialog = Gtk.Dialog(title="Ubuntu Backup — options", flags=0)
-        dialog.set_default_size(560, 230)
-        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
-        dialog.add_button("Choose backup drive", 3)
-        box = dialog.get_content_area()
-        box.set_border_width(12)
-        box.set_spacing(8)
-        info = Gtk.Label(label="Manage the backup destination or permanently remove all local and external backup data.", xalign=0)
-        box.add(info)
-        purge = Gtk.Button(label="Purge all data")
-        confirm = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        confirm.add(Gtk.Label(label="Permanently delete all backup data?", xalign=0))
-        yes = Gtk.Button(label="Yes, purge")
-        no = Gtk.Button(label="No")
-        confirm.pack_start(yes, False, False, 0)
-        confirm.pack_start(no, False, False, 0)
-        confirm.set_no_show_all(True)
-        box.add(purge)
-        box.add(confirm)
+    purge_state = {"armed": False, "timer": None}
 
-        def ask_purge(_button=None):
-            confirm.show_all()
+    def reset_purge():
+        purge_state["armed"] = False
+        purge_item.set_label("Purge all data")
+        purge_state["timer"] = None
+        return False
 
-        def cancel_purge(_button=None):
-            confirm.hide()
-
-        def do_purge(_button=None):
-            try:
-                purge_all_data()
-            except Exception as exc:
-                info.set_text("Purge failed: " + str(exc))
-            else:
-                info.set_text("All backup data purged.")
-            confirm.hide()
-
-        purge.connect("clicked", ask_purge)
-        no.connect("clicked", cancel_purge)
-        yes.connect("clicked", do_purge)
-        box.show_all()
-        confirm.hide()
-        response = dialog.run()
-        dialog.destroy()
-        if response == 3:
-            GLib.idle_add(lambda: (show_drive_chooser(), False)[1])
+    def purge_action(_item=None):
+        if not purge_state["armed"]:
+            purge_state["armed"] = True
+            purge_item.set_label("Confirm purge all data")
+            if purge_state["timer"] is not None:
+                GLib.source_remove(purge_state["timer"])
+            purge_state["timer"] = GLib.timeout_add_seconds(5, reset_purge)
+            return
+        reset_purge()
+        try:
+            purge_all_data()
+        except Exception as exc:
+            _write_status("failed", "purge", "Purge failed: " + str(exc))
+            _status_history("failed", "purge failed: " + str(exc))
 
     def show_drive_chooser(_item=None):
         options = []
@@ -3843,12 +3826,63 @@ def run_tray():
             _write_status("failed", "drive", "Drive selection failed: " + str(exc))
             _status_history("inconsistent", "drive selection failed: " + str(exc))
 
-    quit_item.connect("activate", lambda _item: Gtk.main_quit())
+    quit_state = {"armed": False, "timer": None}
+
+    def reset_quit():
+        quit_state["armed"] = False
+        quit_item.set_label("Quit icon")
+        quit_state["timer"] = None
+        return False
+
+    def quit_action(_item=None):
+        if not quit_state["armed"]:
+            quit_state["armed"] = True
+            quit_item.set_label("Confirm quit")
+            if quit_state["timer"] is not None:
+                GLib.source_remove(quit_state["timer"])
+            quit_state["timer"] = GLib.timeout_add_seconds(5, reset_quit)
+            return
+        Gtk.main_quit()
+
+    quit_item.connect("activate", quit_action)
     backup_item.connect("activate", backup_action)
-    drive_item.connect("activate", show_drive_chooser)
+    drive_option.connect("activate", show_drive_chooser)
+    purge_item.connect("activate", purge_action)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
-    options_item.connect("activate", show_options)
+
+    # The patched AppIndicator host calls this service on left-click, keeping the
+    # dbusmenu for right-click only.
+    tray_interface = """
+<node>
+  <interface name="org.ubuntu.Backup">
+    <method name="ShowStatus"/>
+  </interface>
+</node>
+"""
+    tray_path = "/org/ubuntu/Backup"
+
+    def tray_method(_connection, _sender, _path, _interface, method, _parameters, invocation):
+        try:
+            if method == "ShowStatus":
+                show_status()
+        except Exception as error:
+            print(f"Tray status service failed: {error}", file=sys.stderr)
+        finally:
+            invocation.return_value(None)
+
+    def tray_bus_acquired(connection, _name):
+        node = Gio.DBusNodeInfo.new_for_xml(tray_interface)
+        connection.register_object(tray_path, node.interfaces[0], tray_method, None, None)
+
+    def tray_name_acquired(_connection, _name):
+        pass
+
+    def tray_name_lost(_connection, _name):
+        print("Tray status service name lost.", file=sys.stderr)
+
+    Gio.bus_own_name(Gio.BusType.SESSION, "org.ubuntu.Backup", Gio.BusNameOwnerFlags.NONE,
+                     tray_bus_acquired, tray_name_acquired, tray_name_lost)
 
     provider = None
     try:

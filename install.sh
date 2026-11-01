@@ -72,3 +72,6 @@ PY
 else
     echo "Ubuntu Backup installed; start the tray with ./refresh after logging in."
 fi
+if [[ -x "$ROOT/extension/install.sh" ]]; then
+    "$ROOT/extension/install.sh" || echo "Warning: AppIndicator extension fork was not installed." >&2
+fi

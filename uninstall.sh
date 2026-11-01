@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Remove the Ubuntu Backup program; backups and runtime traces are preserved unless purged.
 set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY=0
 YES=0
 PURGE_BACKUPS=0
@@ -79,6 +80,9 @@ fi
 for path in "${FILES[@]}"; do
     [[ -e "$path" || -L "$path" ]] && rm -rf -- "$path"
 done
+if [[ -x "$ROOT/extension/uninstall.sh" ]]; then
+    "$ROOT/extension/uninstall.sh" || echo "Warning: AppIndicator extension fork was not fully removed." >&2
+fi
 if (( PURGE_BACKUPS )); then
     python3 - "${WORKSPACES[@]}" <<'PY'
 import json, shutil, sys
