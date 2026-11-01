@@ -1412,6 +1412,80 @@ def system_integration_inventory():
             "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(), "items": units}
 
 
+def capture_system_integration(destination):
+    """Store managed timer/service/helper contents plus state for recovery."""
+    data = system_integration_inventory()
+    for item in data["items"]:
+        if not item.get("present"):
+            continue
+        source = Path(item["path"])
+        relative = "system-integration/" + item["role"]
+        try:
+            content = source.read_bytes()
+            write(destination / relative, content, executable=bool(item.get("mode", 0) & 0o111))
+            item["stored"] = relative
+        except OSError as error:
+            item["store_error"] = type(error).__name__
+    write_json(destination / "inventory/system-integration.json", data)
+
+
+def restore_system_integration(snapshot):
+    """Reinstall and synchronize captured system timer/helper; requires sudo."""
+    snapshot = Path(snapshot)
+    verify_tree(snapshot)
+    metadata = snapshot / "inventory/system-integration.json"
+    if not metadata.is_file():
+        print("No captured system-integration metadata.")
+        return False
+    data = json.loads(metadata.read_text())
+    targets = {
+        "service": Path("/etc/systemd/system/ubuntu-configuration-system.service"),
+        "timer": Path("/etc/systemd/system/ubuntu-configuration-system.timer"),
+        "helper": Path("/usr/local/libexec/ubuntu-configuration-system-capture.py"),
+    }
+    present = [item for item in data.get("items", []) if item.get("present")]
+    if not present:
+        print("Backup contains no installed system timer/helper.")
+        return False
+    marker = b"Managed by ubuntu-configuration"
+    for item in present:
+        role = item.get("role")
+        if role not in targets or not item.get("stored"):
+            raise ConfigError("Incomplete captured system-integration entry: " + str(role))
+        source = checked_path(snapshot, item["stored"])
+        content = source.read_bytes()
+        if digest(source) != item.get("sha256"):
+            raise ConfigError("Captured system-integration checksum mismatch: " + str(role))
+        if marker not in content:
+            raise ConfigError("Refusing to restore an unmanaged system-integration file: " + str(role))
+        target = targets[role]
+        if target.is_symlink():
+            raise ConfigError("Refusing symlinked system-integration target: " + str(target))
+        if target.exists():
+            current = target.read_bytes()
+            if marker not in current:
+                raise ConfigError("Refusing to overwrite unmanaged file: " + str(target))
+        temporary = Path(tempfile.mkdtemp(prefix=".system-integration-", dir=snapshot))
+        staged = temporary / role
+        try:
+            staged.write_bytes(content)
+            staged.chmod(0o700 if role == "helper" else 0o644)
+            subprocess.run(["sudo", "install", "-o", "root", "-g", "root",
+                            "-m", "0700" if role == "helper" else "0644",
+                            str(staged), str(target)], check=True)
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+    timer = next((item for item in present if item.get("role") == "timer"), None)
+    if timer is not None:
+        if timer.get("enabled") == "enabled":
+            subprocess.run(["sudo", "systemctl", "enable", "--now", "ubuntu-configuration-system.timer"], check=True)
+        else:
+            subprocess.run(["sudo", "systemctl", "disable", "--now", "ubuntu-configuration-system.timer"], check=False)
+    print("System-wide timer/helper restored; enabled state synchronized.")
+    return True
+
+
 def build_snapshot(destination, config):
     selected = copy.deepcopy(config)
     try:
@@ -1419,7 +1493,7 @@ def build_snapshot(destination, config):
     except ValueError:
         pass
     report = _original_build_snapshot(destination, selected)
-    write_json(destination / "inventory/system-integration.json", system_integration_inventory())
+    capture_system_integration(destination)
     write(destination / "kit" / SCRIPT_PATH.name, SCRIPT_PATH.read_bytes(), executable=True)
     refresh_manifest(destination)
     return report
@@ -1696,6 +1770,8 @@ def wizard_recover(source=None):
             restore_home(path)
             return
         destination = restore(path)
+        if confirm("Restore the captured system-wide timer/helper? (sudo required)", False):
+            restore_system_integration(destination)
         if confirm("Deploy this recovered configuration now? This may install packages."):
             wizard_deploy(destination)
         return
