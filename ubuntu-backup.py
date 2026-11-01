@@ -3587,6 +3587,24 @@ def run_tray():
             else [terminal, "-e", " ".join(shlex.quote(part) for part in command)]
         return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
 
+    drive_cache = {"at": 0.0, "ready": False}
+
+    def drive_ready():
+        import time
+        now = time.monotonic()
+        if now - drive_cache["at"] < 5:
+            return drive_cache["ready"]
+        try:
+            if not settings().get("external_backup"):
+                ready = False
+            else:
+                directory = external_directory(settings())
+                ready = os.access(directory, os.W_OK)
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+            ready = False
+        drive_cache.update(at=now, ready=ready)
+        return ready
+
     def backup_action(_item=None):
         data = current_status()
         if data.get("state") == "running":
@@ -3596,6 +3614,9 @@ def run_tray():
                     os.kill(pid, signal.SIGTERM)
                 except OSError:
                     pass
+            return
+        if not drive_ready():
+            show_drive_chooser()
             return
         try:
             if not settings().get("external_backup"):
@@ -3731,10 +3752,12 @@ def run_tray():
         try:
             if response == 2:
                 set_external(None, True)
+                drive_cache["at"] = 0
                 if current_status().get("state") != "running":
                     _write_status("idle", "drive", "Backup drive forgotten")
             elif response == Gtk.ResponseType.OK and selected:
                 set_external(selected)
+                drive_cache["at"] = 0
                 if current_status().get("state") != "running":
                     _write_status("idle", "drive", "Backup drive selected: " + selected)
             else:
@@ -3794,7 +3817,12 @@ def run_tray():
         running = data.get("state") == "running"
         label = data.get("message") or data.get("state", "idle")
         status_item.set_label(label[:90])
-        backup_item.set_label("Stop backup" if running else "Run backup now")
+        if running:
+            backup_item.set_label("Stop backup")
+        elif drive_ready():
+            backup_item.set_label("Run backup now")
+        else:
+            backup_item.set_label("Select a backup drive first")
         if running:
             toggle[0] = not toggle[0]
             set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
