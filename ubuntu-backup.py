@@ -3615,8 +3615,8 @@ def run_tray():
                 except OSError:
                     pass
             return
-        if not drive_ready():
-            show_drive_chooser()
+        if backup_item.get_label() == "Select a backup drive first" or not drive_ready():
+            GLib.idle_add(lambda: (show_drive_chooser(), False)[1])
             return
         try:
             if not settings().get("external_backup"):
