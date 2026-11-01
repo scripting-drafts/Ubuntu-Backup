@@ -39,18 +39,21 @@ if (( DRY )); then
     exit 0
 fi
 confirm() {
-    local answer
-    read -r -p "$1 [y/N]: " answer || return 1
+    local answer default="${2:-no}" label
+    [[ "$default" == yes ]] && label="[Y/n]" || label="[y/N]"
+    read -r -p "$1 $label: " answer || return 1
     case "${answer,,}" in
         y|yes) return 0 ;;
+        n|no) return 1 ;;
+        "") [[ "$default" == yes ]] ;;
         *) return 1 ;;
     esac
 }
 if (( ! YES )); then
-    confirm "Remove Ubuntu Backup program files?" || { echo "Cancelled."; exit 1; }
+    confirm "Remove Ubuntu Backup program files?" yes || { echo "Cancelled."; exit 1; }
 fi
 if (( PURGE_BACKUPS )); then
-    confirm "Permanently delete all backup data?" || { echo "Cancelled; backups preserved."; exit 1; }
+    confirm "Permanently delete all backup data?" no || { echo "Cancelled; backups preserved."; exit 1; }
 fi
 python3 - "$BIN/ubuntu-backup.py" <<'PY'
 import os, signal, sys
