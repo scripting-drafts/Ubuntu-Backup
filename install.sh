@@ -28,9 +28,9 @@ cat > "$APPS/ubuntu-backup.desktop" <<EOF
 Type=Application
 Name=Ubuntu Backup
 Comment=Configuration and full /home backup
-Exec="$(quote "$BIN/ubuntu-backup.py")"
+Exec="$(quote "$BIN/ubuntu-backup.py")" tray
 Icon=ubuntu-backup
-Terminal=true
+Terminal=false
 Categories=Utility;
 EOF
 cat > "$AUTODIR/ubuntu-backup-tray.desktop" <<EOF

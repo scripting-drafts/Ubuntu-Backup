@@ -3725,8 +3725,10 @@ def run_tray():
         for device in attached_drives():
             for mountpoint in device.get("mountpoints", []):
                 options.append((f"{mountpoint}  ({device.get('fstype') or 'unknown'}, {device.get('size', 0)} bytes)", mountpoint))
-        dialog = Gtk.Dialog(title="Ubuntu Backup — choose backup drive", flags=0)
+        dialog = Gtk.Dialog(title="Ubuntu Backup — choose backup drive", flags=Gtk.DialogFlags.MODAL)
         dialog.set_default_size(680, 180)
+        dialog.set_keep_above(True)
+        dialog.set_position(Gtk.WindowPosition.CENTER)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Forget current drive", 2)
         dialog.add_button("Use drive", Gtk.ResponseType.OK)
@@ -3746,6 +3748,7 @@ def run_tray():
             chooser.set_sensitive(False)
         box.add(chooser)
         box.show_all()
+        dialog.present()
         response = dialog.run()
         selected = options[chooser.get_active()][1] if options and chooser.get_active() >= 0 else None
         dialog.destroy()
@@ -3816,13 +3819,13 @@ def run_tray():
         data = current_status()
         running = data.get("state") == "running"
         label = data.get("message") or data.get("state", "idle")
-        status_item.set_label(label[:90])
-        if running:
-            backup_item.set_label("Stop backup")
-        elif drive_ready():
-            backup_item.set_label("Run backup now")
-        else:
-            backup_item.set_label("Select a backup drive first")
+        label = label[:90]
+        if status_item.get_label() != label:
+            status_item.set_label(label)
+        desired = ("Stop backup" if running else
+                   "Run backup now" if drive_ready() else "Select a backup drive first")
+        if backup_item.get_label() != desired:
+            backup_item.set_label(desired)
         if running:
             toggle[0] = not toggle[0]
             set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
@@ -3831,7 +3834,6 @@ def run_tray():
             set_icon("dialog-information-symbolic" if state == "complete" else
                      "dialog-error-symbolic" if state == "failed" else
                      "dialog-warning-symbolic" if state == "cancelled" else "media-record-symbolic")
-        menu.show_all()
         return True
 
     GLib.timeout_add(750, refresh)
