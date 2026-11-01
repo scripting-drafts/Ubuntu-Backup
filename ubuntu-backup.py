@@ -960,7 +960,7 @@ def copy_external_snapshot(snapshot, config):
         result, created, shared = create_linked_config_snapshot(snapshot, root, name)
         prune_linked_config(root, config["keep_snapshots"])
         display = directory / result.relative_to(root)
-    print(f"External linked snapshot verified: {display} ({created} new objects, {shared} files shared)")
+    print("External backup verified.")
     return display
 
 
@@ -1075,10 +1075,9 @@ def backup(skip_external=False):
                 shutil.rmtree(previous)
             if local_path is not None:
                 prune_dated(local_path.parent, config["keep_snapshots"])
-                print(f"Local dated backup verified: {local_path} ({shared} files shared with previous snapshot)")
-            else:
-                print("Local dated backup disabled; only the external timeline will be kept.")
-            print(f"Capture warnings: {len(report['warnings'])}; details: snapshot/inventory/capture-report.json")
+            print("Configuration backup verified.")
+            if report["warnings"]:
+                print(f"Warnings: {len(report['warnings'])} (see capture-report.json)")
             if skip_external:
                 print("External copy skipped for this run; saved target was not changed.")
             elif config["external_backup"] is None:
@@ -1912,7 +1911,7 @@ def backup_everything():
         _write_status("running", "configuration", "Capturing configuration")
         path = interactive_backup()
         _write_status("running", "full_home", "Capturing full /home")
-        print("Configuration backup complete; continuing with full /home.")
+        print("Starting full /home capture.")
         home_done = wizard_home_backup()
         message = ("Backup operation complete: configuration and full /home."
                    if home_done else
@@ -3334,13 +3333,7 @@ def wizard_home_backup():
     nested = [entry["mount"] for entry in identity["mounts"] if entry["mount"] != "/home"]
     if nested:
         raise ConfigError("Strict /home backup refuses unapproved nested mounts; prepare separate filesystem backups: " + ", ".join(nested))
-    print("FULL /home: all users' files, including secrets, browser data and projects. Snapshot is NOT encrypted.")
-    print("Each new file is stored once in a shared baseline; dated timelines contain relative symlinks to it.")
-    print("The source is never rewritten. ACLs, extended attributes, ownership and sparse files are recorded.")
-    print("Virtual filesystems, nested mounts and this kit's generated backup/cache directories are not traversed.")
-    print("Stop applications/VMs/databases first: a live tar stream is NOT a filesystem-consistent snapshot.")
-    print("Any reported read/change error fails the backup; no old full-home timeline is pruned.")
-    print("Keep the baseline with every dated timeline; one date folder is not portable on its own.")
+    print("Full /home includes secrets; not encrypted. Stop apps/VMs first; the capture is not atomic.")
     print("Destination: " + str(directory))
     baseline = KIT / "config/home-backup-approval.json"
     changed = not baseline.is_file() or json.loads(baseline.read_text()) != identity
@@ -3415,9 +3408,7 @@ def root_home_backup(workspace):
         temporary.rename(result)
         temporary = None
         fsync_directory(timelines)
-        print("Verified full /home linked snapshot: " + str(directory / result.relative_to(pinned)))
-        print(f"Stored {manifest['entry_count']} entries, {len(created)} new baseline objects; {manifest['warning_count']} runtime/special entries were recorded but not recreated.")
-        print("Full-home timelines are NOT automatically pruned. Keep the baseline; restore into an isolated directory and adapt owners/hardware manually.")
+        print(f"Full /home verified: {manifest['entry_count']} entries, {len(created)} new objects.")
     finally:
         if child.poll() is None:
             # The writer has dropped root and must not try to signal a root tar process.
