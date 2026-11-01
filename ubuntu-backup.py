@@ -1886,7 +1886,8 @@ def interactive_backup():
         try:
             directory = external_directory(settings())
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-            print(f"Saved backup drive is unavailable: {exc}")
+            print(f"Backup cancelled: saved drive unavailable: {exc}")
+            return None
         else:
             print("Using previously approved backup drive: " + str(directory))
             return backup()
@@ -1906,8 +1907,17 @@ def backup_everything():
     _write_status("running", "preparing", "Preparing backup")
     _ensure_tray()
     try:
-        if not settings().get("external_backup"):
+        external = settings().get("external_backup")
+        if not external:
             message = "Backup cancelled: no backup drive selected."
+            _write_status("cancelled", "cancelled", message)
+            _status_history("cancelled", message)
+            print(message)
+            return None
+        try:
+            external_directory(settings())
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            message = f"Backup cancelled: selected drive unavailable: {exc}"
             _write_status("cancelled", "cancelled", message)
             _status_history("cancelled", message)
             print(message)
@@ -1917,7 +1927,7 @@ def backup_everything():
         _write_status("running", "configuration", "Capturing configuration")
         path = interactive_backup()
         if path is None:
-            message = "Backup cancelled: no backup drive selected."
+            message = "Backup cancelled: backup drive unavailable or not selected."
             _write_status("cancelled", "cancelled", message)
             _status_history("cancelled", message)
             print(message)
