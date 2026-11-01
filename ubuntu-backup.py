@@ -3475,16 +3475,19 @@ def run_tray():
     backup_item = Gtk.MenuItem(label="Run backup now")
     drive_item = Gtk.MenuItem(label="Choose backup drive")
     live_item = Gtk.MenuItem(label="Live status")
+    history_item = Gtk.MenuItem(label="History")
     options_item = Gtk.MenuItem(label="Options")
     quit_item = Gtk.MenuItem(label="Quit icon")
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, options_item, Gtk.SeparatorMenuItem(), quit_item):
+    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, history_item, options_item, Gtk.SeparatorMenuItem(), quit_item):
         menu.append(item)
     menu.show_all()
 
     window = None
+    notebook = None
     text = None
     progress = None
+    history_view = None
     refresh_source = None
 
     def update_window():
@@ -3501,24 +3504,48 @@ def run_tray():
                       f"Phase: {data.get('phase', '')}\n"
                       f"Updated: {data.get('updated', '')}\n\n"
                       f"{data.get('message', '')}")
+        if history_view is not None:
+            try:
+                body = _history_path().read_text()
+            except OSError:
+                body = "No history yet."
+            history_view.get_buffer().set_text(body)
         return True
 
-    def show_status(_item=None):
-        nonlocal window, text, progress, refresh_source
-        if window is None:
-            window = Gtk.Window(title="Ubuntu Backup — live status")
-            window.set_default_size(520, 240)
-            window.connect("delete-event", lambda w, e: (w.hide(), True)[1])
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            box.set_border_width(12)
-            progress = Gtk.ProgressBar()
-            text = Gtk.Label(xalign=0, yalign=0)
-            text.set_selectable(True)
-            box.pack_start(progress, False, False, 0)
-            box.pack_start(text, True, True, 0)
-            window.add(box)
-            refresh_source = GLib.timeout_add(500, update_window)
+    def ensure_window():
+        nonlocal window, notebook, text, progress, history_view, refresh_source
+        if window is not None:
+            return
+        window = Gtk.Window(title="Ubuntu Backup")
+        window.set_default_size(680, 460)
+        window.connect("delete-event", lambda w, e: (w.hide(), True)[1])
+        notebook = Gtk.Notebook()
+        status_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        status_page.set_border_width(12)
+        progress = Gtk.ProgressBar()
+        text = Gtk.Label(xalign=0, yalign=0)
+        text.set_selectable(True)
+        status_page.pack_start(progress, False, False, 0)
+        status_page.pack_start(text, True, True, 0)
+        notebook.append_page(status_page, Gtk.Label(label="Status"))
+        history_page = Gtk.ScrolledWindow()
+        history_view = Gtk.TextView(editable=False, monospace=True)
+        history_page.add(history_view)
+        notebook.append_page(history_page, Gtk.Label(label="History"))
+        window.add(notebook)
+        refresh_source = GLib.timeout_add(500, update_window)
+
+    def show_tab(index):
+        ensure_window()
+        notebook.set_current_page(index)
         window.show_all()
+        window.present()
+
+    def show_status(_item=None):
+        show_tab(0)
+
+    def show_history(_item=None):
+        show_tab(1)
 
     def launch_terminal(action):
         import shlex
@@ -3674,6 +3701,7 @@ def run_tray():
     backup_item.connect("activate", launch_backup)
     drive_item.connect("activate", show_drive_chooser)
     live_item.connect("activate", show_status)
+    history_item.connect("activate", show_history)
     options_item.connect("activate", show_options)
 
     provider = None
