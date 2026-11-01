@@ -3614,7 +3614,9 @@ def run_tray():
                          ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
                          if shutil.which(name)), None)
         if terminal is None:
-            subprocess.run(["zenity", "--error", "--text=No terminal emulator found."], check=False)
+            message = "No terminal emulator found; backup not started."
+            _write_status("failed", "terminal", message)
+            _status_history("failed", message)
             return
         terminal_name = os.path.basename(os.path.realpath(terminal))
         arguments = [terminal, "--", *command] if terminal_name in ("gnome-terminal", "kgx") \
@@ -3719,38 +3721,49 @@ def run_tray():
 
     def show_options(_item=None):
         dialog = Gtk.Dialog(title="Ubuntu Backup — options", flags=0)
-        dialog.set_default_size(520, 160)
+        dialog.set_default_size(560, 230)
         dialog.add_button("Close", Gtk.ResponseType.CLOSE)
-        dialog.add_button("Purge all data", 1)
+        dialog.add_button("Choose backup drive", 3)
         box = dialog.get_content_area()
         box.set_border_width(12)
         box.set_spacing(8)
-        box.add(Gtk.Label(label="Permanently remove local and configured external backup data, history, logs and runtime state.", xalign=0))
+        info = Gtk.Label(label="Manage the backup destination or permanently remove all local and external backup data.", xalign=0)
+        box.add(info)
+        purge = Gtk.Button(label="Purge all data")
+        confirm = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        confirm.add(Gtk.Label(label="Permanently delete all backup data?", xalign=0))
+        yes = Gtk.Button(label="Yes, purge")
+        no = Gtk.Button(label="No")
+        confirm.pack_start(yes, False, False, 0)
+        confirm.pack_start(no, False, False, 0)
+        confirm.set_no_show_all(True)
+        box.add(purge)
+        box.add(confirm)
+
+        def ask_purge(_button=None):
+            confirm.show_all()
+
+        def cancel_purge(_button=None):
+            confirm.hide()
+
+        def do_purge(_button=None):
+            try:
+                purge_all_data()
+            except Exception as exc:
+                info.set_text("Purge failed: " + str(exc))
+            else:
+                info.set_text("All backup data purged.")
+            confirm.hide()
+
+        purge.connect("clicked", ask_purge)
+        no.connect("clicked", cancel_purge)
+        yes.connect("clicked", do_purge)
         box.show_all()
+        confirm.hide()
         response = dialog.run()
         dialog.destroy()
-        if response != 1:
-            return
-        confirm = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.WARNING,
-                                    buttons=Gtk.ButtonsType.YES_NO, text="Purge all backup data?")
-        confirm.format_secondary_text("This permanently deletes backups, snapshots, history, logs and configured external timelines. It cannot be undone.")
-        confirm.set_default_response(Gtk.ResponseType.NO)
-        response = confirm.run()
-        confirm.destroy()
-        if response != Gtk.ResponseType.YES:
-            return
-        try:
-            purge_all_data()
-        except Exception as exc:
-            error = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.ERROR,
-                                      buttons=Gtk.ButtonsType.CLOSE, text=str(exc))
-            error.run()
-            error.destroy()
-            return
-        info = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.INFO,
-                                 buttons=Gtk.ButtonsType.CLOSE, text="All backup data purged.")
-        info.run()
-        info.destroy()
+        if response == 3:
+            GLib.idle_add(lambda: (show_drive_chooser(), False)[1])
 
     def show_drive_chooser(_item=None):
         options = []
@@ -3808,42 +3821,15 @@ def run_tray():
     history_item.connect("activate", show_history)
     options_item.connect("activate", show_options)
 
-    provider = None
-    try:
-        lib = ctypes.CDLL("libayatana-appindicator3.so.1")
-
-        class PyCapsule(ctypes.Structure):
-            _fields_ = [("ob_refcnt", ctypes.c_ssize_t), ("ob_type", ctypes.c_void_p),
-                        ("pointer", ctypes.c_void_p), ("name", ctypes.c_char_p),
-                        ("context", ctypes.c_void_p)]
-
-        def pointer(obj):
-            return PyCapsule.from_address(id(obj.__gpointer__)).pointer
-
-        lib.app_indicator_new.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-        lib.app_indicator_new.restype = ctypes.c_void_p
-        lib.app_indicator_set_status.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        lib.app_indicator_set_menu.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        lib.app_indicator_set_icon_full.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-        lib.app_indicator_set_title.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        indicator = lib.app_indicator_new(b"ubuntu-backup", b"media-record-symbolic", 0)
-        lib.app_indicator_set_title(indicator, b"Ubuntu Backup")
-        lib.app_indicator_set_menu(indicator, pointer(menu))
-        lib.app_indicator_set_status(indicator, 1)
-        provider = ("indicator", indicator, lib)
-    except OSError:
-        icon = Gtk.StatusIcon.new_from_icon_name("media-record-symbolic")
-        icon.set_tooltip_text("Ubuntu Backup")
-        icon.connect("popup-menu", lambda _i, button, activate_time: menu.popup(None, None, None, None, button, activate_time))
-        icon.connect("activate", show_status)
-        icon.set_visible(True)
-        provider = ("statusicon", icon, None)
+    icon = Gtk.StatusIcon.new_from_icon_name("media-record-symbolic")
+    icon.set_tooltip_text("Ubuntu Backup")
+    icon.connect("popup-menu", lambda _i, button, activate_time: menu.popup(None, None, None, None, button, activate_time))
+    icon.connect("activate", show_status)
+    icon.set_visible(True)
+    provider = ("statusicon", icon, None)
 
     def set_icon(name):
-        if provider[0] == "indicator":
-            provider[2].app_indicator_set_icon_full(provider[1], name.encode(), b"Ubuntu Backup")
-        else:
-            provider[1].set_from_icon_name(name)
+        provider[1].set_from_icon_name(name)
 
     toggle = [False]
 
