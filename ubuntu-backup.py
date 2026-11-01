@@ -2590,6 +2590,30 @@ def clean_created_objects(created):
             pass
 
 
+class ProgressBar:
+    def __init__(self, label, width=28):
+        self.label = label
+        self.width = width
+        self.last = 0.0
+
+    def update(self, count, size, force=False):
+        import time
+        now = time.monotonic()
+        if not force and now - self.last < 0.2:
+            return
+        self.last = now
+        phase = int(now * 4) % (self.width * 2)
+        filled = phase if phase <= self.width else self.width * 2 - phase
+        bar = '#' * filled + '-' * (self.width - filled)
+        print(f"\r{self.label} [{bar}] {count} entries, {size / 1048576:.1f} MiB", end='', flush=True)
+
+    def finish(self, count, size):
+        print(f"\r{self.label} [{'#' * self.width}] {count} entries, {size / 1048576:.1f} MiB", flush=True)
+
+    def abort(self):
+        print(flush=True)
+
+
 class TailReader:
     """Track tar's trailing zero padding; the root tar exit status is authoritative."""
     def __init__(self, stream):
@@ -2705,6 +2729,7 @@ def capture_home_archive(stream, root, identity, exclusions):
     warnings = []
     count = 0
     logical = 0
+    progress = ProgressBar("Full /home")
     tracker = TailReader(stream)
     try:
         with entries_path.open("w") as entries, tarfile.open(fileobj=tracker, mode="r|") as archive:
@@ -2752,6 +2777,7 @@ def capture_home_archive(stream, root, identity, exclusions):
                 entries.write(json.dumps(entry, separators=(",", ":")) + "\n")
                 written.add(name)
                 count += 1
+                progress.update(count, logical)
             # Tar normally supplies every parent directory. Record any that it omitted.
             for directory, dirs, _ in os.walk(tree, topdown=True, followlinks=False):
                 for child in sorted(dirs):
@@ -2766,6 +2792,7 @@ def capture_home_archive(stream, root, identity, exclusions):
                         entries.write(json.dumps(entry, separators=(",", ":")) + "\n")
                         written.add(relative)
                         count += 1
+        progress.finish(count, logical)
         # A cut inside tar's trailing zero padding loses no file data; the root
         # tar process exit status is the authoritative completeness check.
         if len(tracker.tail) < 512 or tracker.tail[-512:] != b"\0" * 512:
@@ -2780,6 +2807,7 @@ def capture_home_archive(stream, root, identity, exclusions):
         verify_home_timeline(temporary, hash_objects=False)
         return temporary, manifest, created, timelines
     except BaseException:
+        progress.abort()
         if temporary.exists():
             shutil.rmtree(temporary)
         clean_created_objects(created)
