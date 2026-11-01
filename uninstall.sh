@@ -79,7 +79,7 @@ if (( PURGE_BACKUPS )); then
 import json, shutil, sys
 from pathlib import Path
 for workspace in map(Path, sys.argv[1:]):
-    for name in ("backups", "snapshot", ".previous-snapshot", "profiles", "privileged-system"):
+    for name in ("backups", "snapshot", ".previous-snapshot", "profiles", "privileged-system", "system-integration-recovery"):
         shutil.rmtree(workspace / name, ignore_errors=True)
     try:
         value = json.loads((workspace / "config/settings.json").read_text()).get("external_backup")
@@ -112,7 +112,67 @@ for path in /etc/systemd/system/ubuntu-configuration-system.service \
             /usr/local/libexec/ubuntu-configuration-system-capture.py; do
     [[ -e "$path" ]] && SYSTEM_PRESENT=1
 done
+PRESERVED=0
 if (( SYSTEM_PRESENT )) && [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
+    BUNDLE="${WORKSPACES[0]}/system-integration-recovery"
+    PRESERVED=1
+    echo "Preserving system-wide timer/helper for recovery (sudo required)."
+    sudo mkdir -p "$BUNDLE" || PRESERVED=0
+    for pair in "service:/etc/systemd/system/ubuntu-configuration-system.service" \
+                "timer:/etc/systemd/system/ubuntu-configuration-system.timer" \
+                "helper:/usr/local/libexec/ubuntu-configuration-system-capture.py"; do
+        role="${pair%%:*}"
+        path="${pair#*:}"
+        if [[ -e "$path" ]]; then
+            mode=600
+            [[ "$role" == helper ]] && mode=700
+            sudo install -m "$mode" "$path" "$BUNDLE/$role" || PRESERVED=0
+        fi
+    done
+    if (( PRESERVED )); then
+        sudo chown -R "$(id -u):$(id -g)" "$BUNDLE" || PRESERVED=0
+        chmod 700 "$BUNDLE" || PRESERVED=0
+    fi
+    if (( PRESERVED )); then
+        python3 - "$BUNDLE" <<'PY' || PRESERVED=0
+import datetime as dt
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+bundle = Path(sys.argv[1])
+paths = {"service": Path("/etc/systemd/system/ubuntu-configuration-system.service"),
+         "timer": Path("/etc/systemd/system/ubuntu-configuration-system.timer"),
+         "helper": Path("/usr/local/libexec/ubuntu-configuration-system-capture.py")}
+items = []
+for role, source in paths.items():
+    stored = bundle / role
+    if not stored.is_file():
+        continue
+    item = {"role": role, "path": str(source), "present": True, "stored": role,
+            "mode": stored.stat().st_mode & 0o777, "uid": 0, "gid": 0,
+            "sha256": hashlib.sha256(stored.read_bytes()).hexdigest()}
+    if role in ("service", "timer"):
+        unit = source.name
+        for key, command in (("enabled", ["systemctl", "is-enabled", unit]),
+                             ("active", ["systemctl", "is-active", unit])):
+            result = subprocess.run(command, capture_output=True, text=True)
+            item[key] = result.stdout.strip() or "unknown"
+    items.append(item)
+(bundle / "system-integration.json").write_text(json.dumps(
+    {"format": "ubuntu-system-integration-v1",
+     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(), "items": items}, indent=2) + "\n")
+(bundle / "system-integration.json").chmod(0o600)
+PY
+    fi
+    if (( PRESERVED )); then
+        echo "Recovery copy: $BUNDLE"
+    else
+        echo "System integration not removed: recovery copy could not be created."
+    fi
+fi
+if (( SYSTEM_PRESENT )) && [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]] && (( PRESERVED )); then
     echo "Removing system-wide timer/helper (sudo required)."
     sudo systemctl disable --now ubuntu-configuration-system.timer 2>/dev/null || true
     for path in /etc/systemd/system/ubuntu-configuration-system.service \

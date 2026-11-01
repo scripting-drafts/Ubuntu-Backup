@@ -1432,11 +1432,16 @@ def capture_system_integration(destination):
 def restore_system_integration(snapshot):
     """Reinstall and synchronize captured system timer/helper; requires sudo."""
     snapshot = Path(snapshot)
-    verify_tree(snapshot)
     metadata = snapshot / "inventory/system-integration.json"
-    if not metadata.is_file():
-        print("No captured system-integration metadata.")
-        return False
+    if metadata.is_file():
+        verify_tree(snapshot)
+    else:
+        fallback = KIT / "system-integration-recovery"
+        metadata = fallback / "system-integration.json"
+        if not metadata.is_file():
+            print("No captured system-integration metadata.")
+            return False
+        snapshot = fallback
     data = json.loads(metadata.read_text())
     targets = {
         "service": Path("/etc/systemd/system/ubuntu-configuration-system.service"),
