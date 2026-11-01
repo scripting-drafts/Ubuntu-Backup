@@ -120,7 +120,13 @@ if sudo -n true 2>/dev/null; then
     sudo systemctl disable --now ubuntu-configuration-system.timer 2>/dev/null || true
     sudo systemctl daemon-reload 2>/dev/null || true
 else
-    echo "System-wide timer/helper not removed (sudo required)."
+    for path in /etc/systemd/system/ubuntu-configuration-system.service \
+                /etc/systemd/system/ubuntu-configuration-system.timer \
+                /usr/local/libexec/ubuntu-configuration-system-capture.py; do
+        if [[ -e "$path" ]]; then
+            echo "System-wide timer/helper not removed (sudo required): $path"
+        fi
+    done
 fi
 if [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
