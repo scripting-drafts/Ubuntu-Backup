@@ -3831,7 +3831,7 @@ def run_tray():
     def reset_quit():
         quit_state["armed"] = False
         if quit_button is not None:
-            quit_button.set_label("Quit icon")
+            quit_button.set_label("Quit")
         quit_state["timer"] = None
         return False
 
@@ -3875,13 +3875,9 @@ def run_tray():
                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             box.set_name("ubuntu-backup-quit-box")
-            box.pack_start(Gtk.Label(label="Ubuntu Backup", xalign=0), False, False, 0)
-            quit_button = Gtk.Button(label="Quit icon")
-            cancel_button = Gtk.Button(label="Cancel")
+            quit_button = Gtk.Button(label="Quit")
             quit_button.connect("clicked", quit_action)
-            cancel_button.connect("clicked", lambda _button: quit_window.hide())
             box.pack_start(quit_button, False, False, 0)
-            box.pack_start(cancel_button, False, False, 0)
             quit_window.add(box)
             quit_window.connect("delete-event", lambda window, _event: (window.hide(), True)[1])
         quit_window.show_all()
