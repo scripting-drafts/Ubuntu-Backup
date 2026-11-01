@@ -2016,7 +2016,7 @@ def preferred_workspace():
     if (parent / "config/settings.json").is_file() or (parent.parent / "manifest.json").is_file():
         if parent != HOME:
             return parent
-    return HOME / "ubuntu-backup-data"
+    return HOME / "ubuntu-backup" / "data"
 
 
 def main():
