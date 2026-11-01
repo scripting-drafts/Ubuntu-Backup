@@ -3821,22 +3821,40 @@ def run_tray():
     history_item.connect("activate", show_history)
     options_item.connect("activate", show_options)
 
-    icon_file = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share")) / \
-        "icons/hicolor/scalable/apps/ubuntu-backup.svg"
-    icon = Gtk.StatusIcon()
-    if icon_file.is_file():
-        icon.set_from_file(str(icon_file))
-    else:
-        icon.set_from_icon_name("media-record-symbolic")
-    icon.set_tooltip_text("Ubuntu Backup")
-    icon.connect("popup-menu", lambda _i, button, activate_time: menu.popup(None, None, None, None, button, activate_time))
-    icon.connect("activate", show_status)
-    icon.set_visible(True)
-    provider = ("statusicon", icon, None)
+    provider = None
+    try:
+        lib = ctypes.CDLL("libayatana-appindicator3.so.1")
+
+        class PyCapsule(ctypes.Structure):
+            _fields_ = [("ob_refcnt", ctypes.c_ssize_t), ("ob_type", ctypes.c_void_p),
+                        ("pointer", ctypes.c_void_p), ("name", ctypes.c_char_p),
+                        ("context", ctypes.c_void_p)]
+
+        def pointer(obj):
+            return PyCapsule.from_address(id(obj.__gpointer__)).pointer
+
+        lib.app_indicator_new.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+        lib.app_indicator_new.restype = ctypes.c_void_p
+        lib.app_indicator_set_status.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.app_indicator_set_menu.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.app_indicator_set_icon_full.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        lib.app_indicator_set_title.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        indicator = lib.app_indicator_new(b"ubuntu-backup", b"media-record-symbolic", 0)
+        lib.app_indicator_set_title(indicator, b"Ubuntu Backup")
+        lib.app_indicator_set_menu(indicator, pointer(menu))
+        lib.app_indicator_set_status(indicator, 1)
+        provider = ("indicator", indicator, lib)
+    except OSError:
+        icon = Gtk.StatusIcon.new_from_icon_name("media-record-symbolic")
+        icon.set_tooltip_text("Ubuntu Backup")
+        icon.connect("popup-menu", lambda _i, button, activate_time: menu.popup(None, None, None, None, button, activate_time))
+        icon.connect("activate", show_status)
+        icon.set_visible(True)
+        provider = ("statusicon", icon, None)
 
     def set_icon(name):
-        if name == "media-record-symbolic" and icon_file.is_file():
-            provider[1].set_from_file(str(icon_file))
+        if provider[0] == "indicator":
+            provider[2].app_indicator_set_icon_full(provider[1], name.encode(), b"Ubuntu Backup")
         else:
             provider[1].set_from_icon_name(name)
 
