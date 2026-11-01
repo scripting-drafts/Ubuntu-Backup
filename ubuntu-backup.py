@@ -3687,10 +3687,8 @@ def run_tray():
             else:
                 return
         except Exception as exc:
-            error = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.ERROR,
-                                      buttons=Gtk.ButtonsType.CLOSE, text=str(exc))
-            error.run()
-            error.destroy()
+            _write_status("failed", "drive", "Drive selection failed: " + str(exc))
+            _status_history("inconsistent", "drive selection failed: " + str(exc))
 
     quit_item.connect("activate", lambda _item: Gtk.main_quit())
     backup_item.connect("activate", launch_backup)
