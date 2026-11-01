@@ -1,10 +1,13 @@
 """Regression tests for the safety-critical helpers in ubuntu-backup.py."""
 
 from collections import namedtuple
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -85,6 +88,46 @@ class CaptureFallbackTests(unittest.TestCase):
             finally:
                 backup.system_integration_inventory = saved
                 live.chmod(0o600)
+
+
+class EmbeddedCollectorTests(unittest.TestCase):
+    def test_missing_optional_root_is_skipped(self):
+        namespace = {
+            "__name__": "root_reference_worker",
+            "__file__": "/tmp/capture-root-configs.py",
+            "SELF_SOURCE": backup.EMBEDDED_ROOT_EXPORTER,
+        }
+        exec(compile(backup.EMBEDDED_ROOT_EXPORTER, "<embedded>", "exec"), namespace)
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            missing = str(Path(directory) / "missing" / "helper.py")
+            files, details = namespace["collect"](os.getuid(), accounts=[], system_roots=[missing])
+            self.assertEqual(details["omissions"], [])
+            self.assertIn("inventory/privileged-links.json", files)
+
+
+class CaptureRootTests(unittest.TestCase):
+    def test_worker_stderr_is_surfaced(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 1, "", "Error: missing parent\n")
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.subprocess.run, backup.KIT
+            backup.subprocess.run = fake_run
+            backup.KIT = Path(directory)
+            stderr = io.StringIO()
+            stdout = io.StringIO()
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(backup.ConfigError) as raised:
+                        backup.capture_root()
+            finally:
+                backup.subprocess.run, backup.KIT = saved
+            self.assertIn("missing parent", str(raised.exception))
+            self.assertIn("missing parent", stderr.getvalue())
+            self.assertEqual(calls[0][1].get("stderr"), subprocess.PIPE)
 
 
 if __name__ == "__main__":
