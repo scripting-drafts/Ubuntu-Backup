@@ -3286,12 +3286,55 @@ def run_tray():
     def launch_backup(_item=None):
         launch_terminal("backup-now")
 
-    def launch_drive(_item=None):
-        launch_terminal("choose-drive")
+    def show_drive_chooser(_item=None):
+        options = []
+        for device in attached_drives():
+            for mountpoint in device.get("mountpoints", []):
+                options.append((f"{mountpoint}  ({device.get('fstype') or 'unknown'}, {device.get('size', 0)} bytes)", mountpoint))
+        dialog = Gtk.Dialog(title="Ubuntu Backup — choose backup drive", flags=0)
+        dialog.set_default_size(680, 180)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Forget current drive", 2)
+        dialog.add_button("Use drive", Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        current = settings().get("external_backup")
+        box.add(Gtk.Label(label="Current: " + (current["mount_point"] if current else "unset"), xalign=0))
+        box.add(Gtk.Label(label="Select an already-mounted filesystem. No disk is formatted or mounted.", xalign=0))
+        chooser = Gtk.ComboBoxText()
+        for label, _mount in options:
+            chooser.append_text(label)
+        if options:
+            chooser.set_active(0)
+        else:
+            chooser.append_text("No mounted drives found")
+            chooser.set_sensitive(False)
+        box.add(chooser)
+        box.show_all()
+        response = dialog.run()
+        selected = options[chooser.get_active()][1] if options and chooser.get_active() >= 0 else None
+        dialog.destroy()
+        try:
+            if response == 2:
+                set_external(None, True)
+                if read_status().get("state") != "running":
+                    _write_status("idle", "drive", "Backup drive forgotten")
+            elif response == Gtk.ResponseType.OK and selected:
+                set_external(selected)
+                if read_status().get("state") != "running":
+                    _write_status("idle", "drive", "Backup drive selected: " + selected)
+            else:
+                return
+        except Exception as exc:
+            error = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.ERROR,
+                                      buttons=Gtk.ButtonsType.CLOSE, text=str(exc))
+            error.run()
+            error.destroy()
 
     quit_item.connect("activate", lambda _item: Gtk.main_quit())
     backup_item.connect("activate", launch_backup)
-    drive_item.connect("activate", launch_drive)
+    drive_item.connect("activate", show_drive_chooser)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
 
