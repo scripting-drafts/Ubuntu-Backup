@@ -1,6 +1,6 @@
 # Ubuntu Backup
 
-- Run `./install.sh`; `./uninstall.sh` removes the program but keeps backups.
+- Run `./install.sh`; `./uninstall.sh` removes the program but keeps backups and runtime traces.
 - Run `./ubuntu-backup.py` for interactive backup/restore; no personal data is bundled.
 - Never publish snapshots or exports; they contain secrets and are not encrypted.
 - External backups use the selected drive root and symlink timelines over a shared baseline.

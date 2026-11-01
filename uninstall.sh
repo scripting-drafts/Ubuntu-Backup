@@ -25,7 +25,7 @@ echo "Program files to remove:"
 for path in "${FILES[@]}"; do
     [[ -e "$path" || -L "$path" ]] && echo "  $path"
 done
-echo "Workspaces to clean (backup directories are preserved):"
+echo "Workspaces preserved (backups and runtime traces):"
 for path in "${WORKSPACES[@]}"; do
     [[ -d "$path" ]] && echo "  $path"
 done
@@ -56,20 +56,7 @@ fi
 for path in "${FILES[@]}"; do
     [[ -e "$path" || -L "$path" ]] && rm -rf -- "$path"
 done
-# Remove program state while keeping backup, snapshot, restore and profile data.
-shopt -s nullglob dotglob
-for workspace in "${WORKSPACES[@]}"; do
-    [[ -d "$workspace" ]] || continue
-    for entry in "$workspace"/*; do
-        name="$(basename "$entry")"
-        case "$name" in
-            backups|snapshot|.previous-snapshot|restored|rollback|profiles|privileged-system)
-                continue
-                ;;
-        esac
-        rm -rf -- "$entry"
-    done
-done
+# Workspace backups, status, history, configuration and other runtime traces are preserved.
 # External backup layouts are intentionally left untouched.
 if sudo -n true 2>/dev/null; then
     for path in /etc/systemd/system/ubuntu-configuration-system.service \
@@ -92,4 +79,4 @@ if [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
 fi
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
-echo "Uninstall complete. Backup files were preserved."
+echo "Uninstall complete. Backups and runtime traces were preserved."
