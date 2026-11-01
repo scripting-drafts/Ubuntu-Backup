@@ -5,6 +5,6 @@
 - Never publish snapshots or exports; they contain secrets and are not encrypted.
 - External backups use the selected drive root and symlink timelines over a shared baseline.
 - Dated configuration copies are external-only by default; set `keep_local_backups` to keep local.
-- One backup action captures configuration and full `/home`; the tray handles drive choice, status, history, and Run backup now.
+- One backup action captures configuration and full `/home`; the tray handles drive choice, status, history, Run backup now, and guarded data purge.
 - Menu 1 offers privileged capture; menu 5 schedules both timers.
 - Full `/home` snapshots are manual, external-only, and require explicit sudo approval.

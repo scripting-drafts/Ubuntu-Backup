@@ -3476,9 +3476,10 @@ def run_tray():
     drive_item = Gtk.MenuItem(label="Choose backup drive")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
+    options_item = Gtk.MenuItem(label="Options")
     quit_item = Gtk.MenuItem(label="Quit icon")
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, history_item, Gtk.SeparatorMenuItem(), quit_item):
+    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, history_item, options_item, Gtk.SeparatorMenuItem(), quit_item):
         menu.append(item)
     menu.show_all()
 
@@ -3576,6 +3577,75 @@ def run_tray():
 
         GLib.timeout_add(500, watch_window)
 
+    def purge_all_data():
+        data = current_status()
+        if data.get("state") == "running":
+            raise ConfigError("Cancel the active backup before purging data.")
+        try:
+            external = settings().get("external_backup")
+        except (OSError, ValueError):
+            external = None
+        script = SCRIPT_PATH.resolve()
+        for entry in list(KIT.iterdir()):
+            if entry.resolve() == script or script.parent == entry:
+                continue
+            if entry.name == ".tray.lock":
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
+        write_json(KIT / "config/settings.json", json.loads(json.dumps(EMBEDDED_DEFAULT_SETTINGS)))
+        if isinstance(external, dict) and external.get("mount_point"):
+            mount = Path(external["mount_point"])
+            marker = mount / (external.get("subdirectory") or "") / ".ubuntu-configuration-target.json"
+            try:
+                marker_value = json.loads(marker.read_text())
+            except (OSError, ValueError):
+                marker_value = {}
+            if marker_value.get("format") == "ubuntu-configuration-v1":
+                root = marker.parent
+                for name in ("baseline", "timeline", "ubuntu-configuration-backups"):
+                    shutil.rmtree(root / name, ignore_errors=True)
+                marker.unlink(missing_ok=True)
+        _write_status("idle", "idle", "All backup data purged")
+        return True
+
+    def show_options(_item=None):
+        dialog = Gtk.Dialog(title="Ubuntu Backup — options", flags=0)
+        dialog.set_default_size(520, 160)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.add_button("Purge all data", 1)
+        box = dialog.get_content_area()
+        box.set_border_width(12)
+        box.set_spacing(8)
+        box.add(Gtk.Label(label="Permanently remove local and configured external backup data, history, logs and runtime state.", xalign=0))
+        box.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if response != 1:
+            return
+        confirm = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.WARNING,
+                                    buttons=Gtk.ButtonsType.YES_NO, text="Purge all backup data?")
+        confirm.format_secondary_text("This permanently deletes backups, snapshots, history, logs and configured external timelines. It cannot be undone.")
+        confirm.set_default_response(Gtk.ResponseType.NO)
+        response = confirm.run()
+        confirm.destroy()
+        if response != Gtk.ResponseType.YES:
+            return
+        try:
+            purge_all_data()
+        except Exception as exc:
+            error = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.ERROR,
+                                      buttons=Gtk.ButtonsType.CLOSE, text=str(exc))
+            error.run()
+            error.destroy()
+            return
+        info = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.INFO,
+                                 buttons=Gtk.ButtonsType.CLOSE, text="All backup data purged.")
+        info.run()
+        info.destroy()
+
     def show_drive_chooser(_item=None):
         options = []
         for device in attached_drives():
@@ -3627,6 +3697,7 @@ def run_tray():
     drive_item.connect("activate", show_drive_chooser)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
+    options_item.connect("activate", show_options)
 
     provider = None
     try:
