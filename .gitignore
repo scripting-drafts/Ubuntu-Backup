@@ -7,3 +7,5 @@
 !drive.sh
 !README.md
 !.gitignore
+!tests/
+!tests/*.py
