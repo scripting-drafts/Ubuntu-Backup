@@ -24,7 +24,7 @@ def write(key, values):
     subprocess.run(["gsettings", "set", "org.gnome.shell", key, repr(values)], check=True)
 
 
-write("enabled-extensions", [item for item in read("enabled-extensions") if item != fork])
+write("enabled-extensions", [item for item in read("enabled-extensions") if item not in (fork, system)])
 write("disabled-extensions", [item for item in read("disabled-extensions") if item not in (fork, system)])
 PY
 if [[ -d "$DEST" ]]; then
@@ -32,8 +32,5 @@ if [[ -d "$DEST" ]]; then
     if [[ "$existing" == "$UUID" ]]; then
         rm -rf "$DEST"
     fi
-fi
-if command -v gnome-extensions >/dev/null; then
-    gnome-extensions enable "$SYSTEM_UUID" >/dev/null 2>&1 || true
 fi
 echo "Removed $UUID; the Ubuntu AppIndicators extension is enabled again."
