@@ -54,25 +54,22 @@ app_path.write_text(app.replace(marker, method + marker, 1))
 icon_path = root / "indicatorStatusIcon.js"
 icon = icon_path.read_text()
 press_marker = "    vfunc_button_press_event(buttonEvent) {\n"
-press = """        if (buttonEvent.button === 3 && this._indicator.id === 'ubuntu-backup') {
-            Main.panel.menuManager._closeMenu(true, Main.panel.menuManager.activeMenu);
-            this._indicator.showQuitMenu(buttonEvent.x, buttonEvent.y);
+press = """    vfunc_event(event) {
+        if (event.type() === Clutter.EventType.BUTTON_PRESS &&
+            event.get_button() === 3 && this._indicator.id === 'ubuntu-backup') {
+            let [x, y] = event.get_coords();
+            if (Main.panel.menuManager.activeMenu)
+                Main.panel.menuManager._closeMenu(true, Main.panel.menuManager.activeMenu);
+            this._indicator.showQuitMenu(x, y);
             return Clutter.EVENT_STOP;
         }
-
-"""
-release_marker = "    vfunc_scroll_event(scrollEvent) {\n"
-release = """    vfunc_button_release_event(buttonEvent) {
-        if (buttonEvent.button === 3 && this._indicator.id === 'ubuntu-backup')
-            return Clutter.EVENT_STOP;
-        return Clutter.EVENT_PROPAGATE;
+        return super.vfunc_event(event);
     }
 
 """
-if icon.count(press_marker) != 1 or icon.count(release_marker) != 1:
+if icon.count(press_marker) != 1:
     raise SystemExit("indicatorStatusIcon.js markers changed; refusing to patch")
-icon = icon.replace(press_marker, press_marker + press, 1)
-icon = icon.replace(release_marker, release + release_marker, 1)
+icon = icon.replace(press_marker, press + press_marker, 1)
 icon_path.write_text(icon)
 PY
 if command -v node >/dev/null; then

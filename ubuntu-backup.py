@@ -3577,6 +3577,9 @@ def run_tray():
     last_history = None
     quit_window = None
     quit_button = None
+    quit_confirm_box = None
+    quit_confirm_button = None
+    quit_cancel_button = None
 
     def update_status():
         if status_window is None or not status_window.get_visible():
@@ -3826,28 +3829,48 @@ def run_tray():
             _write_status("failed", "drive", "Drive selection failed: " + str(exc))
             _status_history("inconsistent", "drive selection failed: " + str(exc))
 
-    quit_state = {"armed": False, "timer": None}
+    quit_state = {"confirming": False, "timer": None}
+    quit_focus = {"ready": False}
 
-    def reset_quit():
-        quit_state["armed"] = False
+    def reset_quit(hide=False):
+        if quit_state["timer"] is not None:
+            GLib.source_remove(quit_state["timer"])
+            quit_state["timer"] = None
+        quit_state["confirming"] = False
+        if quit_confirm_box is not None:
+            quit_confirm_box.hide()
         if quit_button is not None:
-            quit_button.set_label("Quit")
-        quit_state["timer"] = None
+            quit_button.show()
+        if hide and quit_window is not None:
+            quit_focus["ready"] = False
+            quit_window.hide()
         return False
 
-    def quit_action(_item=None):
-        if not quit_state["armed"]:
-            quit_state["armed"] = True
-            if quit_button is not None:
-                quit_button.set_label("Confirm quit")
-            if quit_state["timer"] is not None:
-                GLib.source_remove(quit_state["timer"])
-            quit_state["timer"] = GLib.timeout_add_seconds(5, reset_quit)
-            return
-        Gtk.main_quit()
+    def ask_confirm(_item=None):
+        quit_state["confirming"] = True
+        if quit_button is not None:
+            quit_button.hide()
+        if quit_confirm_box is not None:
+            quit_confirm_box.show_all()
+        if quit_state["timer"] is not None:
+            GLib.source_remove(quit_state["timer"])
+        quit_state["timer"] = GLib.timeout_add_seconds(5, lambda: reset_quit(hide=True))
+        return False
+
+    def quit_focus_ready():
+        quit_focus["ready"] = True
+        return False
+
+    def quit_focus_lost(_window, _event):
+        if quit_focus["ready"]:
+            reset_quit(hide=True)
+        return False
 
     def show_quit_menu():
-        nonlocal quit_window, quit_button
+        nonlocal quit_window, quit_button, quit_confirm_box, quit_confirm_button, quit_cancel_button
+        if quit_window is not None and quit_window.get_visible():
+            reset_quit(hide=True)
+            return False
         if quit_window is None:
             quit_window = Gtk.Window(title="Ubuntu Backup", type=Gtk.WindowType.TOPLEVEL)
             quit_window.set_decorated(False)
@@ -3855,15 +3878,11 @@ def run_tray():
             quit_window.set_skip_taskbar_hint(True)
             quit_window.set_skip_pager_hint(True)
             quit_window.set_keep_above(True)
+            quit_window.set_accept_focus(True)
             quit_window.set_position(Gtk.WindowPosition.MOUSE)
             quit_window.set_name("ubuntu-backup-quit")
-            quit_window.set_app_paintable(True)
-            visual = quit_window.get_screen().get_rgba_visual()
-            if visual is not None:
-                quit_window.set_visual(visual)
             css = Gtk.CssProvider()
             css.load_from_data(b"""
-                #ubuntu-backup-quit { background-color: transparent; }
                 #ubuntu-backup-quit-box {
                     background-color: @theme_bg_color;
                     border: 1px solid alpha(@theme_fg_color, 0.18);
@@ -3876,11 +3895,25 @@ def run_tray():
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             box.set_name("ubuntu-backup-quit-box")
             quit_button = Gtk.Button(label="Quit")
-            quit_button.connect("clicked", quit_action)
+            quit_button.connect("clicked", ask_confirm)
+            quit_confirm_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            quit_confirm_button = Gtk.Button(label="Confirm")
+            quit_cancel_button = Gtk.Button(label="Cancel")
+            quit_confirm_button.connect("clicked", lambda _button: Gtk.main_quit())
+            quit_cancel_button.connect("clicked", lambda _button: reset_quit(hide=True))
+            quit_confirm_box.pack_start(quit_confirm_button, True, True, 0)
+            quit_confirm_box.pack_start(quit_cancel_button, True, True, 0)
             box.pack_start(quit_button, False, False, 0)
+            box.pack_start(quit_confirm_box, False, False, 0)
             quit_window.add(box)
-            quit_window.connect("delete-event", lambda window, _event: (window.hide(), True)[1])
-        quit_window.show_all()
+            quit_window.connect("focus-out-event", quit_focus_lost)
+            quit_window.connect("delete-event", lambda window, _event: (reset_quit(hide=True), True)[1])
+            quit_window.show_all()
+            quit_window.hide()
+        reset_quit()
+        quit_focus["ready"] = False
+        GLib.timeout_add(250, quit_focus_ready)
+        quit_window.show()
         quit_window.present()
         return False
 
