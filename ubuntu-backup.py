@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import pwd
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -1982,6 +1983,8 @@ def main():
     elif command == "backup-now":
         if not interactive:
             raise ConfigError("The manual backup action needs an interactive terminal.")
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
+        signal.signal(signal.SIGHUP, signal.default_int_handler)
         backup_everything()
     elif command == "choose-drive":
         if not interactive:
@@ -2654,7 +2657,7 @@ def _history_path():
 
 
 def _write_status(state, phase, message, **extra):
-    payload = {"state": state, "phase": phase, "message": message,
+    payload = {"state": state, "phase": phase, "message": message, "pid": os.getpid(),
                "updated": dt.datetime.now(dt.timezone.utc).isoformat(), **extra}
     try:
         mkdir(KIT)
@@ -3281,10 +3284,30 @@ def run_tray():
         terminal_name = os.path.basename(os.path.realpath(terminal))
         arguments = [terminal, "--", *command] if terminal_name in ("gnome-terminal", "kgx") \
             else [terminal, "-e", " ".join(shlex.quote(part) for part in command)]
-        subprocess.Popen(arguments, start_new_session=True, close_fds=True)
+        return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
 
     def launch_backup(_item=None):
-        launch_terminal("backup-now")
+        process = launch_terminal("backup-now")
+        if process is None:
+            return
+
+        def watch_window():
+            if process.poll() is None:
+                return True
+            data = read_status()
+            if data.get("state") == "running":
+                pid = data.get("pid")
+                if isinstance(pid, int):
+                    try:
+                        if os.getsid(pid) == process.pid:
+                            os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                _write_status("cancelled", "cancelled", "Backup cancelled: terminal window closed")
+                _status_history("cancelled", "Backup cancelled: terminal window closed")
+            return False
+
+        GLib.timeout_add(500, watch_window)
 
     def show_drive_chooser(_item=None):
         options = []
