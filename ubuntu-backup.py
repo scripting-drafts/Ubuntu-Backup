@@ -3478,7 +3478,7 @@ def run_tray():
     import ctypes
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import GLib, Gtk
+    from gi.repository import GLib, Gio, Gtk
 
     try:
         lock_fd = os.open(KIT / ".tray.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -3490,7 +3490,8 @@ def run_tray():
         try:
             return json.loads(_status_path().read_text())
         except (OSError, ValueError):
-            return {"state": "idle", "phase": "idle", "message": "No backup running"}
+            return {"state": "idle", "phase": "idle", "message": "No backup running",
+                    "updated": dt.datetime.now(dt.timezone.utc).isoformat()}
 
     stale_marks = set()
 
@@ -3840,6 +3841,19 @@ def run_tray():
             provider[1].set_from_icon_name(name)
 
     toggle = [False]
+    last_monitor_state = [None]
+    monitor_log = None
+    try:
+        monitor_log = RotatingLog(KIT / "logs" / "monitor.log",
+                                   segment_bytes=64 * 1024 * 1024, segments=2)
+    except OSError:
+        monitor_log = None
+
+    def monitor_event(message):
+        if monitor_log is None:
+            return
+        monitor_log.write(dt.datetime.now(dt.timezone.utc).isoformat() +
+                          " MONITOR " + message + "\n")
 
     def refresh():
         data = current_status()
@@ -3860,9 +3874,27 @@ def run_tray():
             set_icon("dialog-information-symbolic" if state == "complete" else
                      "dialog-error-symbolic" if state == "failed" else
                      "dialog-warning-symbolic" if state == "cancelled" else "media-record-symbolic")
+        signature = (data.get("state"), data.get("phase"), data.get("message"))
+        if signature != last_monitor_state[0]:
+            last_monitor_state[0] = signature
+            monitor_event("state=" + str(signature[0]) + " phase=" + str(signature[1]) +
+                          " message=" + str(signature[2]))
         return True
 
-    GLib.timeout_add(750, refresh)
+    GLib.timeout_add(1000, refresh)
+
+    file_monitor = Gio.File.new_for_path(str(KIT)).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+
+    def on_file_change(_monitor, changed, _other, _event):
+        name = changed.get_basename() if changed is not None else None
+        if name in ("status.json", "history.txt"):
+            refresh()
+            if status_window is not None and status_window.get_visible():
+                update_status()
+            if history_window is not None and history_window.get_visible():
+                update_history()
+    file_monitor.connect("changed", on_file_change)
+
     refresh()
     Gtk.main()
     return 0
