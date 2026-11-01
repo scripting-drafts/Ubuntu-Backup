@@ -1776,16 +1776,38 @@ def interactive_backup():
 
 def backup_everything():
     """Single flow: privileged configuration, configuration backup, full /home."""
-    if confirm("Refresh system-wide configuration with sudo before backing up?"):
-        capture_root(hide_followup_hint=True)
-    path = interactive_backup()
-    print("Configuration backup complete; continuing with full /home.")
-    home_done = wizard_home_backup()
-    if home_done:
-        print("Backup operation complete: configuration and full /home.")
-    else:
-        print("Backup operation complete: configuration only; full /home was skipped.")
-    return path
+    global _STATUS_RUN
+    _STATUS_RUN = True
+    _write_status("running", "preparing", "Preparing backup")
+    _ensure_tray()
+    try:
+        if confirm("Refresh system-wide configuration with sudo before backing up?"):
+            _write_status("running", "privileged", "Capturing system-wide configuration")
+            capture_root(hide_followup_hint=True)
+        _write_status("running", "configuration", "Capturing configuration")
+        path = interactive_backup()
+        _write_status("running", "full_home", "Capturing full /home")
+        print("Configuration backup complete; continuing with full /home.")
+        home_done = wizard_home_backup()
+        message = ("Backup operation complete: configuration and full /home."
+                   if home_done else
+                   "Backup operation complete: configuration only; full /home was skipped.")
+        _write_status("complete", "complete", message, result=str(path) if path else None)
+        _status_history("complete", message, path)
+        print(message)
+        return path
+    except KeyboardInterrupt:
+        message = "Backup cancelled; no partial backup was published."
+        _write_status("cancelled", "cancelled", message)
+        _status_history("cancelled", message)
+        raise
+    except Exception as exc:
+        message = f"Backup failed: {type(exc).__name__}: {exc}"
+        _write_status("failed", "failed", message)
+        _status_history("failed", message)
+        raise
+    finally:
+        _STATUS_RUN = False
 
 
 def retention_value():
@@ -1887,6 +1909,7 @@ def main():
         "menu": "Open the interactive menu (default)", "backup": "Capture a verified backup",
         "status": "Show workspace, drive and scheduler status",
         "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
+        "tray": "Show the backup status icon",
     }
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
@@ -1952,6 +1975,8 @@ def main():
             restore_home(args.timeline)
     elif command == "status":
         show_status()
+    elif command == "tray":
+        return run_tray()
     elif command == "deploy":
         if interactive:
             wizard_deploy(Path(args.snapshot).expanduser() if args.snapshot else None)
@@ -2607,6 +2632,65 @@ def clean_created_objects(created):
             pass
 
 
+_STATUS_RUN = False
+
+
+def _status_path():
+    return KIT / "status.json"
+
+
+def _history_path():
+    return KIT / "history.txt"
+
+
+def _write_status(state, phase, message, **extra):
+    payload = {"state": state, "phase": phase, "message": message,
+               "updated": dt.datetime.now(dt.timezone.utc).isoformat(), **extra}
+    try:
+        mkdir(KIT)
+        temporary = KIT / (".status-" + str(os.getpid()))
+        temporary.write_text(json.dumps(payload, indent=2) + "\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, _status_path())
+        _status_path().chmod(0o600)
+    except OSError:
+        temporary.unlink(missing_ok=True) if "temporary" in locals() else None
+
+
+def _status_history(state, message, result=None):
+    try:
+        line = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        line += f"  {state.upper():9}  {message}"
+        if result:
+            line += f"  ->  {result}"
+        with _history_path().open("a") as stream:
+            stream.write(line + "\n")
+        _history_path().chmod(0o600)
+    except OSError:
+        pass
+
+
+def _ensure_tray():
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return
+    try:
+        lock_fd = os.open(KIT / ".tray.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        return
+    os.close(lock_fd)
+    try:
+        subprocess.Popen([sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "tray"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                         close_fds=True)
+    except OSError:
+        pass
+
+
 class ProgressBar:
     def __init__(self, label, width=28):
         self.label = label
@@ -3091,6 +3175,152 @@ def root_home_backup(workspace):
             shutil.rmtree(temporary)
             clean_created_objects(created)
         os.close(fd)
+
+def run_tray():
+    """Top-bar status icon: flickers while running; menu shows live status/history."""
+    import ctypes
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk
+
+    try:
+        lock_fd = os.open(KIT / ".tray.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 1
+
+    def read_status():
+        try:
+            return json.loads(_status_path().read_text())
+        except (OSError, ValueError):
+            return {"state": "idle", "phase": "idle", "message": "No backup running"}
+
+    status_item = Gtk.MenuItem(label="Idle")
+    status_item.set_sensitive(False)
+    live_item = Gtk.MenuItem(label="Live status")
+    history_item = Gtk.MenuItem(label="History")
+    quit_item = Gtk.MenuItem(label="Quit icon")
+    menu = Gtk.Menu()
+    for item in (status_item, live_item, history_item, Gtk.SeparatorMenuItem(), quit_item):
+        menu.append(item)
+    menu.show_all()
+
+    window = None
+    text = None
+    progress = None
+    refresh_source = None
+
+    def update_window():
+        if window is None or not window.get_visible():
+            return True
+        data = read_status()
+        progress.pulse()
+        text.set_text(f"State: {data.get('state', 'idle')}\n"
+                      f"Phase: {data.get('phase', '')}\n"
+                      f"Updated: {data.get('updated', '')}\n\n"
+                      f"{data.get('message', '')}")
+        return True
+
+    def show_status(_item=None):
+        nonlocal window, text, progress, refresh_source
+        if window is None:
+            window = Gtk.Window(title="Ubuntu Backup — live status")
+            window.set_default_size(520, 240)
+            window.connect("delete-event", lambda w, e: (w.hide(), True)[1])
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.set_border_width(12)
+            progress = Gtk.ProgressBar()
+            text = Gtk.Label(xalign=0, yalign=0)
+            text.set_selectable(True)
+            box.pack_start(progress, False, False, 0)
+            box.pack_start(text, True, True, 0)
+            window.add(box)
+            refresh_source = GLib.timeout_add(500, update_window)
+        window.show_all()
+
+    def show_history(_item=None):
+        data = read_status()
+        body = ""
+        try:
+            body = _history_path().read_text()
+        except OSError:
+            body = "No history yet."
+        dialog = Gtk.Dialog(title="Ubuntu Backup — history", flags=0)
+        dialog.set_default_size(780, 420)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        view = Gtk.TextView(editable=False, monospace=True)
+        view.get_buffer().set_text(body)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(view)
+        dialog.get_content_area().add(scroll)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    quit_item.connect("activate", lambda _item: Gtk.main_quit())
+    live_item.connect("activate", show_status)
+    history_item.connect("activate", show_history)
+
+    provider = None
+    try:
+        lib = ctypes.CDLL("libayatana-appindicator3.so.1")
+
+        class PyCapsule(ctypes.Structure):
+            _fields_ = [("ob_refcnt", ctypes.c_ssize_t), ("ob_type", ctypes.c_void_p),
+                        ("pointer", ctypes.c_void_p), ("name", ctypes.c_char_p),
+                        ("context", ctypes.c_void_p)]
+
+        def pointer(obj):
+            return PyCapsule.from_address(id(obj.__gpointer__)).pointer
+
+        lib.app_indicator_new.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+        lib.app_indicator_new.restype = ctypes.c_void_p
+        lib.app_indicator_set_status.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.app_indicator_set_menu.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.app_indicator_set_icon_full.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        lib.app_indicator_set_title.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        indicator = lib.app_indicator_new(b"ubuntu-backup", b"media-record-symbolic", 0)
+        lib.app_indicator_set_title(indicator, b"Ubuntu Backup")
+        lib.app_indicator_set_menu(indicator, pointer(menu))
+        lib.app_indicator_set_status(indicator, 1)
+        provider = ("indicator", indicator, lib)
+    except OSError:
+        icon = Gtk.StatusIcon.new_from_icon_name("media-record-symbolic")
+        icon.set_tooltip_text("Ubuntu Backup")
+        icon.connect("popup-menu", lambda _i, button, activate_time: menu.popup(None, None, None, None, button, activate_time))
+        icon.connect("activate", show_status)
+        icon.set_visible(True)
+        provider = ("statusicon", icon, None)
+
+    def set_icon(name):
+        if provider[0] == "indicator":
+            provider[2].app_indicator_set_icon_full(provider[1], name.encode(), b"Ubuntu Backup")
+        else:
+            provider[1].set_from_icon_name(name)
+
+    toggle = [False]
+
+    def refresh():
+        data = read_status()
+        running = data.get("state") == "running"
+        label = data.get("message") or data.get("state", "idle")
+        status_item.set_label(label[:90])
+        if running:
+            toggle[0] = not toggle[0]
+            set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
+        else:
+            state = data.get("state")
+            set_icon("dialog-information-symbolic" if state == "complete" else
+                     "dialog-error-symbolic" if state == "failed" else
+                     "dialog-warning-symbolic" if state == "cancelled" else "media-record-symbolic")
+        menu.show_all()
+        return True
+
+    GLib.timeout_add(750, refresh)
+    refresh()
+    Gtk.main()
+    return 0
+
 
 # BEGIN UBUNTU CONFIGURATION PROFILE
 EMBEDDED_PROFILE = ''
