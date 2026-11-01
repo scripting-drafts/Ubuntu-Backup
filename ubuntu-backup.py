@@ -1911,6 +1911,7 @@ def main():
         "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
         "backup-now": "Run the combined backup in this terminal",
+        "choose-drive": "Select the mounted backup drive",
     }
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
@@ -1982,6 +1983,10 @@ def main():
         if not interactive:
             raise ConfigError("The manual backup action needs an interactive terminal.")
         backup_everything()
+    elif command == "choose-drive":
+        if not interactive:
+            raise ConfigError("Drive selection needs an interactive terminal.")
+        wizard_drive()
     elif command == "deploy":
         if interactive:
             wizard_deploy(Path(args.snapshot).expanduser() if args.snapshot else None)
@@ -3203,11 +3208,12 @@ def run_tray():
     status_item = Gtk.MenuItem(label="Idle")
     status_item.set_sensitive(False)
     backup_item = Gtk.MenuItem(label="Run backup now")
+    drive_item = Gtk.MenuItem(label="Choose backup drive")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
     quit_item = Gtk.MenuItem(label="Quit icon")
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), live_item, history_item, Gtk.SeparatorMenuItem(), quit_item):
+    for item in (status_item, backup_item, drive_item, Gtk.SeparatorMenuItem(), live_item, history_item, Gtk.SeparatorMenuItem(), quit_item):
         menu.append(item)
     menu.show_all()
 
@@ -3263,9 +3269,9 @@ def run_tray():
         dialog.run()
         dialog.destroy()
 
-    def launch_backup(_item=None):
+    def launch_terminal(action):
         import shlex
-        command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "backup-now"]
+        command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT), action]
         terminal = next((shutil.which(name) for name in
                          ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
                          if shutil.which(name)), None)
@@ -3277,8 +3283,15 @@ def run_tray():
             else [terminal, "-e", " ".join(shlex.quote(part) for part in command)]
         subprocess.Popen(arguments, start_new_session=True, close_fds=True)
 
+    def launch_backup(_item=None):
+        launch_terminal("backup-now")
+
+    def launch_drive(_item=None):
+        launch_terminal("choose-drive")
+
     quit_item.connect("activate", lambda _item: Gtk.main_quit())
     backup_item.connect("activate", launch_backup)
+    drive_item.connect("activate", launch_drive)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
 

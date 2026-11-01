@@ -2,11 +2,8 @@
 # Install the single-file Ubuntu Backup tool, launcher, icon, and tray autostart.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AUTOSTART=1
-if [[ "${1:-}" == "--no-autostart" ]]; then
-    AUTOSTART=0
-elif [[ $# -gt 0 ]]; then
-    echo "Usage: ./install.sh [--no-autostart]" >&2
+if (( $# )); then
+    echo "Usage: ./install.sh" >&2
     exit 2
 fi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
@@ -33,8 +30,7 @@ Icon=ubuntu-backup
 Terminal=true
 Categories=Utility;
 EOF
-if (( AUTOSTART )); then
-    cat > "$AUTODIR/ubuntu-backup-tray.desktop" <<EOF
+cat > "$AUTODIR/ubuntu-backup-tray.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Ubuntu Backup tray
@@ -44,19 +40,6 @@ Icon=ubuntu-backup
 Terminal=false
 X-GNOME-Autostart-enabled=true
 EOF
-fi
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
-echo "Installed $BIN/ubuntu-backup.py"
-echo
-echo "Next steps:"
-if (( AUTOSTART )); then
-    echo "1. Log out and back in to start the tray icon."
-else
-    echo "1. Start the tray icon now: $BIN/ubuntu-backup.py tray"
-fi
-echo "2. Open Ubuntu Backup, choose 4, and select the mounted backup drive."
-echo "3. Choose 1 to run the first backup."
-if (( AUTOSTART )); then
-    echo "The tray icon starts at next login; run $BIN/ubuntu-backup.py tray to start it now."
-fi
+echo "Log out and back in to start Ubuntu Backup."
