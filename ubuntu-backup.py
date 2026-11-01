@@ -910,7 +910,8 @@ def saved_drive_location(external):
             mount = Path(name)
             if mount_info(mount)["uuid"] != external["filesystem_uuid"]:
                 continue
-            directory = checked_path(mount, external["subdirectory"])
+            subdirectory = external.get("subdirectory", "")
+            directory = checked_path(mount, subdirectory) if subdirectory else mount
             marker = directory / ".ubuntu-configuration-target.json"
             if directory.stat().st_mode & 0o077 or marker.is_symlink():
                 continue
@@ -1003,8 +1004,8 @@ def set_external(mount_point, disable=False):
             raise ConfigError("Supply the mount point of the drive AFTER you prepare and mount it.")
         mount = Path(mount_point).expanduser().resolve()
         information = mount_info(mount)
-        subdirectory = f"ubuntu-configuration-backups/{socket.gethostname()}-{HOME.name}"
-        directory = checked_path(mount, subdirectory)
+        subdirectory = ""
+        directory = mount
         marker = directory / ".ubuntu-configuration-target.json"
         if directory.exists() and any(directory.iterdir()) and not marker.is_file():
             raise ConfigError("Refusing to adopt a nonempty directory without a backup marker.")
@@ -1026,7 +1027,7 @@ def set_external(mount_point, disable=False):
                                      "subdirectory": subdirectory, "marker_id": marker_id}
     write_json(KIT / "config/settings.json", config)
     print("External backup disabled; existing drive data was not removed." if disable else
-          "Backup drive configured. No disk was formatted; the next backup will also copy there.")
+          "Backup drive configured at its root. No disk was formatted; the next backup will also copy there.")
 
 
 def backup(skip_external=False):
@@ -1762,7 +1763,11 @@ def backup_everything():
         capture_root(hide_followup_hint=True)
     path = interactive_backup()
     print("Configuration backup complete; continuing with full /home.")
-    wizard_home_backup()
+    home_done = wizard_home_backup()
+    if home_done:
+        print("Backup operation complete: configuration and full /home.")
+    else:
+        print("Backup operation complete: configuration only; full /home was skipped.")
     return path
 
 
@@ -2938,7 +2943,7 @@ def wizard_home_backup():
     config = settings()
     if not config["external_backup"]:
         print("Choose and mount the backup drive first (menu 4). No /home data was read or copied.")
-        return
+        return False
     directory = external_directory(config)
     identity = home_identity()
     nested = [entry["mount"] for entry in identity["mounts"] if entry["mount"] != "/home"]
@@ -2957,11 +2962,12 @@ def wizard_home_backup():
     if changed:
         print("Hardware/mount layout is new or changed. Explicit review is required; nothing is adapted on backup.")
         if ask("Type APPROVE SOURCE LAYOUT to approve this exact layout") != "APPROVE SOURCE LAYOUT":
-            return
+            return False
         write_json(baseline, identity)
     if ask("Type BACK UP ALL HOME to start the sudo, read-only capture") != "BACK UP ALL HOME":
-        return
+        return False
     subprocess.run(["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "_backup-home-worker"], check=True)
+    return True
 
 
 def root_home_backup(workspace):
