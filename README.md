@@ -1,10 +1,10 @@
 # Ubuntu Backup
 
-- Run `./ubuntu-backup.py` for interactive backup and restore; no personal data is bundled.
+- Run `./install.sh` to install the launcher, icon, and optional tray autostart.
+- Run `./ubuntu-backup.py` for interactive backup/restore; no personal data is bundled.
 - Never publish snapshots or exports; they contain secrets and are not encrypted.
-- External timelines use symlinks over a shared content baseline.
-- Backups use the selected drive root directly; no host/user subfolder.
+- External backups use the selected drive root and symlink timelines over a shared baseline.
 - Dated configuration copies are external-only by default; set `keep_local_backups` to keep local.
-- One backup action captures configuration and full `/home`; the tray icon shows live status and history.
+- One backup action captures configuration and full `/home`; the tray shows status, history, and Run backup now.
 - Menu 1 offers privileged capture; menu 5 schedules both timers.
 - Full `/home` snapshots are manual, external-only, and require explicit sudo approval.
