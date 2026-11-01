@@ -3483,15 +3483,15 @@ def run_tray():
         menu.append(item)
     menu.show_all()
 
-    window = None
-    notebook = None
-    text = None
+    status_window = None
+    status_text = None
     progress = None
+    history_window = None
     history_view = None
-    refresh_source = None
+    last_history = None
 
-    def update_window():
-        if window is None or not window.get_visible():
+    def update_status():
+        if status_window is None or not status_window.get_visible():
             return True
         data = current_status()
         if data.get("state") == "running":
@@ -3500,52 +3500,58 @@ def run_tray():
             progress.set_fraction(1.0)
         else:
             progress.set_fraction(0.0)
-        text.set_text(f"State: {data.get('state', 'idle')}\n"
-                      f"Phase: {data.get('phase', '')}\n"
-                      f"Updated: {data.get('updated', '')}\n\n"
-                      f"{data.get('message', '')}")
-        if history_view is not None:
-            try:
-                body = _history_path().read_text()
-            except OSError:
-                body = "No history yet."
+        status_text.set_text(f"State: {data.get('state', 'idle')}\n"
+                             f"Phase: {data.get('phase', '')}\n"
+                             f"Updated: {data.get('updated', '')}\n\n"
+                             f"{data.get('message', '')}")
+        return True
+
+    def update_history():
+        nonlocal last_history
+        if history_window is None or not history_window.get_visible():
+            return True
+        try:
+            body = _history_path().read_text()
+        except OSError:
+            body = "No history yet."
+        if body != last_history:
+            last_history = body
             history_view.get_buffer().set_text(body)
         return True
 
-    def ensure_window():
-        nonlocal window, notebook, text, progress, history_view, refresh_source
-        if window is not None:
-            return
-        window = Gtk.Window(title="Ubuntu Backup")
-        window.set_default_size(680, 460)
-        window.connect("delete-event", lambda w, e: (w.hide(), True)[1])
-        notebook = Gtk.Notebook()
-        status_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        status_page.set_border_width(12)
-        progress = Gtk.ProgressBar()
-        text = Gtk.Label(xalign=0, yalign=0)
-        text.set_selectable(True)
-        status_page.pack_start(progress, False, False, 0)
-        status_page.pack_start(text, True, True, 0)
-        notebook.append_page(status_page, Gtk.Label(label="Status"))
-        history_page = Gtk.ScrolledWindow()
-        history_view = Gtk.TextView(editable=False, monospace=True)
-        history_page.add(history_view)
-        notebook.append_page(history_page, Gtk.Label(label="History"))
-        window.add(notebook)
-        refresh_source = GLib.timeout_add(500, update_window)
-
-    def show_tab(index):
-        ensure_window()
-        notebook.set_current_page(index)
-        window.show_all()
-        window.present()
-
     def show_status(_item=None):
-        show_tab(0)
+        nonlocal status_window, status_text, progress
+        if status_window is None:
+            status_window = Gtk.Window(title="Ubuntu Backup — Live status")
+            status_window.set_default_size(520, 240)
+            status_window.connect("delete-event", lambda w, e: (w.hide(), True)[1])
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.set_border_width(12)
+            progress = Gtk.ProgressBar()
+            status_text = Gtk.Label(xalign=0, yalign=0)
+            status_text.set_selectable(True)
+            box.pack_start(progress, False, False, 0)
+            box.pack_start(status_text, True, True, 0)
+            status_window.add(box)
+            GLib.timeout_add(500, update_status)
+        status_window.show_all()
+        status_window.present()
 
     def show_history(_item=None):
-        show_tab(1)
+        nonlocal history_window, history_view, last_history
+        if history_window is None:
+            history_window = Gtk.Window(title="Ubuntu Backup — History")
+            history_window.set_default_size(780, 420)
+            history_window.connect("delete-event", lambda w, e: (w.hide(), True)[1])
+            history_view = Gtk.TextView(editable=False, monospace=True)
+            scroll = Gtk.ScrolledWindow()
+            scroll.add(history_view)
+            history_window.add(scroll)
+            last_history = None
+            update_history()
+            GLib.timeout_add(1000, update_history)
+        history_window.show_all()
+        history_window.present()
 
     def launch_terminal(action):
         import shlex
