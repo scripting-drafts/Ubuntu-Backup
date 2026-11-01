@@ -1087,6 +1087,8 @@ def backup(skip_external=False):
                 try:
                     external_path = copy_external_snapshot(current, config)
                 except (ConfigError, OSError, ValueError, KeyError, tarfile.TarError) as exc:
+                    if isinstance(exc, FileNotFoundError):
+                        raise ConfigError("Workspace disappeared during backup; no partial backup was published.") from None
                     if local_path is None:
                         raise ConfigError(f"External linked copy failed; no local backup was kept: {exc}") from None
                     raise ConfigError(f"Local backup succeeded, but external linked copy failed: {exc}") from None
@@ -1351,9 +1353,13 @@ def private_workspace(path):
     if path.exists():
         if not path.is_dir() or path.stat().st_uid != os.geteuid():
             raise ConfigError("Workspace must be an owned, real directory.")
-        if any(path.iterdir()) and not (path / "config/settings.json").is_file():
+        entries = {entry.name for entry in path.iterdir()}
+        known = {"backups", "snapshot", ".previous-snapshot", "restored", "rollback",
+                 "plans", "profiles", "privileged-system", "system-integration-recovery",
+                 "config", "logs", "status.json", "history.txt", ".tray.lock", ".maintenance.lock"}
+        if entries and not (path / "config/settings.json").is_file():
             # A recovered archive's kit/ is also a valid starting workspace.
-            if not (path.parent / "manifest.json").is_file():
+            if not entries <= known and not (path.parent / "manifest.json").is_file():
                 raise ConfigError("Refusing to adopt a nonempty, unrecognized workspace.")
     mkdir(path)
     path.chmod(0o700)
@@ -2780,7 +2786,8 @@ def _write_status(state, phase, message, **extra):
     payload = {"state": state, "phase": phase, "message": message, "pid": os.getpid(),
                "updated": dt.datetime.now(dt.timezone.utc).isoformat(), **extra}
     try:
-        mkdir(KIT)
+        if not KIT.is_dir():
+            return
         temporary = KIT / (".status-" + str(os.getpid()))
         temporary.write_text(json.dumps(payload, indent=2) + "\n")
         temporary.chmod(0o600)
