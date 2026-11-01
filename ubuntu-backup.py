@@ -953,9 +953,17 @@ def pinned_external(config):
         os.close(fd)
 
 
+MIN_EXTERNAL_FREE_BYTES = 64 * 1024 * 1024
+
+
 def validate_external_target(external):
-    """Reject source filesystems and non-POSIX/writable backup targets."""
+    """Reject source filesystems, full targets, and non-POSIX/writable backup targets."""
     with pinned_external({"external_backup": external}) as (root, directory):
+        free = shutil.disk_usage(root).free
+        if free < MIN_EXTERNAL_FREE_BYTES:
+            raise ConfigError(
+                f"Backup drive has only {free // (1024 * 1024)} MiB free; "
+                f"at least {MIN_EXTERNAL_FREE_BYTES // (1024 * 1024)} MiB is required.")
         probe = Path(tempfile.mkdtemp(prefix=".backup-probe-", dir=root))
         try:
             source = probe / "file"
@@ -2885,7 +2893,7 @@ def _status_history(state, message, result=None):
         pass
 
 
-LOG_SEGMENT_BYTES = 256 * 1024 * 1024
+LOG_SEGMENT_BYTES = 16 * 1024 * 1024
 LOG_SEGMENTS = 4
 
 
@@ -3649,22 +3657,22 @@ def run_tray():
             else [terminal, "-e", " ".join(shlex.quote(part) for part in command)]
         return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
 
-    drive_cache = {"at": 0.0, "ready": False}
+    drive_cache = {"at": 0.0, "ready": False, "error": None}
 
-    def drive_ready():
+    def drive_ready(force=False):
         import time
         now = time.monotonic()
-        if now - drive_cache["at"] < 30:
+        if not force and now - drive_cache["at"] < 30:
             return drive_cache["ready"]
         try:
             if not settings().get("external_backup"):
-                ready = False
+                ready, error = False, None
             else:
                 validate_external_target(settings()["external_backup"])
-                ready = True
-        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
-            ready = False
-        drive_cache.update(at=now, ready=ready)
+                ready, error = True, None
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            ready, error = False, str(exc)
+        drive_cache.update(at=now, ready=ready, error=error)
         return ready
 
     def backup_action(_item=None):
@@ -3677,17 +3685,12 @@ def run_tray():
                 except OSError:
                     pass
             return
-        if backup_item.get_label() == "Select a backup drive first" or not drive_ready():
+        if not drive_ready(force=True):
+            if drive_cache["error"]:
+                message = "Backup cancelled: " + drive_cache["error"]
+                _write_status("cancelled", "cancelled", message)
+                _status_history("cancelled", message)
             GLib.idle_add(lambda: (show_drive_chooser(), False)[1])
-            return
-        try:
-            if not settings().get("external_backup"):
-                raise ConfigError("No backup drive selected.")
-            validate_external_target(settings()["external_backup"])
-        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-            message = "Backup cancelled: " + str(exc)
-            _write_status("cancelled", "cancelled", message)
-            _status_history("cancelled", message)
             return
         process = launch_terminal("backup-now")
         if process is None:
