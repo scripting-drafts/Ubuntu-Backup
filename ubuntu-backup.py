@@ -1382,6 +1382,36 @@ def refresh_manifest(directory, created_at=None):
                                            "files": records})
 
 
+def system_integration_inventory():
+    """Metadata only: no secrets; records managed system timer/helper state."""
+    paths = [
+        ("service", Path("/etc/systemd/system/ubuntu-configuration-system.service")),
+        ("timer", Path("/etc/systemd/system/ubuntu-configuration-system.timer")),
+        ("helper", Path("/usr/local/libexec/ubuntu-configuration-system-capture.py")),
+    ]
+    units = []
+    for role, path in paths:
+        entry = {"role": role, "path": str(path), "present": path.is_file() and not path.is_symlink()}
+        if entry["present"]:
+            info = path.stat()
+            entry.update({"mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid,
+                          "sha256": digest(path)})
+            if role in ("service", "timer"):
+                unit = path.name
+                for key, command in (("enabled", ["systemctl", "is-enabled", unit]),
+                                     ("active", ["systemctl", "is-active", unit])):
+                    try:
+                        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                        entry[key] = result.stdout.strip() or "unknown"
+                    except (OSError, subprocess.SubprocessError):
+                        entry[key] = "unknown"
+        elif role in ("service", "timer"):
+            entry.update({"enabled": "not-installed", "active": "not-installed"})
+        units.append(entry)
+    return {"format": "ubuntu-system-integration-v1",
+            "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(), "items": units}
+
+
 def build_snapshot(destination, config):
     selected = copy.deepcopy(config)
     try:
@@ -1389,6 +1419,7 @@ def build_snapshot(destination, config):
     except ValueError:
         pass
     report = _original_build_snapshot(destination, selected)
+    write_json(destination / "inventory/system-integration.json", system_integration_inventory())
     write(destination / "kit" / SCRIPT_PATH.name, SCRIPT_PATH.read_bytes(), executable=True)
     refresh_manifest(destination)
     return report

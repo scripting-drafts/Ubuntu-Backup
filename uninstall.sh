@@ -106,27 +106,26 @@ for workspace in map(Path, sys.argv[1:]):
     print("Purged backup layout:", root)
 PY
 fi
-if sudo -n true 2>/dev/null; then
+SYSTEM_PRESENT=0
+for path in /etc/systemd/system/ubuntu-configuration-system.service \
+            /etc/systemd/system/ubuntu-configuration-system.timer \
+            /usr/local/libexec/ubuntu-configuration-system-capture.py; do
+    [[ -e "$path" ]] && SYSTEM_PRESENT=1
+done
+if (( SYSTEM_PRESENT )) && [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
+    echo "Removing system-wide timer/helper (sudo required)."
+    sudo systemctl disable --now ubuntu-configuration-system.timer 2>/dev/null || true
     for path in /etc/systemd/system/ubuntu-configuration-system.service \
                 /etc/systemd/system/ubuntu-configuration-system.timer; do
         if [[ -f "$path" ]] && grep -q 'Managed by ubuntu-configuration' "$path"; then
-            sudo rm -f -- "$path"
+            sudo rm -f -- "$path" || echo "Could not remove: $path"
         fi
     done
     helper=/usr/local/libexec/ubuntu-configuration-system-capture.py
     if [[ -f "$helper" ]] && grep -q 'Managed by ubuntu-configuration' "$helper"; then
-        sudo rm -f -- "$helper"
+        sudo rm -f -- "$helper" || echo "Could not remove: $helper"
     fi
-    sudo systemctl disable --now ubuntu-configuration-system.timer 2>/dev/null || true
     sudo systemctl daemon-reload 2>/dev/null || true
-else
-    for path in /etc/systemd/system/ubuntu-configuration-system.service \
-                /etc/systemd/system/ubuntu-configuration-system.timer \
-                /usr/local/libexec/ubuntu-configuration-system-capture.py; do
-        if [[ -e "$path" ]]; then
-            echo "System-wide timer/helper not removed (sudo required): $path"
-        fi
-    done
 fi
 if [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
