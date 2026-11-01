@@ -4,5 +4,6 @@
 !install.sh
 !uninstall.sh
 !refresh.sh
+!drive.sh
 !README.md
 !.gitignore
