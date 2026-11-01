@@ -22,7 +22,8 @@ WORKSPACES=("$HOME/ubuntu-backup-data" "$HOME/ubuntu-configuration")
 FILES=("$BIN/ubuntu-backup.py" "$HOME/ubuntu-backup.py" "$HOME/ubuntu-configuration.py"
        "$HOME/ubuntu-backup.zip" "$APPS/ubuntu-backup.desktop" "$AUTOSTART" "$ICON"
        "$CONFIG/systemd/user/ubuntu-configuration-backup.service"
-       "$CONFIG/systemd/user/ubuntu-configuration-backup.timer")
+       "$CONFIG/systemd/user/ubuntu-configuration-backup.timer"
+       "$CONFIG/systemd/user/ubuntu-backup-tray.service")
 echo "Program files to remove:"
 for path in "${FILES[@]}"; do
     [[ -e "$path" || -L "$path" ]] && echo "  $path"
@@ -70,6 +71,7 @@ for entry in os.listdir('/proc'):
 PY
 if [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
     systemctl --user disable --now ubuntu-configuration-backup.timer 2>/dev/null || true
+    systemctl --user disable --now ubuntu-backup-tray.service 2>/dev/null || true
 fi
 for path in "${FILES[@]}"; do
     [[ -e "$path" || -L "$path" ]] && rm -rf -- "$path"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the single-file Ubuntu Backup tool, launcher, icon, and tray autostart.
+# Install the Ubuntu Backup tool, launcher, icon, autostart, and start the tray now.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if (( $# )); then
@@ -12,9 +12,12 @@ python3 -c 'import gi; gi.require_version("Gtk", "3.0")' 2>/dev/null || {
     exit 1
 }
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}"
-APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
-AUTODIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+APPS="$DATA/applications"
+ICONS="$DATA/icons/hicolor/scalable/apps"
+AUTODIR="$CONFIG/autostart"
+SYSTEMD="$CONFIG/systemd/user"
 WORKSPACE="$HOME/ubuntu-backup-data"
 mkdir -p "$BIN" "$APPS" "$ICONS" "$AUTODIR"
 install -m 700 "$ROOT/ubuntu-backup.py" "$BIN/ubuntu-backup.py"
@@ -40,6 +43,12 @@ Icon=ubuntu-backup
 Terminal=false
 X-GNOME-Autostart-enabled=true
 EOF
+rm -f "$SYSTEMD/ubuntu-backup-tray.service"
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
-command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
-echo "Log out and back in to start Ubuntu Backup."
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
+if [[ "${UBUNTU_BACKUP_SKIP_START:-0}" != 1 ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    setsid "$BIN" --workspace "$WORKSPACE" tray >/dev/null 2>&1 &
+    echo "Ubuntu Backup installed and started."
+else
+    echo "Ubuntu Backup installed; start the tray with ./refresh after logging in."
+fi
