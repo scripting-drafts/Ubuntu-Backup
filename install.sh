@@ -48,9 +48,13 @@ fi
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
 echo "Installed $BIN/ubuntu-backup.py"
-echo "Launcher: $APPS/ubuntu-backup.desktop"
+echo
+echo "Next steps:"
+echo "1. Open Ubuntu Backup from the application menu."
+echo "2. Choose 4 and select the mounted backup drive."
+echo "3. Choose 1 to run the first backup."
 if (( AUTOSTART )); then
-    echo "Tray starts at login: $AUTODIR/ubuntu-backup-tray.desktop"
+    echo "The tray icon starts at next login; run $BIN/ubuntu-backup.py tray to start it now."
 else
-    echo "Tray autostart not installed."
+    echo "Run $BIN/ubuntu-backup.py tray when you want the status icon."
 fi
