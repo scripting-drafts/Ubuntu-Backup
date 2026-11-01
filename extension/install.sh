@@ -119,4 +119,4 @@ PY
 if command -v gnome-extensions >/dev/null; then
     gnome-extensions enable "$UUID" >/dev/null 2>&1 || true
 fi
-echo "Installed $UUID. GNOME Shell must restart once to load it."
+echo "Installed $UUID. Restart GNOME Shell after the first install or a system extension update."
