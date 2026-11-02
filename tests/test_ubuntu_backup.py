@@ -130,5 +130,38 @@ class CaptureRootTests(unittest.TestCase):
             self.assertEqual(calls[0][1].get("stderr"), subprocess.PIPE)
 
 
+class CpuGuardTests(unittest.TestCase):
+    def test_excluded_smt_siblings_are_removed(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            (kit / "config").mkdir()
+            (kit / "config/settings.json").write_text(
+                json.dumps({"keep_snapshots": 30, "exclude_cpus": [2]}))
+            saved = backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity
+            backup.KIT = kit
+            backup.cpu_siblings = lambda cpu: {2, 8}
+            backup.os.sched_getaffinity = lambda _pid: {0, 1, 2, 3, 8}
+            try:
+                self.assertEqual(backup.allowed_backup_cpus(), {0, 1, 3})
+            finally:
+                backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity = saved
+
+    def test_rejects_a_set_that_excludes_everything(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            (kit / "config").mkdir()
+            (kit / "config/settings.json").write_text(
+                json.dumps({"keep_snapshots": 30, "exclude_cpus": [2]}))
+            saved = backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity
+            backup.KIT = kit
+            backup.cpu_siblings = lambda cpu: {2, 8}
+            backup.os.sched_getaffinity = lambda _pid: {2, 8}
+            try:
+                with self.assertRaises(backup.ConfigError):
+                    backup.allowed_backup_cpus()
+            finally:
+                backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity = saved
+
+
 if __name__ == "__main__":
     unittest.main()
