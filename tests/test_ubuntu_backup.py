@@ -4,6 +4,7 @@ from collections import namedtuple
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import importlib.util
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -161,6 +162,53 @@ class CpuGuardTests(unittest.TestCase):
                     backup.allowed_backup_cpus()
             finally:
                 backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity = saved
+
+
+class StagingTests(unittest.TestCase):
+    def test_stream_object_stages_until_bulk_copy(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            stage_objects = base / "stage" / "objects"
+            stage_incoming = base / "stage" / "incoming"
+            external_objects = base / "external" / "objects"
+            stage_objects.mkdir(parents=True)
+            stage_incoming.mkdir(parents=True)
+            external_objects.mkdir(parents=True)
+            data = b"hello staged backup\n"
+            created = []
+            destination, sha256 = backup.stream_object(
+                stage_objects, stage_incoming, external_objects,
+                io.BytesIO(data), len(data), None, created)
+            self.assertEqual(destination, backup.object_path(external_objects, sha256))
+            self.assertFalse(destination.exists())
+            self.assertEqual(created, [destination])
+            self.assertEqual(backup.object_path(stage_objects, sha256).read_bytes(), data)
+            self.assertEqual(backup.copy_staged_objects(stage_objects, external_objects), 1)
+            self.assertEqual(destination.read_bytes(), data)
+
+    def test_existing_external_object_is_reused(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            stage_objects = base / "stage" / "objects"
+            stage_incoming = base / "stage" / "incoming"
+            external_objects = base / "external" / "objects"
+            stage_objects.mkdir(parents=True)
+            stage_incoming.mkdir(parents=True)
+            external_objects.mkdir(parents=True)
+            data = b"already stored\n"
+            sha256 = hashlib.sha256(data).hexdigest()
+            destination = backup.object_path(external_objects, sha256)
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(data)
+            created = []
+            result, digest_value = backup.stream_object(
+                stage_objects, stage_incoming, external_objects,
+                io.BytesIO(data), len(data), None, created)
+            self.assertEqual(result, destination)
+            self.assertEqual(digest_value, sha256)
+            self.assertEqual(created, [])
+            self.assertFalse(backup.object_path(stage_objects, sha256).exists())
+            self.assertEqual(list(stage_incoming.iterdir()), [])
 
 
 if __name__ == "__main__":

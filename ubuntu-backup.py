@@ -35,6 +35,7 @@ ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
 MAX_FILE = 64 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
+STAGING_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 SYSTEM_CONFIG_ROOTS = ("/etc", "/usr/local/etc")
 CONFIG_DATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",
                     "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",
@@ -707,7 +708,7 @@ def object_path(objects, sha256):
     return objects / sha256[:2] / sha256
 
 
-def publish_object(objects, incoming, temporary, sha256, size, created):
+def publish_object(objects, incoming, temporary, sha256, size, created, sync=True):
     """Atomically publish one immutable, content-addressed baseline file."""
     if temporary.stat().st_size != size:
         raise ConfigError("Baseline object size changed before publication.")
@@ -728,7 +729,8 @@ def publish_object(objects, incoming, temporary, sha256, size, created):
         return destination, created
     finally:
         temporary.unlink(missing_ok=True)
-    fsync_directory(destination.parent)
+    if sync:
+        fsync_directory(destination.parent)
     created.append(destination)
     return destination, created
 
@@ -1432,7 +1434,7 @@ def private_workspace(path):
         entries = {entry.name for entry in path.iterdir()}
         known = {"backups", "snapshot", ".previous-snapshot", "restored", "rollback",
                  "plans", "profiles", "privileged-system", "system-integration-recovery",
-                 "config", "logs", "status.json", "history.txt", ".tray.lock", ".maintenance.lock"}
+                 "staging", "config", "logs", "status.json", "history.txt", ".tray.lock", ".maintenance.lock"}
         if entries and not (path / "config/settings.json").is_file():
             # A recovered archive's kit/ is also a valid starting workspace.
             if not entries <= known and not (path.parent / "manifest.json").is_file():
@@ -2826,9 +2828,9 @@ def stream_hash(stream, count, hasher):
         remaining -= len(block)
 
 
-def stream_object(objects, incoming, stream, size, sparse, created):
-    """Store one logical file as a sparse-friendly baseline object."""
-    with tempfile.NamedTemporaryFile(dir=incoming, prefix=".object-", delete=False) as output:
+def stream_object(stage_objects, stage_incoming, external_objects, stream, size, sparse, created):
+    """Hash one logical file, stage it locally, and return its external object path."""
+    with tempfile.NamedTemporaryFile(dir=stage_incoming, prefix=".object-", delete=False) as output:
         temporary = Path(output.name)
         hasher = hashlib.sha256()
         try:
@@ -2865,16 +2867,84 @@ def stream_object(objects, incoming, stream, size, sparse, created):
                     hasher.update(block)
                     remaining -= len(block)
             output.flush()
-            os.fsync(output.fileno())
+            # The local staging copy is disposable; it is flushed once after the bulk copy.
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
     sha256 = hasher.hexdigest()
+    external = object_path(external_objects, sha256)
     try:
-        destination, _ = publish_object(objects, incoming, temporary, sha256, size, created)
+        if external.is_symlink():
+            raise ConfigError("Refusing symlinked baseline object.")
+        if external.exists():
+            if not external.is_file() or external.stat().st_size != size:
+                raise ConfigError("Existing baseline object has the wrong size or type.")
+            return external, sha256
+        staged = []
+        publish_object(stage_objects, stage_incoming, temporary, sha256, size, staged, sync=False)
+        if staged:
+            created.append(external)
     finally:
         temporary.unlink(missing_ok=True)
-    return destination, sha256
+    return external, sha256
+
+
+def prepare_staging(external_root):
+    """Create the disposable local staging area used before a bulk copy to the drive."""
+    stage = KIT / "staging"
+    if stage.is_symlink() or (stage.exists() and not stage.is_dir()):
+        raise ConfigError("Backup staging path is not a real directory: " + str(stage))
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(mode=0o700)
+    try:
+        if stage.stat().st_dev == os.stat(external_root).st_dev:
+            raise ConfigError("Full /home staging must be on a different filesystem from the backup drive.")
+        free = shutil.disk_usage(stage).free
+        if free < STAGING_RESERVE_BYTES:
+            raise ConfigError(f"Only {free / 2**30:.1f} GiB free for staging; "
+                              f"at least {STAGING_RESERVE_BYTES / 2**30:.1f} GiB is required.")
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    return stage
+
+
+def copy_staged_objects(stage_objects, external_objects):
+    """Copy only new content-addressed objects to the drive, then flush once."""
+    shards = [entry for entry in stage_objects.iterdir() if entry.is_dir()]
+    if not shards:
+        return 0
+    copied = 0
+    total = 0
+    for shard in shards:
+        target_shard = ensure_private_directory(external_objects, shard.name)
+        for source in shard.iterdir():
+            if source.is_symlink() or not source.is_file():
+                raise ConfigError("Unexpected entry in staging: " + str(source))
+            target = target_shard / source.name
+            if target.is_symlink():
+                raise ConfigError("Refusing symlinked baseline object: " + str(target))
+            size = source.stat().st_size
+            if target.exists():
+                if not target.is_file() or target.stat().st_size != size:
+                    raise ConfigError("Existing baseline object has the wrong size or type.")
+                continue
+            temporary = target_shard / (".copy-" + uuid.uuid4().hex)
+            try:
+                copy_sparse_file(source, temporary, size)
+                os.chmod(temporary, 0o400)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            copied += 1
+            total += size
+            if copied % 4096 == 0:
+                print(f"Bulk copy: {copied} objects, {total / 2**30:.1f} GiB", file=sys.stderr, flush=True)
+    if copied:
+        os.sync()
+        print(f"Bulk copy complete: {copied} objects, {total / 2**30:.1f} GiB", file=sys.stderr, flush=True)
+    return copied
 
 
 def make_timeline_parent(tree, name):
@@ -3210,6 +3280,10 @@ def verify_home_timeline(timeline, hash_objects=True):
 def capture_home_archive(stream, root, identity, exclusions):
     """Consume a root tar stream as the normal user and publish a linked timeline."""
     objects, incoming, timelines = baseline_directories(root, "home")
+    stage = prepare_staging(root)
+    stage_objects = ensure_private_directory(stage, "objects")
+    stage_incoming = ensure_private_directory(stage, "incoming")
+    print("Staging full /home on " + str(stage), file=sys.stderr)
     temporary = Path(tempfile.mkdtemp(prefix=".home-timeline-", dir=timelines))
     tree = ensure_private_directory(temporary, "tree")
     entries_path = temporary / "entries.ndjson"
@@ -3223,6 +3297,8 @@ def capture_home_archive(stream, root, identity, exclusions):
     try:
         with entries_path.open("w") as entries, tarfile.open(fileobj=tracker, mode="r|") as archive:
             for member in archive:
+                if count % 128 == 0 and shutil.disk_usage(stage).free < STAGING_RESERVE_BYTES:
+                    raise ConfigError("Local staging space is nearly exhausted; no timeline published.")
                 name = tar_member_name(member.name)
                 if name is None:
                     continue
@@ -3256,7 +3332,8 @@ def capture_home_archive(stream, root, identity, exclusions):
                     if source is None:
                         raise ConfigError(f"Cannot read full /home file: {name}")
                     sparse = [list(segment) for segment in member.sparse] if getattr(member, "sparse", None) else None
-                    destination, sha256 = stream_object(objects, incoming, source, member.size, sparse, created)
+                    destination, sha256 = stream_object(stage_objects, stage_incoming, objects,
+                                                        source, member.size, sparse, created)
                     symlink_relative(path, destination)
                     logical += member.size
                     entry = dict(base, type="file", size=member.size, sha256=sha256, sparse=sparse)
@@ -3293,6 +3370,10 @@ def capture_home_archive(stream, root, identity, exclusions):
                     "entries_sha256": digest(entries_path),
                     "restore_policy": "Stage privately. Never overwrite live /home or replay UID/hardware bindings blindly."}
         write_json(temporary / "manifest.json", manifest)
+        if created:
+            print(f"Copying {len(created)} new objects from local staging to the backup drive...",
+                  file=sys.stderr)
+        copy_staged_objects(stage_objects, objects)
         verify_home_timeline(temporary, hash_objects=False)
         return temporary, manifest, created, timelines
     except BaseException:
@@ -3301,6 +3382,8 @@ def capture_home_archive(stream, root, identity, exclusions):
             shutil.rmtree(temporary)
         clean_created_objects(created)
         raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 def copy_sparse_file(source, destination, size):
@@ -3511,7 +3594,7 @@ def root_home_backup(workspace):
     command = ["/usr/bin/tar", "--create", "--file=-", "--acls", "--xattrs", "--numeric-owner",
                "--sparse", "--one-file-system", "--directory=/home"]
     relative = KIT.relative_to("/home").as_posix()
-    excluded = [relative + "/" + name for name in ("backups", "privileged-system", "restored", "rollback", "profiles", "snapshot")]
+    excluded = [relative + "/" + name for name in ("backups", "privileged-system", "restored", "rollback", "profiles", "snapshot", "staging")]
     for name in excluded:
         command.append("--exclude=./" + name)
     command.append(".")
@@ -3556,6 +3639,7 @@ def root_home_backup(workspace):
         if temporary is not None and temporary.exists():
             shutil.rmtree(temporary)
             clean_created_objects(created)
+        shutil.rmtree(KIT / "staging", ignore_errors=True)
         os.close(fd)
 
 def run_tray():
