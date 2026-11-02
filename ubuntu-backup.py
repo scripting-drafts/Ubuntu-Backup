@@ -2214,8 +2214,10 @@ def main():
         print("Personal configuration data is bundled in this file; it is NOT encrypted.")
         workspace = Path(ask("Private workspace folder", str(workspace)))
     private_workspace(workspace)
+    allowed_cpus = restrict_backup_cpus()
     if command != "tray":
         _setup_logging()
+        print("Backup processes pinned to CPUs: " + ",".join(map(str, sorted(allowed_cpus))), file=sys.stderr)
     if command == "menu":
         menu()
     elif command == "backup":
