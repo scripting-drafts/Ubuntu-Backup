@@ -1,36 +1,23 @@
 #!/usr/bin/env bash
-# Mount or safely unmount the backup drive without the automount timer racing.
+# Mount/unmount the backup drive declared in /etc/fstab, verified by the on-disk
+# marker. No device name, mount path or UUID is stored in the workspace: the
+# filesystem owns its UUID, the marker owns its identity, fstab owns the path.
 set -Eeuo pipefail
-DEVICE="${1:-/dev/sda1}"
-ACTION="${2:-status}"
-status() {
-    if mountpoint="$(findmnt -S "$DEVICE" -no TARGET 2>/dev/null)"; then
-        echo "Mounted: $mountpoint"
-    else
-        echo "Not mounted: $DEVICE"
-    fi
-    systemctl --user is-enabled ubuntu-backup-mount.timer 2>/dev/null \
-        | sed 's/^/Automount timer: /' || true
-}
-case "$ACTION" in
+BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/ubuntu-backup.py"
+WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$HOME/ubuntu-backup/data}"
+[[ -x "$BIN" ]] || { echo "Install first: ./install.sh" >&2; exit 1; }
+case "${1:-status}" in
     mount)
-        systemctl --user enable --now ubuntu-backup-mount.timer >/dev/null
-        systemctl --user start ubuntu-backup-mount.service
-        status
+        exec "$BIN" --workspace "$WORKSPACE" mount-saved
         ;;
     unmount)
-        systemctl --user disable --now ubuntu-backup-mount.timer >/dev/null || true
-        sync
-        if findmnt -S "$DEVICE" -no TARGET >/dev/null 2>&1; then
-            udisksctl unmount -b "$DEVICE"
-        fi
-        status
+        exec "$BIN" --workspace "$WORKSPACE" unmount-saved
         ;;
     status)
-        status
+        exec "$BIN" --workspace "$WORKSPACE" mount-saved --check
         ;;
     *)
-        echo "Usage: ./drive.sh [DEVICE] {mount|unmount|status}" >&2
+        echo "Usage: ./drive.sh {mount|unmount|status}" >&2
         exit 2
         ;;
 esac

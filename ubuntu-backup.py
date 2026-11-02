@@ -9,9 +9,11 @@ import datetime as dt
 import fcntl
 import fnmatch
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import pwd
 import re
 import shutil
@@ -30,7 +32,7 @@ HOME = Path.home()
 FORMAT = "ubuntu-configuration-v1"
 UNIT = "ubuntu-configuration-backup"
 MARKER = "# Managed by ubuntu-configuration v1"
-WORKSPACE_README = '# Ubuntu configuration and backup\n\n- Live tool: `~/ubuntu-backup.py` (private, self-contained, not encrypted).\n- Workspace: keep its settings, snapshots/timelines and rollback journals.\n- Run `./ubuntu-backup.py` for the menu; `./ubuntu-backup.py --help` shows full docs.\n- One backup action captures configuration and full `/home`; identical files are stored once.\n- Full recovery stages configuration or full `/home`; live `/home` is never overwritten.\n- External copies use dated symlink timelines over shared baselines.\n- Full `/home` capture is manual, external-drive only, requires sudo approval, and is not auto-pruned.\n- Snapshots contain secrets and are not encrypted. Do not publish them.\n'
+WORKSPACE_README = '# Ubuntu configuration and backup\n\n- Live tool: `~/ubuntu-backup.py` (private, self-contained, not encrypted).\n- Workspace: keep its settings, snapshots/timelines and rollback journals.\n- Run `./ubuntu-backup.py` for the menu; `./ubuntu-backup.py --help` shows full docs.\n- One backup action captures configuration, development code and full `/home`; identical files are stored once.\n- Each development change records its time, content version and package/library references; reapply follows dependency order and never pins versions.\n- Full recovery stages configuration or full `/home`; live `/home` is never overwritten.\n- External copies use dated symlink timelines over shared baselines.\n- Full `/home` capture is manual, external-drive only, requires sudo approval, and is not auto-pruned.\n- Snapshots contain secrets and are not encrypted. Do not publish them.\n'
 ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
 MAX_FILE = 64 * 1024 * 1024
@@ -94,6 +96,9 @@ def settings():
         raise ConfigError("keep_snapshots must be a positive integer.")
     if not isinstance(value.get("keep_local_backups", False), bool):
         raise ConfigError("keep_local_backups must be true or false.")
+    development = value.get("development_include", [])
+    if not isinstance(development, list) or not all(isinstance(item, str) for item in development):
+        raise ConfigError("development_include must be a list of home-relative paths.")
     excluded = value.get("exclude_cpus", [])
     if not isinstance(excluded, list) or not all(type(cpu) is int and cpu >= 0 for cpu in excluded):
         raise ConfigError("exclude_cpus must be a list of CPU numbers.")
@@ -319,6 +324,7 @@ def collect_inventory(destination, config, report):
         target.append(portable_name)
     write(destination / "apt-portable.txt", "\n".join(portable) + "\n")
     write(destination / "apt-review-only.txt", "\n".join(review) + "\n")
+    package_baseline(destination, installed, portable + review, native_arch)
     snaps = []
     for line in outputs["snap-list.txt"].splitlines()[1:]:
         fields = line.split()
@@ -343,7 +349,7 @@ def collect_inventory(destination, config, report):
         "architecture": native_arch,
     })
     if not installed or not manual:
-        raise ConfigError("Cannot capture installed/manual APT packages; snapshot aborted.")
+        report["warnings"].append("APT package inventory incomplete; code and configuration capture continues.")
 
 
 def copy_selection(source, destination, relative, config, report, system=False, skip_kit=False, root_device=None):
@@ -392,10 +398,688 @@ def copy_selection(source, destination, relative, config, report, system=False, 
         report["warnings"].append(f"Root-only system reference not captured: {source}")
 
 
+CODE_SUFFIXES = {".sh": "shell", ".bash": "shell", ".zsh": "shell", ".dash": "shell",
+                 ".py": "python", ".pyw": "python", ".js": "javascript", ".mjs": "javascript",
+                 ".cjs": "javascript", ".ts": "typescript", ".c": "c", ".h": "c-header",
+                 ".cc": "c++", ".cpp": "c++", ".cxx": "c++", ".hpp": "c++-header",
+                 ".go": "go", ".rs": "rust", ".java": "java", ".rb": "ruby", ".pl": "perl",
+                 ".php": "php", ".lua": "lua"}
+SHEBANG_KINDS = (("bash", "shell"), ("zsh", "shell"), ("dash", "shell"), ("sh", "shell"),
+                 ("python", "python"), ("node", "javascript"), ("ruby", "ruby"),
+                 ("perl", "perl"), ("lua", "lua"), ("php", "php"))
+DEVELOPMENT_MARKERS = (".git", "Makefile", "makefile", "CMakeLists.txt", "pyproject.toml",
+                       "setup.py", "setup.cfg", "package.json", "Cargo.toml", "go.mod",
+                       "pom.xml", "build.gradle", "build.gradle.kts")
+DEVELOPMENT_SKIP_DIRS = ("node_modules", ".venv", "venv", "env", "target", "build", "dist", "out",
+                         ".tox", ".mypy_cache", ".pytest_cache", ".next", ".nuxt", "coverage",
+                         ".nyc_output", ".gradle")
+HEADER_LIBRARIES = {"X11/": ["-lX11"], "Xrandr": ["-lXrandr"], "Xinerama": ["-lXinerama"],
+                    "Xext": ["-lXext"], "Xfixes": ["-lXfixes"], "GL/": ["-lGL"],
+                    "pthread.h": ["-lpthread"], "math.h": ["-lm"], "dlfcn.h": ["-ldl"],
+                    "zlib.h": ["-lz"], "sqlite3.h": ["-lsqlite3"], "curl/": ["-lcurl"],
+                    "openssl/": ["-lssl", "-lcrypto"]}
+DEVELOPMENT_FORMATS = ("ubuntu-developments-v1", "ubuntu-developments-v2")
+SHELL_KEYWORDS = frozenset("""
+if then else elif fi for while until do done case esac function select in time
+true false return exit break continue shift set unset export readonly local declare
+typeset alias unalias source . eval exec trap wait jobs bg fg echo printf cd pwd
+read pushd popd umask ulimit command type hash getopts sudo env nohup nice ionice
+timeout xargs
+""".split())
+
+
+def iso_timestamp(value):
+    return dt.datetime.fromtimestamp(value, dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def shell_commands(text):
+    """Command-shaped tokens in shell text; only names present in PATH are kept later."""
+    commands = set()
+    pattern = (r"(?m)(?:^|[|;&(){}]|\$\(|\n)\s*"
+               r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+               r"(?:sudo\s+|env\s+(?:\S+\s+)*)?([A-Za-z0-9_./+-]+)")
+    for match in re.finditer(pattern, text):
+        token = match.group(1)
+        if token in SHELL_KEYWORDS or token.startswith("-") or token.isdigit():
+            continue
+        commands.add(token)
+    return commands
+
+
+def shebang_commands(data):
+    if not data.startswith(b"#!"):
+        return set()
+    tokens = data.split(b"\n", 1)[0].decode("utf-8", "replace")[2:].split()
+    commands = set()
+    for token in tokens[1:]:
+        if token.startswith("-"):
+            continue
+        name = PurePosixPath(token).name
+        if name in ("env", "S"):
+            continue
+        commands.add(name)
+    return commands
+
+
+def c_includes(text):
+    return sorted(set(re.findall(r'(?m)^\s*#\s*include\s*[<"]([^>"]+)[>"]', text)))
+
+
+def python_modules(text):
+    modules = set()
+    pattern = r"(?m)^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*))"
+    for match in re.finditer(pattern, text):
+        module = (match.group(1) or match.group(2)).split(".")[0]
+        modules.add(module)
+    return sorted(modules)
+
+
+def dpkg_path_aliases(path):
+    """usrmerge systems install files under /bin but PATH resolves to /usr/bin."""
+    aliases = [str(path)]
+    for prefix, alternate in (("/usr/bin/", "/bin/"), ("/bin/", "/usr/bin/"),
+                              ("/usr/sbin/", "/sbin/"), ("/sbin/", "/usr/sbin/"),
+                              ("/usr/lib/", "/lib/"), ("/lib/", "/usr/lib/"),
+                              ("/usr/libexec/", "/libexec/"), ("/libexec/", "/usr/libexec/")):
+        if str(path).startswith(prefix):
+            candidate = alternate + str(path)[len(prefix):]
+            if candidate not in aliases:
+                aliases.append(candidate)
+    return aliases
+
+
+def installed_module_paths(module):
+    paths = []
+    for base in sys.path:
+        directory = Path(base or os.getcwd())
+        for candidate in (directory / (module + ".py"), directory / module / "__init__.py"):
+            if candidate.is_file():
+                paths.append(candidate)
+    return paths
+
+
+class ReferenceResolver:
+    """Read-only identification of packages and libraries; captured code is never run."""
+
+    def __init__(self, home=None):
+        self.home = Path(home) if home else HOME
+        self.owners_cache = {}
+        self.command_cache = {}
+        self.library_cache = None
+        self.distributions = None
+        self.python_cache = {}
+        self.git_cache = {}
+        self.arch = None
+
+    def _run(self, command, timeout=30):
+        try:
+            return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _native_arch(self):
+        if self.arch is None:
+            result = self._run(["dpkg", "--print-architecture"])
+            self.arch = result.stdout.strip() if result and result.returncode == 0 else ""
+        return self.arch
+
+    def package_owners(self, paths):
+        present = [str(Path(path)) for path in paths if Path(path).is_file()]
+        aliases = {}
+        for path in present:
+            for alias in dpkg_path_aliases(path):
+                aliases.setdefault(alias, set()).add(path)
+        pending = sorted(alias for alias in aliases if alias not in self.owners_cache)
+        if pending:
+            result = self._run(["dpkg", "-S", *pending], timeout=60)
+            found = {}
+            if result:
+                for line in result.stdout.splitlines():
+                    if ": " not in line or line.startswith("diversion by"):
+                        continue
+                    package, path = line.split(": ", 1)
+                    found[path] = package.split(",")[0].strip()
+            arch = self._native_arch()
+            for path in pending:
+                package = found.get(path)
+                if package and arch:
+                    package = package.removesuffix(":" + arch)
+                self.owners_cache[path] = package
+        owners = set()
+        for path in present:
+            for alias in dpkg_path_aliases(path):
+                if self.owners_cache.get(alias):
+                    owners.add(self.owners_cache[alias])
+        return sorted(owners)
+
+    def command(self, name):
+        if name in self.command_cache:
+            return self.command_cache[name]
+        path = shutil.which(name)
+        reference = None
+        if path:
+            reference = {"name": name, "path": path, "packages": self.package_owners([path])}
+        self.command_cache[name] = reference
+        return reference
+
+    def header_references(self, headers):
+        references = []
+        for header in headers:
+            path = Path("/usr/include") / header
+            references.append({"name": header, "path": str(path),
+                               "packages": self.package_owners([path]) if path.is_file() else []})
+        return references
+
+    def python(self, module):
+        if module in self.python_cache:
+            return self.python_cache[module]
+        if self.distributions is None:
+            try:
+                self.distributions = importlib.metadata.packages_distributions()
+            except Exception:
+                self.distributions = {}
+        distributions = []
+        for name in self.distributions.get(module, []):
+            try:
+                version = importlib.metadata.version(name)
+            except Exception:
+                version = ""
+            distributions.append({"name": name, "version": version})
+        reference = {"module": module, "distributions": distributions,
+                     "packages": self.package_owners(installed_module_paths(module))}
+        self.python_cache[module] = reference
+        return reference
+
+    def elf_needed(self, path):
+        readelf = shutil.which("readelf")
+        if not readelf:
+            return []
+        result = self._run([readelf, "-d", str(path)], timeout=20)
+        if not result or result.returncode:
+            return []
+        return sorted(set(re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", result.stdout)))
+
+    def library_references(self, sonames):
+        if self.library_cache is None:
+            self.library_cache = {}
+            result = self._run(["ldconfig", "-p"], timeout=30)
+            if result:
+                for line in result.stdout.splitlines():
+                    if "=>" not in line:
+                        continue
+                    left, right = line.split("=>", 1)
+                    fields = left.strip().split()
+                    if len(fields) >= 2 and fields[1].startswith("("):
+                        self.library_cache.setdefault(fields[0], right.strip())
+        references = []
+        for name in sonames:
+            path = self.library_cache.get(name)
+            references.append({"name": name, "path": path,
+                               "packages": self.package_owners([path]) if path else []})
+        return references
+
+    def git(self, source_path):
+        source_path = Path(source_path)
+        if not source_path.is_file() or not self.home.is_dir():
+            return None
+        root = None
+        for candidate in [source_path.parent, *source_path.parent.parents]:
+            if candidate != self.home and self.home not in candidate.parents:
+                break
+            if (candidate / ".git").exists():
+                root = candidate
+                break
+        if root is None:
+            return None
+        key = str(root)
+        if key in self.git_cache:
+            return self.git_cache[key]
+        git = shutil.which("git")
+        if not git:
+            self.git_cache[key] = None
+            return None
+
+        def run(*args):
+            result = self._run([git, "--no-optional-locks", "-c", "core.fsmonitor=false",
+                                "-c", "diff.external=", "-C", str(root), *args], timeout=15)
+            return result.stdout.strip() if result and result.returncode == 0 else ""
+
+        self.git_cache[key] = {
+            "root": "." if root == self.home else root.relative_to(self.home).as_posix(),
+            "commit": run("rev-parse", "HEAD"),
+            "branch": run("rev-parse", "--abbrev-ref", "HEAD"),
+            "describe": run("describe", "--tags", "--always", "--dirty"),
+        }
+        return self.git_cache[key]
+
+
+def build_references(relative, text, data, kind, dependencies, source_path, resolver):
+    """Per-file references: code links, commands, headers, libraries, Python distributions."""
+    references = {"code": sorted(dependencies), "commands": [], "packages": [],
+                  "libraries": [], "library_packages": [], "headers": [],
+                  "header_packages": [], "python": []}
+    packages = set()
+    commands = set()
+    if kind in ("shell", "python"):
+        commands.update(shell_commands(text))
+    commands.update(shebang_commands(data))
+    command_details = []
+    for command in sorted(commands):
+        detail = resolver.command(command)
+        if detail:
+            command_details.append(detail)
+            packages.update(detail["packages"])
+    references["commands"] = command_details
+    if kind == "python":
+        for module in python_modules(text):
+            detail = resolver.python(module)
+            references["python"].append(detail)
+            packages.update(detail["packages"])
+    if kind in ("c", "c++", "c-header", "c++-header"):
+        references["headers"] = c_includes(text)
+        references["header_packages"] = resolver.header_references(references["headers"])
+        for reference in references["header_packages"]:
+            packages.update(reference["packages"])
+        references["libraries"] = infer_libraries(text)
+    if kind == "binary":
+        references["libraries"] = resolver.elf_needed(source_path)
+        references["library_packages"] = resolver.library_references(references["libraries"])
+        for reference in references["library_packages"]:
+            packages.update(reference["packages"])
+    references["packages"] = sorted(packages)
+    return references
+
+
+def development_exclusions():
+    """Build caches and vendored dependency trees are never development sources."""
+    result = []
+    for name in DEVELOPMENT_SKIP_DIRS:
+        result.extend((f"**/{name}", f"**/{name}/*"))
+    return result
+
+
+def detect_development_roots(home, config):
+    """Explicit roots plus top-level checkouts identified by build/version markers."""
+    roots = list(config.get("development_include", []))
+    if config.get("coverage") != "system-wide-configuration":
+        return sorted(set(roots))
+    try:
+        children = sorted(home.iterdir())
+    except OSError:
+        return sorted(set(roots))
+    for path in children:
+        if path.is_symlink() or not path.is_dir() or path.name.startswith("."):
+            continue
+        if path == KIT or KIT in path.parents:
+            continue
+        if any(fnmatch.fnmatch(path.name, pattern) for pattern in config.get("exclude", [])):
+            continue
+        try:
+            if not any((path / marker).exists() for marker in DEVELOPMENT_MARKERS):
+                continue
+        except OSError:
+            continue
+        roots.append(path.name)
+    return sorted(set(roots))
+
+
+def code_kind(relative, data):
+    """Classify a captured file by binary signature, shebang, or source suffix."""
+    if data.startswith(b"\x7fELF"):
+        return "binary"
+    if data.startswith(b"#!"):
+        tokens = data.split(b"\n", 1)[0].decode("utf-8", "replace")[2:].split()
+        for token in tokens[1:]:
+            name = PurePosixPath(token).name
+            for marker, kind in SHEBANG_KINDS:
+                if marker in name:
+                    return kind
+    suffix = PurePosixPath(relative).suffix.lower()
+    return CODE_SUFFIXES.get(suffix)
+
+
+def text_content(data):
+    if data.startswith(b"\x7fELF") or b"\x00" in data[:4096]:
+        return ""
+    return data.decode("utf-8", "replace")
+
+
+def infer_libraries(text):
+    libraries = []
+    for marker, values in HEADER_LIBRARIES.items():
+        if marker in text:
+            for value in values:
+                if value not in libraries:
+                    libraries.append(value)
+    return libraries
+
+
+def extract_references(relative, text, captured, executables, kind):
+    """Resolve backed-up code dependencies without executing any captured file."""
+    dependencies = set()
+    directory = PurePosixPath(relative).parent
+    if str(directory) == ".":
+        directory = PurePosixPath("")
+    if not text:
+        return dependencies
+
+    def resolve(reference):
+        reference = reference.strip().strip("'\"")
+        reference = reference.replace("${HOME}", str(HOME)).replace("$HOME", str(HOME))
+        if reference.startswith("~"):
+            reference = str(HOME) + reference[1:]
+        prefix = str(HOME).rstrip("/") + "/"
+        if reference.startswith(prefix):
+            candidate = reference[len(prefix):]
+        elif reference.startswith("/"):
+            return None
+        else:
+            candidate = posixpath.normpath(posixpath.join(str(directory), reference))
+        if candidate.startswith("../") or candidate == relative:
+            return None
+        return candidate if candidate in captured else None
+
+    for match in re.finditer(r"(?:\$\{HOME\}|\$HOME|~)/([A-Za-z0-9_.@%+,\-/]+)", text):
+        candidate = resolve("~/" + match.group(1).rstrip(".,:;)]}\"'"))
+        if candidate:
+            dependencies.add(candidate)
+    prefix = str(HOME).rstrip("/") + "/"
+    for match in re.finditer(re.escape(prefix) + r"([A-Za-z0-9_.@%+,\-/]+)", text):
+        candidate = resolve(prefix + match.group(1).rstrip(".,:;)]}\"'"))
+        if candidate:
+            dependencies.add(candidate)
+    if kind in ("shell", "python"):
+        for match in re.finditer(r"(?m)^\s*(?:source|\.)\s+([^\s;]+)", text):
+            candidate = resolve(match.group(1))
+            if candidate:
+                dependencies.add(candidate)
+        words = set(re.findall(r"[A-Za-z0-9_.@+-]+", text))
+        for candidate in captured:
+            if candidate == relative or candidate not in executables:
+                continue
+            if PurePosixPath(candidate).parent == directory and PurePosixPath(candidate).name in words:
+                dependencies.add(candidate)
+    if kind == "python":
+        by_stem = {}
+        for name in captured:
+            by_stem.setdefault(PurePosixPath(name).stem, []).append(name)
+        for match in re.finditer(r"(?m)^\s*(?:from\s+([A-Za-z_][\w.]*)\s+import|import\s+([A-Za-z_][\w.]*))", text):
+            module = match.group(1) or match.group(2)
+            stem = module.split(".")[-1]
+            for candidate in by_stem.get(stem, []):
+                if candidate == relative:
+                    continue
+                parent = PurePosixPath(candidate).parent
+                if parent == directory or (str(directory) not in ("", ".") and
+                                           candidate.startswith(str(directory) + "/")):
+                    dependencies.add(candidate)
+    return dependencies
+
+
+def topological_order(nodes, edges):
+    """Dependency-first order with deterministic lexical tie-breaking."""
+    nodes = sorted(set(nodes))
+    remaining = {name: set(edges.get(name, ())) & set(nodes) for name in nodes}
+    order, cycles = [], []
+    while remaining:
+        ready = sorted(name for name, dependencies in remaining.items() if not dependencies)
+        if not ready:
+            stuck = sorted(remaining)
+            cycles.append(stuck)
+            order.extend(stuck)
+            break
+        order.extend(ready)
+        for name in ready:
+            del remaining[name]
+        for dependencies in remaining.values():
+            dependencies.difference_update(ready)
+    return order, cycles
+
+
+def previous_development_records(previous):
+    if not previous:
+        return {}, None
+    path = Path(previous) / "inventory/developments.json"
+    if not path.is_file():
+        return {}, None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}, None
+    if data.get("format") not in DEVELOPMENT_FORMATS:
+        return {}, None
+    records = {item["path"]: item for item in data.get("files", [])
+               if isinstance(item, dict) and isinstance(item.get("path"), str)}
+    return records, data.get("captured_at")
+
+
+def capture_developments(destination, previous=None, source_home=None):
+    """Inventory backed-up code as time/version-stamped changes with package references."""
+    root = destination / "home"
+    if not root.is_dir():
+        return None
+    source_home = Path(source_home) if source_home else HOME
+    resolver = ReferenceResolver(source_home)
+    captured_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    paths = regular_files(root)
+    captured = [path.relative_to(root).as_posix() for path in paths]
+    captured_set = set(captured)
+    kinds, contents, executables, sizes = {}, {}, set(), {}
+    for path in paths:
+        name = path.relative_to(root).as_posix()
+        info = path.stat()
+        sizes[name] = info.st_size
+        if info.st_mode & 0o111:
+            executables.add(name)
+        suffix = PurePosixPath(name).suffix.lower()
+        data = b""
+        if name in executables or suffix in CODE_SUFFIXES:
+            try:
+                with path.open("rb") as stream:
+                    data = stream.read(2 * 1024 * 1024)
+            except OSError:
+                data = b""
+        contents[name] = data
+        kind = code_kind(name, data)
+        if kind:
+            kinds[name] = kind
+    code_names = sorted(kinds)
+    previous_files, previous_captured = previous_development_records(previous)
+    records, edges, changes = [], {}, []
+    for name in code_names:
+        staged_path = root / name
+        source_path = source_home / name
+        text = text_content(contents[name])
+        dependencies = extract_references(name, text, captured_set, executables, kinds[name])
+        sha256 = digest(staged_path)
+        version = "sha256:" + sha256[:12]
+        try:
+            modified = source_path.stat().st_mtime
+        except OSError:
+            modified = staged_path.stat().st_mtime
+        modified_at = iso_timestamp(modified)
+        prior = previous_files.get(name)
+        prior_revision = prior.get("revision", 1) if prior else 0
+        if not isinstance(prior_revision, int) or prior_revision < 0:
+            prior_revision = 0
+        if prior is None:
+            change, revision = "added", 1
+            changed_at = modified_at
+        elif prior.get("sha256") != sha256:
+            change, revision = "modified", prior_revision + 1
+            changed_at = modified_at
+        else:
+            change, revision = "unchanged", max(prior_revision, 1)
+            changed_at = prior.get("changed_at") or modified_at
+        references = build_references(name, text, contents[name], kinds[name],
+                                      dependencies, staged_path, resolver)
+        record = {"path": name, "kind": kinds[name], "executable": name in executables,
+                  "size": sizes[name], "sha256": sha256, "version": version,
+                  "revision": revision,
+                  "modified_at": modified_at, "changed_at": changed_at,
+                  "captured_at": captured_at, "change": change,
+                  "previous_version": prior.get("version") if prior else None,
+                  "previous_revision": prior.get("revision") if prior else None,
+                  "depends_on": sorted(dependencies), "references": references}
+        git = resolver.git(source_path)
+        if git:
+            record["git"] = git
+        if kinds[name] in ("c", "c++"):
+            output = str(PurePosixPath(name).with_suffix(""))
+            if kinds.get(output) == "binary":
+                record["build"] = {"language": kinds[name], "source": name, "output": output,
+                                   "compiler": "c++" if kinds[name] == "c++" else "cc",
+                                   "libraries": infer_libraries(text)}
+                edges.setdefault(output, set()).add(name)
+        if change in ("added", "modified"):
+            entry = {"path": name, "change": change, "changed_at": changed_at,
+                     "detected_at": captured_at, "version": version,
+                     "revision": revision,
+                     "previous_version": record["previous_version"],
+                     "previous_revision": record["previous_revision"],
+                     "references": references}
+            if record.get("git"):
+                entry["git"] = record["git"]
+            changes.append(entry)
+        edges.setdefault(name, set()).update(dependencies)
+        records.append(record)
+    removed = []
+    for name in sorted(set(previous_files) - set(code_names)):
+        prior = previous_files[name]
+        removed.append(name)
+        changes.append({"path": name, "change": "removed",
+                        "changed_at": prior.get("modified_at") or previous_captured,
+                        "detected_at": captured_at, "version": None,
+                        "revision": prior.get("revision"),
+                        "previous_version": prior.get("version"),
+                        "previous_revision": prior.get("revision"),
+                        "references": prior.get("references", {})})
+    order, cycles = topological_order(code_names, edges)
+    packages = sorted({package for record in records
+                       for package in record["references"]["packages"]})
+    libraries = sorted({library for record in records
+                        for library in record["references"]["libraries"]})
+    distributions = {}
+    for record in records:
+        for entry in record["references"]["python"]:
+            for distribution in entry["distributions"]:
+                distributions[distribution["name"]] = distribution["version"]
+    result = {"format": "ubuntu-developments-v2", "captured_at": captured_at,
+              "source_home": str(source_home), "previous_capture_at": previous_captured,
+              "files": records, "order": order, "cycles": cycles,
+              "changes": sorted(changes, key=lambda item: (item.get("changed_at") or "", item["path"])),
+              "removed": removed,
+              "references": {"packages": packages, "libraries": libraries,
+                             "python_distributions": [{"name": name, "version": version}
+                                                      for name, version in sorted(distributions.items())]}}
+    write_json(destination / "inventory/developments.json", result)
+    return result
+
+
+def load_developments(snapshot):
+    path = Path(snapshot) / "inventory/developments.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("format") not in DEVELOPMENT_FORMATS:
+        return None
+    return data
+
+
+def deploy_order(snapshot, paths):
+    """Configuration first; backed-up code in dependency order, then leftovers."""
+    data = load_developments(snapshot)
+    order = data.get("order", []) if data else []
+    known = {name: index for index, name in enumerate(order)}
+    targets = list(paths)
+    configuration = sorted(name for name in targets if name not in known)
+    developments = [name for name in order if name in set(targets)]
+    unseen = sorted(name for name in targets if name in known and name not in set(developments))
+    return configuration + developments + unseen
+
+
+def reapply_builds(snapshot, changed):
+    """Optional source rebuild after files are re-applied; failures never discard backups."""
+    data = load_developments(snapshot)
+    if not data:
+        print("No development build metadata in this snapshot.")
+        return
+    rebuilt = 0
+    for item in data.get("files", []):
+        build = item.get("build")
+        if not build:
+            continue
+        source_name, output_name = build.get("source"), build.get("output")
+        if not source_name or not output_name:
+            continue
+        if source_name not in changed and output_name not in changed:
+            continue
+        compiler = shutil.which(build.get("compiler", "cc"))
+        if not compiler:
+            print(f"Skipping build (compiler not found): {output_name}")
+            continue
+        libraries = [value for value in build.get("libraries", [])
+                     if re.fullmatch(r"-l[A-Za-z0-9_.+-]+", value)]
+        command = [compiler, "-O2", "-o", str(checked_path(HOME, output_name)),
+                   str(checked_path(snapshot, "home/" + source_name)), *libraries]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            print(f"Build failed for {output_name}; the captured binary remains in place.")
+        else:
+            rebuilt += 1
+            print(f"Rebuilt development: {output_name}")
+    if not rebuilt:
+        print("No development artifacts needed rebuilding.")
+
+
+def package_baseline(destination, installed, names, native_arch):
+    """Versions are informational: reapply resolves names and accepts newer packages."""
+    def version_for(name):
+        if name in installed:
+            return installed[name]
+        for key, value in installed.items():
+            if key.removesuffix(":" + native_arch) == name:
+                return value
+        return ""
+    write_json(destination / "package-baseline.json", {
+        "format": "ubuntu-package-baseline-v1",
+        "pin_versions": False,
+        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source_architecture": native_arch,
+        "note": "Versions are informational only. Reapply resolves package names against the new "
+                "system and accepts newer versions; missing packages are reported, not forced.",
+        "packages": [{"name": name, "version": version_for(name)} for name in sorted(set(names))],
+    })
+
+
+def saved_package_names(source):
+    """Read name-based package inventory, falling back to older snapshot layouts."""
+    for name in ("apt-portable.txt", "apt-manual.txt"):
+        path = Path(source) / "inventory" / name
+        if path.is_file():
+            return sorted(set(path.read_text().split()))
+    path = Path(source) / "inventory/package-baseline.json"
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text())
+            return sorted({item["name"] for item in data.get("packages", [])
+                           if isinstance(item, dict) and isinstance(item.get("name"), str)})
+        except (OSError, ValueError, KeyError):
+            return []
+    return []
+
+
 def build_snapshot(destination, config):
     config = dict(config)
+    config["exclude"] = sorted(set(config.get("exclude", []) + development_exclusions()))
     if config.get("coverage") == "system-wide-configuration":
         config["home_include"] = sorted(set(config["home_include"] + configuration_home_paths(HOME)))
+    # Development checkouts are captured as code, not inferred from installed packages.
+    config["home_include"] = sorted(set(config["home_include"] + detect_development_roots(HOME, config)))
+    if config.get("coverage") == "system-wide-configuration":
         # Children of a selected directory are already recursive. Avoid duplicate reads/copies.
         config["home_include"] = [name for name in config["home_include"] if not any(
             name.startswith(parent + "/") for parent in config["home_include"] if parent != name and "*" not in parent)]
@@ -475,6 +1159,21 @@ def build_snapshot(destination, config):
         source = KIT / name
         if source.exists():
             copy_selection(source, destination / "kit" / name, name, config, report)
+    previous = KIT / "snapshot"
+    developments = capture_developments(
+        destination,
+        previous=previous if (previous / "inventory/developments.json").is_file() else None,
+        source_home=HOME)
+    if developments:
+        counts = {}
+        for item in developments.get("changes", []):
+            counts[item.get("change", "unknown")] = counts.get(item.get("change", "unknown"), 0) + 1
+        report["developments"] = {"files": len(developments.get("files", [])),
+                                  "changes": counts,
+                                  "removed": developments.get("removed", []),
+                                  "previous_capture_at": developments.get("previous_capture_at"),
+                                  "packages": developments.get("references", {}).get("packages", []),
+                                  "libraries": developments.get("references", {}).get("libraries", [])}
     write_json(destination / "inventory/capture-report.json", report)
     records = []
     for path in regular_files(destination):
@@ -920,7 +1619,7 @@ def mount_info(path):
 def attached_drives():
     """Discover attached block filesystems without mounting or modifying them."""
     result = subprocess.run(["lsblk", "--json", "--bytes", "--output",
-                             "PATH,TYPE,TRAN,RM,SIZE,FSTYPE,UUID,MOUNTPOINTS"],
+                             "PATH,TYPE,TRAN,RM,SIZE,FSTYPE,UUID,LABEL,MOUNTPOINTS"],
                             capture_output=True, text=True, timeout=15, check=True)
     devices = []
     def visit(nodes, transport=None, removable=False):
@@ -934,6 +1633,7 @@ def attached_drives():
                 devices.append({"path": node.get("path"), "type": kind, "transport": node_transport,
                                 "removable": node_removable, "size": node.get("size"),
                                 "fstype": node.get("fstype"), "uuid": node.get("uuid"),
+                                "label": node.get("label"),
                                 "mountpoints": [p for p in (node.get("mountpoints") or []) if p and not p.startswith("[")]})
             visit(node.get("children") or [], node_transport, node_removable)
     # Preserve lsblk discovery order. It does not provide connection timestamps.
@@ -942,41 +1642,325 @@ def attached_drives():
     return devices
 
 
-def saved_drive_location(external):
-    """Relocate only the already-approved filesystem; never pick a different disk."""
-    candidates = []
-    original = external["mount_point"]
-    for device in attached_drives():
-        if device.get("uuid") == external["filesystem_uuid"]:
-            candidates.extend(device["mountpoints"])
-    # Try the previously recorded location too; verifies mount, UUID and marker below.
-    candidates = list(dict.fromkeys([original, *candidates]))
-    matches = []
-    for name in candidates:
-        try:
-            mount = Path(name)
-            if mount_info(mount)["uuid"] != external["filesystem_uuid"]:
-                continue
-            subdirectory = external.get("subdirectory", "")
-            directory = checked_path(mount, subdirectory) if subdirectory else mount
-            marker = directory / ".ubuntu-configuration-target.json"
-            if directory.stat().st_mode & 0o077 or marker.is_symlink():
-                continue
-            value = json.loads(marker.read_text())
-            if value.get("format") == FORMAT and value.get("id") == external["marker_id"]:
-                matches.append(directory)
-        except (ConfigError, OSError, ValueError, KeyError, TypeError):
+FSTAB_PATH = Path("/etc/fstab")
+MOUNT_OPTIONS = "defaults,nofail,x-systemd.device-timeout=10"
+POSIX_FSTYPES = ("ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs")
+MOUNT_ROOTS = (Path("/media"), Path("/mnt"))
+
+MOUNT_HELPER = '''#!/usr/bin/python3 -I
+"""Root-only one-shot helper: add a boot mount entry, mount it, hand the tree to the user."""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+COMMENT = "# Managed by ubuntu-backup v1"
+FSTAB = Path("/etc/fstab")
+uuid_value, fstype, target, options, ownership, recursive = sys.argv[1:7]
+mount_point = Path(target)
+owner_uid, owner_gid = (int(part) for part in ownership.split(":"))
+
+if os.geteuid() != 0:
+    raise SystemExit("This helper only runs as root.")
+if not uuid_value.replace("-", "").isalnum() or not mount_point.is_absolute():
+    raise SystemExit("Invalid mount request.")
+
+original = FSTAB.read_bytes()
+entry = f"UUID={uuid_value} {mount_point} {fstype} {options} 0 2\\n"
+lines = original.decode().splitlines(keepends=True)
+if not any(line.split("#", 1)[0].split()[:1] == [f"UUID={uuid_value}"] for line in lines):
+    if lines and not lines[-1].endswith("\\n"):
+        lines[-1] += "\\n"
+    lines += ["\\n", COMMENT + " (backup drive boot mount)\\n", entry]
+    temporary = FSTAB.with_name(".fstab.ubuntu-backup-" + str(os.getpid()))
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(descriptor, "w") as output:
+            output.write("".join(lines))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, FSTAB)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+mount_point.mkdir(parents=True, exist_ok=True)
+result = subprocess.run(["/usr/bin/mount", str(mount_point)], capture_output=True, text=True)
+if result.returncode:
+    FSTAB.write_bytes(original)
+    raise SystemExit(result.stderr.strip() or "mount failed")
+if recursive == "1":
+    subprocess.run(["/usr/bin/chown", "-R", "--", f"{owner_uid}:{owner_gid}", str(mount_point)], check=False)
+else:
+    subprocess.run(["/usr/bin/chown", "--", f"{owner_uid}:{owner_gid}", str(mount_point)], check=False)
+print("mounted " + str(mount_point))
+'''
+
+
+def fstab_entries():
+    """All /etc/fstab entries with their UUID and whether we manage the line; never writes."""
+    try:
+        lines = FSTAB_PATH.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    entries, comment = [], ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            comment = stripped
             continue
-    if len(matches) != 1:
-        raise ConfigError("Saved backup drive is unavailable or ambiguous; matching UUID AND marker are required.")
-    return matches[0]
+        if not stripped:
+            comment = ""
+            continue
+        fields = stripped.split("#", 1)[0].split()
+        if len(fields) < 4:
+            comment = ""
+            continue
+        source, target, fstype, options = fields[:4]
+        if source.startswith("UUID="):
+            filesystem_uuid = source[5:]
+        elif source.startswith("/dev/disk/by-uuid/"):
+            filesystem_uuid = source.rsplit("/", 1)[-1]
+        else:
+            filesystem_uuid = None
+        entries.append({"source": source, "uuid": filesystem_uuid, "mount_point": target,
+                        "fstype": fstype, "options": options,
+                        "managed": "ubuntu-backup" in comment})
+        comment = ""
+    return entries
+
+
+def fstab_entry(filesystem_uuid):
+    return next((entry for entry in fstab_entries() if entry["uuid"] == filesystem_uuid), None)
+
+
+def system_disk():
+    """Device that holds the running system, including its partition table parent."""
+    result = subprocess.run(["findmnt", "-no", "SOURCE", "/"], capture_output=True, text=True, check=False)
+    source = result.stdout.strip().splitlines()
+    if not source or not source[0].startswith("/dev/"):
+        return None
+    return parent_disk(source[0])
+
+
+def parent_disk(path):
+    result = subprocess.run(["lsblk", "-no", "PKNAME", str(path)], capture_output=True, text=True, check=False)
+    parent = result.stdout.strip().splitlines()
+    return "/dev/" + parent[0].strip() if parent and parent[0].strip() else str(path)
+
+
+def default_mount_point(device):
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", str(device.get("label") or "")).strip(".-")
+    name = label or (device.get("uuid") or "")[:8] or "drive"
+    return Path("/media") / pwd.getpwuid(os.geteuid()).pw_name / name
+
+
+def mount_plan(device, mount_point=None):
+    """Validate a rootless boot mount for one unmounted filesystem; changes nothing."""
+    filesystem_uuid, fstype = device.get("uuid"), device.get("fstype")
+    if not filesystem_uuid or not fstype:
+        raise ConfigError("This device has no filesystem; prepare one first. Nothing was formatted.")
+    if fstype not in POSIX_FSTYPES:
+        raise ConfigError(f"{fstype} cannot store the backup safely; only Linux filesystems are supported.")
+    disk = system_disk()
+    if not disk or parent_disk(device.get("path") or "") == disk:
+        raise ConfigError("Refusing to mount the disk that holds the running system.")
+    if mount_point:
+        target = Path(mount_point).expanduser()
+        if not target.is_absolute():
+            raise ConfigError("Mount point must be an absolute path.")
+        target = target.resolve()
+    else:
+        target = default_mount_point(device)
+    if not any(target == base or base in target.parents for base in MOUNT_ROOTS):
+        raise ConfigError("Mount point must be under /media or /mnt.")
+    existing = fstab_entry(filesystem_uuid)
+    if existing and Path(existing["mount_point"]) != target:
+        raise ConfigError(f"This filesystem already has an fstab entry at {existing['mount_point']}; "
+                          "choose that path or edit fstab first.")
+    if target.exists():
+        try:
+            occupied = any(target.iterdir())
+        except OSError:
+            raise ConfigError(f"Cannot verify that {target} is empty; choose a new path.") from None
+        if occupied:
+            raise ConfigError(f"Mount point {target} is not empty; choose an empty directory.")
+    return {"uuid": filesystem_uuid, "fstype": fstype, "mount_point": target,
+            "options": MOUNT_OPTIONS, "existing": existing is not None}
+
+
+def mount_drive(device, mount_point=None, recursive=False):
+    """Mount a prepared Linux filesystem at boot and give it to the current user."""
+    plan = mount_plan(device, mount_point)
+    if not sys.stdin.isatty():
+        raise ConfigError("Mounting needs one sudo prompt; run './ubuntu-backup.py choose-drive' in a terminal.")
+    print(f"Mount point: {plan['mount_point']}")
+    print(f"Filesystem:  {plan['fstype']} (UUID {plan['uuid']})")
+    print("fstab:       " + ("already configured; mounting now" if plan["existing"]
+                             else "add a nofail boot entry owned by you"))
+    if not confirm("Mount this filesystem and make it writable by this account?"):
+        raise ConfigError("Mount cancelled; nothing was changed.")
+    with tempfile.NamedTemporaryFile("w", dir=KIT, prefix=".mount-drive-", suffix=".py", delete=False) as helper:
+        helper.write(MOUNT_HELPER)
+        helper_path = Path(helper.name)
+    helper_path.chmod(0o600)
+    try:
+        result = subprocess.run(["sudo", "/usr/bin/python3", "-I", str(helper_path),
+                                 plan["uuid"], plan["fstype"], str(plan["mount_point"]),
+                                 plan["options"], f"{os.geteuid()}:{os.getegid()}",
+                                 "1" if recursive else "0"],
+                                capture_output=True, text=True, timeout=900)
+    finally:
+        helper_path.unlink(missing_ok=True)
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.strip():
+            print(line)
+    if result.returncode:
+        raise ConfigError("Mount failed; /etc/fstab was left unchanged.")
+    information = mount_info(plan["mount_point"])
+    if information["uuid"] != plan["uuid"]:
+        raise ConfigError("Mounted filesystem does not match the selected UUID.")
+    if plan["mount_point"].stat().st_uid != os.geteuid():
+        print("Warning: the drive is mounted but not owned by this account; writes may be refused.")
+    return str(plan["mount_point"])
+
+
+def mount_saved(check=False, quiet=False):
+    """Mount what /etc/fstab declares, then verify the on-disk marker.
+
+    Nothing about the drive is read from settings: the UUID lives in fstab and the
+    identity lives in the marker file. Returns "mounted", "unset", "absent",
+    "failed" or (check only) "present"."""
+    if not settings().get("external_backup"):
+        if not quiet:
+            print("No backup drive configured; nothing to mount.")
+        return "unset"
+    mounted = mounted_backup_drives()
+    if mounted:
+        if not quiet:
+            print("Mounted: " + str(mounted[0]["directory"]))
+        return "mounted"
+    entries = [entry for entry in fstab_entries() if entry["managed"]]
+    if not entries:
+        if check or not quiet:
+            print("No mounted backup marker and no managed boot entry; select the drive from menu 4 to add one.")
+        return "absent"
+    attached = {device.get("uuid") for device in attached_drives() if device.get("uuid")}
+    present = [entry for entry in entries if entry["uuid"] in attached]
+    if not present:
+        if check or not quiet:
+            print("The filesystem declared in /etc/fstab is not attached. "
+                  "If the drive was replaced or reformatted, select it again from menu 4; nothing was changed.")
+        return "absent"
+    if check:
+        print("Boot entry present but not mounted: " + ", ".join(entry["mount_point"] for entry in present))
+        print("Run ./drive.sh mount for the single sudo prompt.")
+        return "present"
+    subprocess.run(["/usr/bin/systemctl", "--user", "start", "ubuntu-backup-mount.timer"], check=False)
+    for entry in present:
+        if entry["uuid"] and subprocess.run(["udisksctl", "mount", "-b", f"/dev/disk/by-uuid/{entry['uuid']}",
+                                             "--no-user-interaction"],
+                                            capture_output=True, text=True, check=False).returncode == 0:
+            continue
+        result = subprocess.run(["sudo", "-n", "/usr/bin/mount", entry["mount_point"]],
+                                capture_output=True, text=True, check=False)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            print(f"Could not mount {entry['mount_point']} without a password"
+                  + (f": {detail}" if detail else "") + "; run ./drive.sh mount in a terminal.")
+            return "failed"
+    mounted = mounted_backup_drives()
+    if not mounted:
+        print("A mount command ran, but no mounted filesystem carries the backup marker.")
+        return "failed"
+    if not quiet:
+        print("Mounted: " + str(mounted[0]["directory"]))
+    return "mounted"
+
+
+def unmount_saved():
+    """Unmount the marked filesystem; the boot entry in /etc/fstab is left alone."""
+    if not settings().get("external_backup"):
+        print("No backup drive configured; nothing to unmount.")
+        return "unset"
+    drives = mounted_backup_drives()
+    if not drives:
+        print("No mounted filesystem carries the backup marker; nothing to unmount.")
+        return "absent"
+    if len(drives) > 1:
+        raise ConfigError("More than one mounted filesystem carries a backup marker ("
+                          + ", ".join(str(item["directory"]) for item in drives) + "); unmount them explicitly.")
+    directory, filesystem_uuid = drives[0]["directory"], drives[0]["uuid"]
+    subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.service"], check=False)
+    subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
+    os.sync()
+    result = None
+    if filesystem_uuid:
+        result = subprocess.run(["udisksctl", "unmount", "-b", f"/dev/disk/by-uuid/{filesystem_uuid}"],
+                                capture_output=True, text=True, check=False)
+    if result is None or result.returncode:
+        result = subprocess.run(["sudo", "/usr/bin/umount", str(directory)],
+                                capture_output=True, text=True, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise ConfigError("Could not unmount " + str(directory) + (f": {detail}" if detail else ""))
+    print("Unmounted: " + str(directory))
+    return "unmounted"
+
+
+
+def marker_record(directory):
+    """On-disk backup identity. The filesystem owns it; the config never stores it."""
+    marker = Path(directory) / ".ubuntu-configuration-target.json"
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        value = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return None
+    if value.get("format") != FORMAT or not isinstance(value.get("id"), str) or not value["id"]:
+        return None
+    return value
+
+
+def on_source_filesystem(path):
+    try:
+        device = Path(path).stat().st_dev
+    except OSError:
+        return True
+    return device in (HOME.stat().st_dev, Path("/").stat().st_dev)
+
+
+def mounted_backup_drives():
+    """Mounted filesystems carrying a valid marker; no stored UUID or path is consulted."""
+    found, seen = [], set()
+    for device in attached_drives():
+        for name in device["mountpoints"]:
+            directory = Path(name)
+            if directory in seen:
+                continue
+            marker = marker_record(directory)
+            if marker is None or on_source_filesystem(directory):
+                continue
+            seen.add(directory)
+            found.append({"directory": directory, "uuid": device.get("uuid"), "marker": marker})
+    return found
 
 
 def external_directory(config):
-    external = config["external_backup"]
+    """Resolve the backup drive from the on-disk marker; mount paths are never persisted."""
+    external = config.get("external_backup")
     if not external:
         raise ConfigError("No external backup drive is configured.")
-    return saved_drive_location(external)
+    drives = mounted_backup_drives()
+    if not drives:
+        raise ConfigError("No mounted filesystem carries the backup marker; mount the drive first (menu 4).")
+    if len(drives) > 1:
+        raise ConfigError("More than one mounted filesystem carries a backup marker ("
+                          + ", ".join(str(item["directory"]) for item in drives)
+                          + "); unmount the extra drives.")
+    directory = drives[0]["directory"]
+    subdirectory = external.get("subdirectory", "")
+    return checked_path(directory, subdirectory) if subdirectory else directory
 
 
 @contextmanager
@@ -985,12 +1969,11 @@ def pinned_external(config):
     directory = external_directory(config)
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        if os.fstat(fd).st_dev in (HOME.stat().st_dev, Path("/").stat().st_dev):
-            raise ConfigError("Backup drive disappeared; refusing writes onto the source filesystem.")
         pinned = Path("/proc/self/fd") / str(fd)
-        marker = json.loads((pinned / ".ubuntu-configuration-target.json").read_text())
-        if marker.get("format") != FORMAT or marker.get("id") != config["external_backup"]["marker_id"]:
-            raise ConfigError("Pinned backup drive marker does not match.")
+        if on_source_filesystem(pinned):
+            raise ConfigError("Backup drive disappeared; refusing writes onto the source filesystem.")
+        if marker_record(pinned) is None:
+            raise ConfigError("Pinned backup drive marker is missing or invalid.")
         yield pinned, directory
     finally:
         os.close(fd)
@@ -999,9 +1982,16 @@ def pinned_external(config):
 MIN_EXTERNAL_FREE_BYTES = 64 * 1024 * 1024
 
 
-def validate_external_target(external):
-    """Reject source filesystems, full targets, and non-POSIX/writable backup targets."""
-    with pinned_external({"external_backup": external}) as (root, directory):
+def validate_external_directory(directory):
+    """Reject source filesystems, full targets, and non-POSIX/writable backup directories."""
+    directory = Path(directory)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root = Path("/proc/self/fd") / str(fd)
+        if on_source_filesystem(root):
+            raise ConfigError("Backup drive must be on a different filesystem from home and the OS.")
+        if marker_record(root) is None:
+            raise ConfigError("Backup marker is missing or invalid.")
         free = shutil.disk_usage(root).free
         if free < MIN_EXTERNAL_FREE_BYTES:
             raise ConfigError(
@@ -1017,6 +2007,8 @@ def validate_external_target(external):
                 raise ConfigError("Backup drive cannot create valid symlinks.")
         finally:
             shutil.rmtree(probe, ignore_errors=True)
+    finally:
+        os.close(fd)
     return directory
 
 
@@ -1040,9 +2032,8 @@ def copy_external(path, config, filename=None):
     try:
         if os.fstat(directory_fd).st_dev in (HOME.stat().st_dev, Path("/").stat().st_dev):
             raise ConfigError("Backup drive disappeared; refusing a copy onto the source filesystem.")
-        marker = json.loads((pinned / ".ubuntu-configuration-target.json").read_text())
-        if marker["id"] != config["external_backup"]["marker_id"]:
-            raise ConfigError("Pinned backup directory marker does not match.")
+        if marker_record(pinned) is None:
+            raise ConfigError("Pinned backup directory marker is missing or invalid.")
         with tempfile.NamedTemporaryFile(dir=pinned, prefix=".ubuntu-copy-", delete=False) as output:
             temporary = Path(output.name)
             with path.open("rb") as source:
@@ -1079,9 +2070,8 @@ def set_external(mount_point, disable=False):
         information = mount_info(mount)
         if information["fstype"] in ("vfat", "ntfs", "exfat", "msdos"):
             raise ConfigError("Backup drive must use a POSIX filesystem with symlink support.")
-        if mount.stat().st_dev in (HOME.stat().st_dev, Path("/").stat().st_dev):
+        if on_source_filesystem(mount):
             raise ConfigError("Backup drive must be on a different filesystem from home and the OS.")
-        subdirectory = ""
         directory = mount
         marker = directory / ".ubuntu-configuration-target.json"
         if directory.exists() and any(directory.iterdir()) and not marker.is_file():
@@ -1089,19 +2079,18 @@ def set_external(mount_point, disable=False):
         mkdir(directory)
         if marker.is_symlink():
             raise ConfigError("Drive marker must not be a symlink.")
-        if marker.exists():
+        marker_existed = marker.exists()
+        if marker_existed:
             existing = json.loads(marker.read_text())
             if existing.get("format") != FORMAT or not isinstance(existing.get("id"), str):
                 raise ConfigError("Refusing an unrecognized backup drive marker.")
-            marker_id = existing["id"]
         else:
-            marker_id = str(uuid.uuid4())
-        marker_existed = marker.exists()
-        write_json(marker, {"format": FORMAT, "id": marker_id})
-        external = {"mount_point": str(mount), "filesystem_uuid": information["uuid"],
-                    "subdirectory": subdirectory, "marker_id": marker_id}
+            write_json(marker, {"format": FORMAT, "id": str(uuid.uuid4())})
+        # Only the relative subdirectory is persisted: the UUID lives in the filesystem
+        # superblock, the identity in the marker, and the mount path in /etc/fstab.
+        external = {"subdirectory": ""}
         try:
-            validate_external_target(external)
+            validate_external_directory(directory)
             directory.chmod(0o700)
             if directory.stat().st_mode & 0o077:
                 raise ConfigError("Drive cannot enforce private Unix permissions. Use an encrypted/Linux filesystem.")
@@ -1113,6 +2102,12 @@ def set_external(mount_point, disable=False):
     write_json(KIT / "config/settings.json", config)
     print("External backup disabled; existing drive data was not removed." if disable else
           "Backup drive configured at its root. No disk was formatted; the next backup will also copy there.")
+    if not disable:
+        stale = [entry for entry in fstab_entries()
+                 if entry["managed"] and entry["uuid"] and entry["uuid"] != information["uuid"]]
+        for entry in stale:
+            print(f"Note: a managed boot entry for UUID {entry['uuid']} at {entry['mount_point']} "
+                  "remains in /etc/fstab; remove that line if the disk was replaced or reformatted.")
 
 
 def backup(skip_external=False):
@@ -1155,6 +2150,12 @@ def backup(skip_external=False):
             if local_path is not None:
                 prune_dated(local_path.parent, config["keep_snapshots"])
             print("Configuration backup verified.")
+            if report.get("developments"):
+                development = report["developments"]
+                changes = development.get("changes", {})
+                summary = ", ".join(f"{name}={changes[name]}" for name in sorted(changes)) or "none"
+                print(f"Developments: {development['files']} code files; changes since "
+                      f"{development.get('previous_capture_at') or 'first capture'}: {summary}.")
             if report["warnings"]:
                 print(f"Warnings: {len(report['warnings'])} (see capture-report.json)")
             if skip_external:
@@ -1237,33 +2238,85 @@ def default_snapshot():
     raise ConfigError("No snapshot found. Run backup.sh or restore a backup first.")
 
 
-def apt_plan(names):
+def apt_status(names):
+    """Resolve saved package names against the current system; versions are never pinned."""
+    status = {"supported": [], "unavailable": [], "candidates": {}, "installed_now": {}}
     if not names:
-        return [], []
+        return status
     if not all(PACKAGE_RE.fullmatch(name) for name in names):
         raise ConfigError("Invalid package name in saved inventory.")
     native_arch = subprocess.run(["dpkg", "--print-architecture"], capture_output=True,
                                  text=True, check=True).stdout.strip()
     aliases = {name: name.removesuffix(":" + native_arch) for name in names}
-    result = subprocess.run(["apt-cache", "policy", *aliases.values()], capture_output=True, text=True, check=True,
-                            env=dict(os.environ, LC_ALL="C.UTF-8"))
-    available, package = set(), None
+    result = subprocess.run(["apt-cache", "policy", *sorted(set(aliases.values()))], capture_output=True,
+                            text=True, check=True, env=dict(os.environ, LC_ALL="C.UTF-8"))
+    available, candidates, installed_now, package = set(), {}, {}, None
     for line in result.stdout.splitlines():
         if line and not line[0].isspace() and line.endswith(":"):
             package = line[:-1]
-        elif line.strip().startswith("Candidate:") and line.split(":", 1)[1].strip() != "(none)":
-            if package:
+        elif package and line.strip().startswith("Candidate:"):
+            value = line.split(":", 1)[1].strip()
+            if value != "(none)":
                 available.add(package)
+                candidates[package] = value
+        elif package and line.strip().startswith("Installed:"):
+            value = line.split(":", 1)[1].strip()
+            if value != "(none)":
+                installed_now[package] = value
     supported = [name for name in names if name in available or aliases[name] in available]
-    return supported, sorted(set(names) - set(supported))
+    status["supported"] = supported
+    status["unavailable"] = sorted(set(names) - set(supported))
+    status["candidates"] = {name: candidates.get(name) or candidates.get(aliases[name])
+                            for name in supported}
+    status["installed_now"] = {name: installed_now.get(name) or installed_now.get(aliases[name])
+                               for name in supported}
+    return status
+
+
+def apt_plan(names):
+    status = apt_status(names)
+    return status["supported"], status["unavailable"]
+
+
+def package_drift(snapshot, status):
+    """Report saved versions that differ; drift is expected and never blocks reapply."""
+    path = Path(snapshot) / "inventory/package-baseline.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    drift = []
+    for item in data.get("packages", []):
+        if not isinstance(item, dict):
+            continue
+        name, saved = item.get("name"), item.get("version")
+        current = status.get("candidates", {}).get(name)
+        if name and saved and current and current != saved:
+            drift.append({"package": name, "saved": saved, "candidate": current})
+    return drift
 
 
 def deploy(args):
     source = Path(args.snapshot).expanduser().resolve() if args.snapshot else default_snapshot()
     manifest = verify_tree(source)
     records = [record for record in manifest["files"] if record["path"].startswith("home/")]
-    package_names = (source / "inventory/apt-portable.txt").read_text().split()
-    supported, unavailable = apt_plan(package_names) if args.packages else ([], [])
+    package_names = saved_package_names(source)
+    if args.packages:
+        try:
+            package_status = apt_status(package_names)
+        except (ConfigError, OSError, subprocess.SubprocessError) as error:
+            print(f"Warning: saved packages could not be resolved ({error}); "
+                  "continuing without package reapply.")
+            package_status = {"supported": [], "unavailable": package_names,
+                              "candidates": {}, "installed_now": {}}
+    else:
+        package_status = None
+    supported = package_status["supported"] if package_status else []
+    unavailable = package_status["unavailable"] if package_status else []
+    drift = package_drift(source, package_status) if package_status else []
+    developments = load_developments(source) or {}
     changed, unchanged, conflicts = [], [], []
     for record in records:
         relative = record["path"][len("home/"):]
@@ -1280,16 +2333,43 @@ def deploy(args):
             unchanged.append(relative)
         else:
             changed.append(relative)
-    plan = {"source": str(source), "home_files_to_write": changed, "unchanged": unchanged,
+    ordered_changed = deploy_order(source, changed)
+    plan = {"source": str(source), "home_files_to_write": ordered_changed, "unchanged": unchanged,
             "conflicts_skipped": conflicts, "apt_available": supported, "apt_unavailable": unavailable,
+            "package_versions_pinned": False, "package_drift": drift,
+            "development_cycles": developments.get("cycles", []),
+            "development_changes": developments.get("changes", []),
+            "development_references": developments.get("references", {}),
+            "development_order": [name for name in ordered_changed
+                                  if name in {item.get("path") for item in developments.get("files", [])}],
             "system_files_automatically_restored": [], "apply": args.apply,
             "snap_install_requested": args.snaps, "flatpak_install_requested": args.flatpaks,
             "desktop_settings_requested": args.desktop_settings}
     write_json(KIT / "plans/last-deploy.json", plan)
     print(f"{'APPLY' if args.apply else 'DRY RUN'}: {len(changed)} home files to write; "
           f"{len(unchanged)} unchanged; {len(conflicts)} conflicts skipped.")
+    if developments:
+        print(f"Developments: {len(developments.get('files', []))} code files reapply in dependency order.")
+        changes = developments.get("changes", [])
+        if changes:
+            counts = {}
+            for item in changes:
+                counts[item.get("change", "unknown")] = counts.get(item.get("change", "unknown"), 0) + 1
+            summary = ", ".join(f"{name}={counts[name]}" for name in sorted(counts))
+            captured = developments.get("previous_capture_at") or "first capture"
+            print(f"Development changes since {captured}: {summary}.")
+        references = developments.get("references", {})
+        if references.get("packages") or references.get("libraries"):
+            print(f"Development references: {len(references.get('packages', []))} packages, "
+                  f"{len(references.get('libraries', []))} libraries.")
+        if developments.get("cycles"):
+            print(f"Warning: {len(developments['cycles'])} development cycle(s); those members apply "
+                  "in lexical order after their shared dependencies.")
     if args.packages:
-        print(f"APT: {len(supported)} available; {len(unavailable)} unavailable/review required. No versions pinned.")
+        print(f"APT: {len(supported)} available; {len(unavailable)} unavailable/review required. "
+              "Package names are resolved again; versions are not pinned.")
+        if drift:
+            print(f"APT: {len(drift)} saved version(s) differ from current candidates; newer versions are accepted.")
     if args.snaps or args.flatpaks or args.desktop_settings:
         print(f"Optional actions: snaps={args.snaps}, flatpaks={args.flatpaks}, desktop settings={args.desktop_settings}")
     print(f"Full plan: {KIT / 'plans/last-deploy.json'}")
@@ -1300,7 +2380,11 @@ def deploy(args):
         print("Nothing installed or applied. Use --apply; add --overwrite only to replace conflicting files.")
         return
     if args.packages and supported:
-        subprocess.run(["sudo", "apt-get", "install", "--no-remove", "--no-install-recommends", "--", *supported], check=True)
+        # Newer candidates and missing optional packages must not block code reapply.
+        result = subprocess.run(["sudo", "apt-get", "install", "--no-remove", "--no-install-recommends",
+                                 "--", *supported], check=False)
+        if result.returncode:
+            print(f"Warning: APT returned {result.returncode}; continuing with development reapply.")
     if args.snaps:
         for app in json.loads((source / "inventory/snap-apps.json").read_text()):
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", app["name"]) or not re.fullmatch(r"[A-Za-z0-9./_-]+", app["channel"]):
@@ -1321,15 +2405,20 @@ def deploy(args):
                 raise ConfigError("Invalid Flatpak inventory.")
             subprocess.run(["flatpak", "install", "--user", "--noninteractive", "--", remote, app + "//" + branch], check=True)
     rollback = KIT / "rollback" / timestamp()
-    for relative in changed:
+    development_paths = {item.get("path") for item in developments.get("files", [])}
+    for relative in ordered_changed:
         target = checked_path(HOME, relative)
         if target.exists():
             write(rollback / "home" / relative, target.read_bytes(), bool(target.stat().st_mode & 0o111))
         record = next(item for item in records if item["path"] == "home/" + relative)
         write(target, (source / record["path"]).read_bytes(), record["executable"])
-    if changed:
-        write_json(rollback / "changes.json", {"files_written": changed, "previous_files": "home/"})
+        if relative in development_paths:
+            print(f"Reapplied development: {relative}")
+    if ordered_changed:
+        write_json(rollback / "changes.json", {"files_written": ordered_changed, "previous_files": "home/"})
         print(f"Pre-deploy copies of replaced files: {rollback}")
+    if args.build:
+        reapply_builds(source, set(ordered_changed))
     if args.desktop_settings:
         before = subprocess.run(["dconf", "dump", "/"], capture_output=True, check=True).stdout
         write(rollback / "dconf-before.ini", before)
@@ -1381,8 +2470,8 @@ def install_timer():
     print("Daily user backup timer enabled. Missed runs catch up when your user manager next starts.")
 
 
-EMBEDDED_DEFAULT_SETTINGS = {'coverage': 'system-wide-configuration', 'keep_snapshots': 30, 'exclude_cpus': [2, 8], 'external_backup': None, 'keep_local_backups': False, 'home_include': ['.bashrc', '.bash_logout', '.bash_aliases', '.profile', '.inputrc', '.gitconfig', '.Xresources', '.xprofile', '.xsessionrc', '.config/autostart', '.config/systemd/user', '.config/mimeapps.list', '.config/user-dirs.dirs', '.config/user-dirs.locale', '.config/fontconfig', '.config/gtk-3.0/settings.ini', '.config/gtk-3.0/gtk.css', '.config/gtk-4.0/settings.ini', '.config/gtk-4.0/gtk.css', '.config/Code/User/settings.json', '.config/Code/User/keybindings.json', '.config/Code/User/snippets', '.config/sublime-text/Packages/User', '.config/libreoffice/4/user/registrymodifications.xcu', '.local/share/applications', '.local/share/fonts', '.local/share/gnome-shell/extensions', '.local/share/themes', '.local/share/icons', '.fonts', '.themes', '.icons', 'bin', '*.sh', '*.py'], 'home_reference_only': ['.local/bin', '.nvidia-settings-rc', '.config/monitors.xml'], 'system_reference_only': ['/etc/default/keyboard', '/etc/default/locale', '/etc/environment', '/etc/locale.gen', '/etc/timezone', '/etc/apt/sources.list', '/etc/apt/sources.list.d', '/etc/apt/preferences.d', '/etc/apt/keyrings', '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/modprobe.d', '/etc/modules-load.d', '/etc/udev/rules.d', '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/systemd/system', '/etc/systemd/journald.conf', '/etc/systemd/journald.conf.d', '/etc/systemd/logind.conf', '/etc/systemd/logind.conf.d', '/etc/docker/daemon.json', '/etc/containerd/config.toml', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/etc/cron.d'], 'exclude': ['**/__pycache__', '**/__pycache__/*', '**/*.pyc', '**/.git', '**/.git/*', '.ssh', '.ssh/*', '.gnupg', '.gnupg/*', '.kube', '.kube/*', '.git-credentials', '.config/gh/*', '.docker/config.json', '.config/systemd/user/ubuntu-configuration-backup.*', '.config/systemd/user/timers.target.wants/ubuntu-configuration-backup.timer', 'etc/systemd/system/snap*', 'etc/apt/auth.conf', 'etc/apt/auth.conf.d/*'], 'apt_review_only': ['linux-*', 'grub*', 'shim*', 'nvidia-*', 'libnvidia-*', 'cuda*', 'nsight*', 'firmware-*', 'oem-*', 'efibootmgr', 'os-prober', 'mokutil']}
-EMBEDDED_README = 'Ubuntu Backup: self-contained interactive configuration backup and restore.\nNo personal configuration snapshot or backup data is bundled in this repository.\nGenerated snapshots and exports contain secrets and are NOT encrypted.\nOne backup action captures configuration and full /home; identical files are stored once.\nFull recovery stages configuration or full /home; live /home is never overwritten.\n'
+EMBEDDED_DEFAULT_SETTINGS = {'coverage': 'system-wide-configuration', 'keep_snapshots': 30, 'exclude_cpus': [2, 8], 'external_backup': None, 'keep_local_backups': False, 'development_include': [], 'home_include': ['.bashrc', '.bash_logout', '.bash_aliases', '.profile', '.inputrc', '.gitconfig', '.Xresources', '.xprofile', '.xsessionrc', '.config/autostart', '.config/systemd/user', '.config/mimeapps.list', '.config/user-dirs.dirs', '.config/user-dirs.locale', '.config/fontconfig', '.config/gtk-3.0/settings.ini', '.config/gtk-3.0/gtk.css', '.config/gtk-4.0/settings.ini', '.config/gtk-4.0/gtk.css', '.config/Code/User/settings.json', '.config/Code/User/keybindings.json', '.config/Code/User/snippets', '.config/sublime-text/Packages/User', '.config/libreoffice/4/user/registrymodifications.xcu', '.local/share/applications', '.local/share/fonts', '.local/share/gnome-shell/extensions', '.local/share/themes', '.local/share/icons', '.fonts', '.themes', '.icons', 'bin', '*.sh', '*.py'], 'home_reference_only': ['.local/bin', '.nvidia-settings-rc', '.config/monitors.xml'], 'system_reference_only': ['/etc/default/keyboard', '/etc/default/locale', '/etc/environment', '/etc/locale.gen', '/etc/timezone', '/etc/apt/sources.list', '/etc/apt/sources.list.d', '/etc/apt/preferences.d', '/etc/apt/keyrings', '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/modprobe.d', '/etc/modules-load.d', '/etc/udev/rules.d', '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/systemd/system', '/etc/systemd/journald.conf', '/etc/systemd/journald.conf.d', '/etc/systemd/logind.conf', '/etc/systemd/logind.conf.d', '/etc/docker/daemon.json', '/etc/containerd/config.toml', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/etc/cron.d'], 'exclude': ['**/__pycache__', '**/__pycache__/*', '**/*.pyc', '**/.git', '**/.git/*', '.ssh', '.ssh/*', '.gnupg', '.gnupg/*', '.kube', '.kube/*', '.git-credentials', '.config/gh/*', '.docker/config.json', '.config/systemd/user/ubuntu-configuration-backup.*', '.config/systemd/user/timers.target.wants/ubuntu-configuration-backup.timer', 'etc/systemd/system/snap*', 'etc/apt/auth.conf', 'etc/apt/auth.conf.d/*'], 'apt_review_only': ['linux-*', 'grub*', 'shim*', 'nvidia-*', 'libnvidia-*', 'cuda*', 'nsight*', 'firmware-*', 'oem-*', 'efibootmgr', 'os-prober', 'mokutil']}
+EMBEDDED_README = 'Ubuntu Backup: self-contained interactive configuration backup and restore.\nNo personal configuration snapshot or backup data is bundled in this repository.\nGenerated snapshots and exports contain secrets and are NOT encrypted.\nOne backup action captures configuration, development code and full /home; identical files are stored once.\nEach development change records its time, content version and package/library references; reapply follows dependency order and never pins package versions.\nFull recovery stages configuration or full /home; live /home is never overwritten.\n'
 EMBEDDED_GITIGNORE = '*\n!ubuntu-backup.py\n!README.md\n!.gitignore\n'
 EMBEDDED_ROOT_EXPORTER = '#!/usr/bin/python3 -I\n"""System-wide CONFIGURATION capture; root reads, owner writes. Never a disk image."""\n# Managed by ubuntu-configuration system capture v1\nimport argparse\nimport datetime as dt\nimport hashlib\nimport io\nimport json\nimport os\nfrom pathlib import Path\nimport pwd\nimport stat\nimport subprocess\nimport sys\nimport tarfile\nimport tempfile\n\nMARKER = "# Managed by ubuntu-configuration system capture v1"\nUNIT = "ubuntu-configuration-system"\nHELPER = Path("/usr/local/libexec/ubuntu-configuration-system-capture.py")\nROOTS = ("/etc", "/usr/local/etc", "/usr/local/libexec/ubuntu-configuration-system-capture.py")\nMAX_FILE, MAX_TOTAL = 64 * 1024 * 1024, 1024 * 1024 * 1024\nDATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",\n             "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",\n             "indexeddb", "local storage", "session storage", "service worker", "blob_storage", "__pycache__"}\nHOME_PATHS = (".config", ".local/share/applications", ".local/share/fonts", ".local/share/themes", ".local/share/icons",\n              ".local/share/gnome-shell/extensions", ".fonts", ".themes", ".icons", ".ssh/config", ".kube/config",\n              ".gnupg/gpg.conf", ".gnupg/gpg-agent.conf", ".docker/config.json", ".aws/config")\nHISTORIES = {".bash_history", ".python_history", ".scala_history", ".dotty_history", ".lesshst", ".wget-hsts",\n             ".sudo_as_admin_successful", ".Xauthority", ".ICEauthority", ".DS_Store"}\n\n\ndef collect(owner_uid, accounts=None, system_roots=ROOTS):\n    """Pinned descriptors, unlimited depth, no symlinks or nested mounts followed."""\n    files, metadata, links, omissions, excluded = {}, {}, [], [], []\n    total = 0\n\n    def scan(parent_fd, name, prefix, device=None):\n        nonlocal total\n        if name.lower() in DATA_DIRS:\n            excluded.append(prefix)\n            return\n        try:\n            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)\n            if stat.S_ISLNK(info.st_mode):\n                links.append({"path": prefix, "target": os.readlink(name, dir_fd=parent_fd)})\n                return\n            if stat.S_ISDIR(info.st_mode):\n                if device is not None and info.st_dev != device:\n                    excluded.append(prefix + " (nested mount)")\n                    return\n                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)\n                try:\n                    with os.scandir(fd) as entries:\n                        names = sorted(entry.name for entry in entries)\n                    for child in names:\n                        scan(fd, child, prefix + "/" + child, info.st_dev)\n                finally:\n                    os.close(fd)\n                return\n            if not stat.S_ISREG(info.st_mode):\n                excluded.append(prefix + " (runtime/special file)")\n                return\n            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)\n            with os.fdopen(fd, "rb") as source:\n                before = os.fstat(source.fileno())\n                if not stat.S_ISREG(before.st_mode):\n                    raise RuntimeError("Configuration changed type: " + prefix)\n                data = source.read(MAX_FILE + 1)\n                after = os.fstat(source.fileno())\n            if len(data) > MAX_FILE:\n                raise RuntimeError("Configuration exceeds 64 MiB; capture aborted: " + prefix)\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise RuntimeError("Configuration changed during read; retry capture: " + prefix)\n            total += len(data)\n            if total > MAX_TOTAL:\n                raise RuntimeError("Configuration exceeds 1 GiB; review excluded application data before retrying.")\n            files[prefix] = data\n            metadata[prefix] = {"mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid, "gid": before.st_gid}\n        except FileNotFoundError:\n            return\n        except PermissionError:\n            omissions.append(prefix + " (unreadable even with current privileges)")\n\n    for root in system_roots:\n        path = Path(root)\n        try:\n            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        except FileNotFoundError:\n            continue\n        try:\n            scan(parent, path.name, "system/" + path.as_posix().lstrip("/"))\n        finally:\n            os.close(parent)\n    chosen = []\n    for account in accounts if accounts is not None else pwd.getpwall():\n        if account.pw_uid not in (0, owner_uid) and not (1000 <= account.pw_uid < 65534 and account.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin")):\n            continue\n        home = Path(account.pw_dir)\n        if not home.is_dir() or home.is_symlink():\n            omissions.append(f"Account {account.pw_uid}: home missing or symlinked")\n            continue\n        chosen.append({"uid": account.pw_uid, "name": account.pw_name, "home": str(home)})\n        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            prefix = "home" if account.pw_uid == owner_uid else f"accounts/{account.pw_uid}/home"\n            paths = set(HOME_PATHS)\n            with os.scandir(fd) as entries:\n                paths.update(entry.name for entry in entries if entry.name.startswith(".") and entry.is_file(follow_symlinks=False)\n                             and entry.name not in HISTORIES and not entry.name.endswith((".swp", ".swo", "~"))\n                             and not entry.name.startswith(".xsession-errors"))\n            for relative in sorted(paths):\n                parent = os.dup(fd)\n                try:\n                    parts = Path(relative).parts\n                    for part in parts[:-1]:\n                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)\n                        os.close(parent)\n                        parent = child\n                    scan(parent, parts[-1], prefix + "/" + relative)\n                except FileNotFoundError:\n                    pass\n                except OSError as exc:\n                    omissions.append(prefix + "/" + relative + " (ancestor unavailable: " + exc.strerror + ")")\n                finally:\n                    os.close(parent)\n        finally:\n            os.close(fd)\n    files["inventory/privileged-links.json"] = (json.dumps(links, indent=2) + "\\n").encode()\n    files["inventory/privileged-source-metadata.json"] = (json.dumps(metadata, indent=2) + "\\n").encode()\n    files["inventory/privileged-exclusions.json"] = (json.dumps(excluded, indent=2) + "\\n").encode()\n    return files, {"accounts": chosen, "roots": list(system_roots), "omissions": omissions}\n\n\ndef units(owner_uid, kit):\n    def quote(value):\n        value = str(value)\n        if "\\n" in value or "\\r" in value:\n            raise RuntimeError("Newlines are not allowed in a scheduler path.")\n        return \'"\' + value.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\').replace("%", "%%") + \'"\'\n    service = f"""{MARKER}\n[Unit]\nDescription=System-wide configuration capture and private user backup\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 -I {HELPER} --owner {owner_uid} --workspace {quote(kit)} --run-backup\nUMask=0077\nNice=10\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths={quote(kit)}\nTimeoutStartSec=20min\n"""\n    timer = f"""{MARKER}\n[Unit]\nDescription=Daily system-wide configuration backup\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=10m\n[Install]\nWantedBy=timers.target\n"""\n    return service, timer\n\n\ndef install_scheduler(owner_uid, kit):\n    root = Path("/etc/systemd/system")\n    service, timer = units(owner_uid, kit)\n    targets = [(HELPER, globals().get("SELF_SOURCE") or Path(__file__).read_text(), 0o700),\n               (root / (UNIT + ".service"), service, 0o644), (root / (UNIT + ".timer"), timer, 0o644)]\n    HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)\n    for directory in (HELPER.parent, root):\n        info = directory.lstat()\n        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:\n            raise RuntimeError("Scheduler directories must be protected and root-owned.")\n    for path, _, _ in targets:\n        if path.is_symlink() or (path.exists() and MARKER not in path.read_text()):\n            raise RuntimeError("Refusing unmanaged scheduler file: " + str(path))\n        if path.suffix == ".service" and path.exists() and f"--owner {owner_uid} " not in path.read_text():\n            raise RuntimeError("System-wide scheduler belongs to another account.")\n    for path, text, mode in targets:\n        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".system-config-", delete=False) as output:\n            temporary = Path(output.name)\n            try:\n                output.write(text.encode())\n                os.fchmod(output.fileno(), mode)\n                os.fchown(output.fileno(), 0, 0)\n                output.flush()\n                os.fsync(output.fileno())\n                os.replace(temporary, path)\n            finally:\n                temporary.unlink(missing_ok=True)\n    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)\n    subprocess.run(["/usr/bin/systemctl", "enable", "--now", UNIT + ".timer"], check=True)\n\n\ndef main(install=False, owner_uid=None, workspace=None, run_backup=False, replace_user_timer=False):\n    os.umask(0o077)\n    if os.geteuid() != 0:\n        raise RuntimeError("Run the confirmed sudo capture action, or sudo ./capture-root-configs.sh")\n    identity = owner_uid if owner_uid is not None else os.environ.get("SUDO_UID")\n    if identity is None:\n        raise RuntimeError("A non-root sudo caller or explicit scheduler owner is required.")\n    owner = pwd.getpwuid(int(identity))\n    if owner.pw_uid == 0:\n        raise RuntimeError("A non-root backup owner is required.")\n    kit = Path(workspace).expanduser().absolute() if workspace else Path(__file__).resolve().parents[1]\n    if Path(owner.pw_dir) not in kit.parents or ".." in kit.parts or kit.is_symlink():\n        raise RuntimeError("The private workspace must be inside the backup owner\'s real home directory.")\n    files, details = collect(owner.pw_uid)\n    captured = dt.datetime.now(dt.timezone.utc).isoformat()\n    manifest = {"format": "ubuntu-configuration-v1", "kind": "system-wide-configuration-cache", "created_at": captured,\n                "captured_at": captured, **details,\n                "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),\n                           "executable": False} for name, data in sorted(files.items())]}\n    if sum(len(data) for data in files.values()) > MAX_TOTAL or len(json.dumps(manifest).encode()) > MAX_FILE:\n        raise RuntimeError("Complete configuration/metadata exceeds safety limits; old cache preserved.")\n    if install:\n        install_scheduler(owner.pw_uid, kit)\n    os.setgroups([])\n    os.setgid(owner.pw_gid)\n    os.setuid(owner.pw_uid)\n    os.environ.update(HOME=owner.pw_dir, XDG_RUNTIME_DIR=f"/run/user/{owner.pw_uid}",\n                      DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{owner.pw_uid}/bus")\n    destination = kit / "privileged-system"\n    if destination.is_symlink():\n        raise RuntimeError("Refusing a symlinked capture directory.")\n    destination.mkdir(mode=0o700, exist_ok=True)\n    destination.chmod(0o700)\n    temporary = None\n    try:\n        with tempfile.NamedTemporaryFile(dir=destination, prefix=".system-wide-", delete=False) as output:\n            temporary = Path(output.name)\n            with tarfile.open(fileobj=output, mode="w:gz") as archive:\n                payload = dict(files)\n                payload["manifest.json"] = (json.dumps(manifest, indent=2) + "\\n").encode()\n                for name, data in sorted(payload.items()):\n                    info = tarfile.TarInfo(name)\n                    info.size, info.mode = len(data), 0o600\n                    archive.addfile(info, io.BytesIO(data))\n            output.flush()\n            os.fsync(output.fileno())\n        with tarfile.open(temporary, "r:gz") as archive:\n            for record in manifest["files"]:\n                if hashlib.sha256(archive.extractfile(record["path"]).read()).hexdigest() != record["sha256"]:\n                    raise RuntimeError("Privileged cache verification failed; old cache preserved.")\n        os.replace(temporary, destination / "system-wide.tar.gz")\n        temporary = None\n        fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n    finally:\n        if temporary is not None:\n            temporary.unlink(missing_ok=True)\n    print(f"Privately captured {len(files)} configuration files across {len(details[\'accounts\'])} accounts (root plus local users); omissions: {len(details[\'omissions\'])}.")\n    if replace_user_timer:\n        old = Path(owner.pw_dir) / ".config/systemd/user/ubuntu-configuration-backup.timer"\n        if old.is_file() and not old.is_symlink() and "# Managed by ubuntu-configuration v1" in old.read_text():\n            subprocess.run(["systemctl", "--user", "disable", "--now", "ubuntu-configuration-backup.timer"], check=True)\n    if run_backup or install:\n        entrypoint = Path(owner.pw_dir) / "ubuntu-backup.py"\n        if not entrypoint.is_file():\n            entrypoint = kit / "ubuntu-backup.py"  # Compatibility with older recovered kits.\n        subprocess.run(["/usr/bin/python3", "-I", str(entrypoint), "--workspace", str(kit), "--non-interactive", "backup"], check=True)\n    else:\n        print("Now run the normal backup command without sudo. Capture includes sensitive settings; it is NOT encrypted.")\n\n\nif __name__ == "__main__":\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument("--owner", type=int)\n    parser.add_argument("--workspace", type=Path)\n    parser.add_argument("--install-timer", action="store_true")\n    parser.add_argument("--replace-user-timer", action="store_true")\n    parser.add_argument("--run-backup", action="store_true")\n    options = parser.parse_args()\n    try:\n        main(options.install_timer, options.owner, options.workspace, options.run_backup, options.replace_user_timer)\n    except (RuntimeError, OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as exc:\n        print(f"Error: {exc}", file=sys.stderr)\n        sys.exit(1)\n'
 # This interface is appended to the standalone backend by build-single-file.py.
@@ -1723,17 +2812,21 @@ def show_status():
     config = settings()
     print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots")
     external = config["external_backup"]
-    print("External drive: " + (external["mount_point"] if external else "not chosen; local backups only"))
-    print(f"Local dated snapshots: {len(dated_snapshots(KIT / 'backups'))}; legacy archives: {len(archives(KIT / 'backups'))}")
-    if external:
+    directory = None
+    if not external:
+        print("External drive: not chosen; local backups only")
+    else:
         try:
             directory = external_directory(config)
-            configuration = directory / "timeline/config"
-            homes = directory / "timeline/home"
-            print(f"External configuration timelines: {len(list(configuration.iterdir())) if configuration.is_dir() else 0}; "
-                  f"full /home timelines: {len(list(homes.iterdir())) if homes.is_dir() else 0}")
+            print("External drive: " + str(directory))
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-            print(f"External drive unavailable: {exc}")
+            print("External drive: configured but unavailable (" + str(exc) + ")")
+    print(f"Local dated snapshots: {len(dated_snapshots(KIT / 'backups'))}; legacy archives: {len(archives(KIT / 'backups'))}")
+    if directory is not None:
+        configuration = directory / "timeline/config"
+        homes = directory / "timeline/home"
+        print(f"External configuration timelines: {len(list(configuration.iterdir())) if configuration.is_dir() else 0}; "
+              f"full /home timelines: {len(list(homes.iterdir())) if homes.is_dir() else 0}")
     if shutil.which("systemctl"):
         result = subprocess.run(["systemctl", "--user", "is-enabled", UNIT + ".timer"],
                                 capture_output=True, text=True, timeout=10)
@@ -1764,7 +2857,8 @@ def wizard_deploy(source=None):
     if source is None:
         return
     verify_tree(source)
-    print("Only portable home settings are copied. System references/repos/drivers/disks are not replayed.")
+    print("Home configuration and backed-up developments are reapplied in dependency order. "
+          "System references/repos/drivers/disks are not replayed.")
     args = argparse.Namespace(
         snapshot=str(source), apply=False,
         overwrite=confirm("Replace conflicting home files, keeping rollback copies?"),
@@ -1772,6 +2866,7 @@ def wizard_deploy(source=None):
         snaps=confirm("Install captured Snap apps/channels (some use classic confinement)?"),
         flatpaks=confirm("Install Flatpak apps from already-configured trusted USER remotes?"),
         desktop_settings=confirm("Import GNOME/dconf preferences?"),
+        build=confirm("Rebuild captured C/C++ binaries from source where a compiler is available?"),
     )
     deploy(args)
     if ask("Type APPLY to apply this plan; anything else cancels") != "APPLY":
@@ -1920,8 +3015,14 @@ def wizard_verify():
 
 def wizard_drive(mount_point=None, disable=False):
     current = settings()["external_backup"]
-    print("Current drive: " + (current["mount_point"] if current else "unset"))
-    print("No disk will be formatted, partitioned, or mounted. Skip keeps the saved choice.")
+    if not current:
+        print("Current drive: unset")
+    else:
+        try:
+            print("Current drive: " + str(external_directory(settings())))
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            print("Current drive: configured but unavailable (" + str(exc) + ")")
+    print("No disk is formatted or partitioned. A selected Linux filesystem can be mounted at boot, after one confirmation.")
     value = "disable" if disable else mount_point
     if value is None:
         while True:
@@ -1931,9 +3032,13 @@ def wizard_drive(mount_point=None, disable=False):
             if not devices:
                 print("No attached block devices detected. Connect a drive and choose rescan.")
             for number, device in enumerate(devices, 1):
-                mounts = ", ".join(device["mountpoints"]) or "NOT MOUNTED"
+                mounts = ", ".join(device["mountpoints"])
+                if not mounts:
+                    entry = fstab_entry(device["uuid"]) if device.get("uuid") else None
+                    mounts = f"boot entry {entry['mount_point']} (not mounted now)" if entry else "NOT MOUNTED"
                 print(f"{number}. {device['path']} ({device['type']}, {device['size']} bytes, "
-                      f"{device['fstype'] or 'no filesystem'}, UUID {device['uuid'] or 'none'}) — {mounts}")
+                      f"{device['fstype'] or 'no filesystem'}, label {device.get('label') or 'none'}, "
+                      f"UUID {device['uuid'] or 'none'}) — {mounts}")
             print("s. Skip external backup for now; keep previous target")
             print("r. Rescan after connecting a drive   p. Enter an already-mounted path")
             print("d. Disable/forget saved target (separate confirmation)")
@@ -1952,9 +3057,17 @@ def wizard_drive(mount_point=None, disable=False):
             if choice.isdigit() and 1 <= int(choice) <= len(devices):
                 selected = devices[int(choice) - 1]
                 if not selected["mountpoints"]:
-                    print("This device is not mounted. Mount the correct prepared filesystem yourself, then rescan; nothing was changed.")
-                    continue
-                if len(selected["mountpoints"]) > 1:
+                    preferred = default_mount_point(selected)
+                    entry = fstab_entry(selected["uuid"]) if selected.get("uuid") else None
+                    if entry:
+                        preferred = Path(entry["mount_point"])
+                    target = ask("Mount point", str(preferred))
+                    try:
+                        value = mount_drive(selected, target or None)
+                    except (ConfigError, OSError, subprocess.SubprocessError) as exc:
+                        print(str(exc))
+                        continue
+                elif len(selected["mountpoints"]) > 1:
                     print("Multiple mountpoints: " + ", ".join(selected["mountpoints"]))
                     value = ask("Enter the desired mountpoint (blank skips)")
                     if value and value not in selected["mountpoints"]:
@@ -2017,7 +3130,7 @@ def backup_everything():
             print(message)
             return None
         try:
-            validate_external_target(settings()["external_backup"])
+            validate_external_directory(external_directory(settings()))
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             message = f"Backup cancelled: selected drive unavailable: {exc}"
             _write_status("cancelled", "cancelled", message)
@@ -2159,10 +3272,14 @@ def main():
         "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
         "backup-now": "Run the combined backup in this terminal",
-        "choose-drive": "Select the mounted backup drive",
+        "choose-drive": "Select a backup drive; can add a boot mount",
+        "mount-saved": "Mount the fstab-declared backup drive and verify its on-disk marker",
+        "unmount-saved": "Unmount the marked backup drive; keeps the boot entry",
     }
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
+    commands.choices["mount-saved"].add_argument("--check", action="store_true", help="Report state only; mount nothing")
+    commands.choices["mount-saved"].add_argument("--quiet", action="store_true", help="Silence the routine no-op states")
     worker = commands.add_parser("_capture-root-worker")
     worker.add_argument("--install-system-timer", action="store_true")
     worker.add_argument("--replace-user-timer", action="store_true")
@@ -2182,12 +3299,12 @@ def main():
     group.add_argument("--archive", type=Path)
     sub = commands.add_parser("undo-restore", help="Review and undo unchanged steps from a selective restore")
     sub.add_argument("journal", nargs="?", type=Path)
-    sub = commands.add_parser("set-external", help="Choose an already-mounted drive; never formats disks")
+    sub = commands.add_parser("set-external", help="Choose a backup drive; can add a boot mount, never formats disks")
     sub.add_argument("mount_point", nargs="?")
     sub.add_argument("--disable", action="store_true")
     sub = commands.add_parser("deploy", help="Preview/apply a saved configuration; dry-run by default")
     sub.add_argument("--snapshot")
-    for option in ("apply", "overwrite", "packages", "snaps", "flatpaks", "desktop-settings"):
+    for option in ("apply", "overwrite", "packages", "snaps", "flatpaks", "desktop-settings", "build"):
         sub.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
     if args.show_help:
@@ -2214,6 +3331,12 @@ def main():
         print("Personal configuration data is bundled in this file; it is NOT encrypted.")
         workspace = Path(ask("Private workspace folder", str(workspace)))
     private_workspace(workspace)
+    if command in ("mount-saved", "unmount-saved"):
+        state = (mount_saved(check=args.check, quiet=args.quiet) if command == "mount-saved"
+                 else unmount_saved())
+        if state == "failed":
+            raise ConfigError("The saved backup drive is attached but could not be mounted.")
+        return
     allowed_cpus = restrict_backup_cpus()
     if command != "tray":
         _setup_logging()
@@ -3615,8 +4738,8 @@ def root_home_backup(workspace):
     temporary = None
     created = []
     try:
-        if json.loads((pinned / ".ubuntu-configuration-target.json").read_text())["id"] != config["external_backup"]["marker_id"]:
-            raise ConfigError("Pinned backup drive marker changed.")
+        if marker_record(pinned) is None:
+            raise ConfigError("Pinned backup drive marker is missing or invalid.")
         temporary, manifest, created, timelines = capture_home_archive(child.stdout, pinned, actual, excluded)
         status = child.wait()
         thread.join()
@@ -3814,7 +4937,7 @@ def run_tray():
             if not settings().get("external_backup"):
                 ready, error = False, None
             else:
-                validate_external_target(settings()["external_backup"])
+                validate_external_directory(external_directory(settings()))
                 ready, error = True, None
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             ready, error = False, str(exc)
@@ -3866,7 +4989,7 @@ def run_tray():
             raise ConfigError("Cancel the active backup before purging data.")
         config = settings()
         external = config.get("external_backup")
-        if external and (not isinstance(external, dict) or not external.get("mount_point")):
+        if external and not isinstance(external, dict):
             raise ConfigError("Saved backup drive settings are incomplete; nothing was purged.")
         external_dir = None
         if external:
@@ -3874,12 +4997,11 @@ def run_tray():
                 external_dir = external_directory(config)
                 if external_dir.is_symlink():
                     raise ConfigError("Refusing symlinked external backup directory.")
-                marker_value = json.loads((external_dir / ".ubuntu-configuration-target.json").read_text())
             except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
                 raise ConfigError("External backup drive is unavailable; nothing was purged. "
                                   "Forget the drive first to purge local data only. " + str(exc)) from None
-            if marker_value.get("format") != FORMAT or marker_value.get("id") != external.get("marker_id"):
-                raise ConfigError("External backup drive marker does not match; nothing was purged.")
+            if marker_record(external_dir) is None:
+                raise ConfigError("External backup drive marker is missing or invalid; nothing was purged.")
         lock_fd = None
         try:
             lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -3937,7 +5059,7 @@ def run_tray():
             try:
                 directory = external_directory(config)
             except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
-                external_text = (f"External drive {external.get('mount_point')} is unavailable. "
+                external_text = ("The configured external drive is unavailable. "
                                  "Purge would stop before deleting anything; forget the drive first "
                                  "to purge local data only.")
             else:
@@ -3989,7 +5111,11 @@ def run_tray():
         box.set_spacing(8)
         box.set_border_width(12)
         current = settings().get("external_backup")
-        box.add(Gtk.Label(label="Current: " + (current["mount_point"] if current else "unset"), xalign=0))
+        try:
+            current_text = str(external_directory(settings())) if current else "unset"
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+            current_text = "configured but unavailable"
+        box.add(Gtk.Label(label="Current: " + current_text, xalign=0))
         box.add(Gtk.Label(label="Select an already-mounted filesystem. No disk is formatted or mounted.", xalign=0))
         chooser = Gtk.ComboBoxText()
         for label, _mount in options:

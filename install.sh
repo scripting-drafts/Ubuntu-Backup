@@ -19,10 +19,12 @@ ICONS="$DATA/icons/hicolor/scalable/apps"
 AUTODIR="$CONFIG/autostart"
 SYSTEMD="$CONFIG/systemd/user"
 WORKSPACE="$HOME/ubuntu-backup/data"
-mkdir -p "$BIN" "$APPS" "$ICONS" "$AUTODIR"
+mkdir -p "$BIN" "$APPS" "$ICONS" "$AUTODIR" "$SYSTEMD"
 install -m 700 "$ROOT/ubuntu-backup.py" "$BIN/ubuntu-backup.py"
 install -m 600 "$ROOT/ubuntu-backup.svg" "$ICONS/ubuntu-backup.svg"
 quote() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
+# systemd specifier %h keeps the generated units portable between machines/accounts.
+portable() { case "$1" in "$HOME"/*) printf '%%h/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
 cat > "$APPS/ubuntu-backup.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -44,6 +46,32 @@ Terminal=false
 X-GNOME-Autostart-enabled=true
 EOF
 rm -f "$SYSTEMD/ubuntu-backup-tray.service"
+# The mount units carry no device name or UUID: the saved UUID is read at run time,
+# so a replaced or reformatted drive is simply skipped until it is selected again.
+cat > "$SYSTEMD/ubuntu-backup-mount.service" <<EOF
+[Unit]
+Description=Mount the backup drive declared in /etc/fstab
+ConditionPathExists=$(portable "$WORKSPACE")/config/settings.json
+
+[Service]
+Type=oneshot
+ExecStart="$(portable "$BIN")" --workspace "$(portable "$WORKSPACE")" mount-saved --quiet
+EOF
+cat > "$SYSTEMD/ubuntu-backup-mount.timer" <<EOF
+[Unit]
+Description=Retry mounting the saved Ubuntu Backup drive
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=ubuntu-backup-mount.service
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl --user daemon-reload 2>/dev/null || true
+systemctl --user enable --now ubuntu-backup-mount.timer 2>/dev/null || true
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
 if [[ "${UBUNTU_BACKUP_SKIP_START:-0}" != 1 ]] && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
