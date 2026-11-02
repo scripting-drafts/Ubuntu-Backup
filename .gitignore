@@ -6,6 +6,7 @@
 !refresh.sh
 !drive.sh
 !README.md
+!ATOMIC-CAPTURE.md
 !.gitignore
 !tests/
 !tests/*.py
