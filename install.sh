@@ -21,6 +21,12 @@ SYSTEMD="$CONFIG/systemd/user"
 WORKSPACE="$HOME/ubuntu-backup/data"
 mkdir -p "$BIN" "$APPS" "$ICONS" "$AUTODIR" "$SYSTEMD"
 install -m 700 "$ROOT/ubuntu-backup.py" "$BIN/ubuntu-backup.py"
+if [[ ! -x "$ROOT/native/ubackup-core" && -f "$ROOT/native/ubackup-core.c" ]]; then
+    make -C "$ROOT/native" >/dev/null 2>&1 || echo "Warning: native capture core build failed; --native-capture will be unavailable." >&2
+fi
+if [[ -x "$ROOT/native/ubackup-core" ]]; then
+    install -m 700 "$ROOT/native/ubackup-core" "$BIN/ubackup-core"
+fi
 install -m 600 "$ROOT/ubuntu-backup.svg" "$ICONS/ubuntu-backup.svg"
 quote() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
 # systemd specifier %h keeps the generated units portable between machines/accounts.
@@ -55,7 +61,7 @@ ConditionPathExists=$(portable "$WORKSPACE")/config/settings.json
 
 [Service]
 Type=oneshot
-ExecStart="$(portable "$BIN")" --workspace "$(portable "$WORKSPACE")" mount-saved --quiet
+ExecStart="$(portable "$BIN/ubuntu-backup.py")" --workspace "$(portable "$WORKSPACE")" mount-saved --quiet
 EOF
 cat > "$SYSTEMD/ubuntu-backup-mount.timer" <<EOF
 [Unit]

@@ -10,6 +10,10 @@
 !.gitignore
 !tests/
 !tests/*.py
+!native/
+!native/*.c
+!native/Makefile
+!native/*.md
 !extension/
 !extension/*.sh
 !extension/*.md

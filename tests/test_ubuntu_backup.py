@@ -105,6 +105,8 @@ class EmbeddedCollectorTests(unittest.TestCase):
             files, details = namespace["collect"](os.getuid(), accounts=[], system_roots=[missing])
             self.assertEqual(details["omissions"], [])
             self.assertIn("inventory/privileged-links.json", files)
+            service, _timer = namespace["units"](1000, Path("/tmp/kit"))
+            self.assertIn("SuccessExitStatus=3", service)
 
 
 class CaptureRootTests(unittest.TestCase):
@@ -211,6 +213,78 @@ class StagingTests(unittest.TestCase):
             self.assertFalse(backup.object_path(stage_objects, sha256).exists())
             self.assertEqual(list(stage_incoming.iterdir()), [])
 
+    def test_sparse_tar_sentinels_are_ignored(self):
+        import tarfile
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "sparse.bin"
+            with source.open("wb") as stream:
+                stream.write(b"A" * 4096)
+                stream.seek(8 * 1024 * 1024)
+                stream.write(b"B" * 4096)
+                stream.truncate(16 * 1024 * 1024)
+            archive_path = base / "sparse.tar"
+            subprocess.run(["tar", "--create", "--file", str(archive_path), "--sparse",
+                            "--directory", str(base), source.name], check=True)
+            stage_objects = base / "stage/objects"
+            stage_incoming = base / "stage/incoming"
+            external_objects = base / "external/objects"
+            stage_objects.mkdir(parents=True)
+            stage_incoming.mkdir(parents=True)
+            external_objects.mkdir(parents=True)
+            with tarfile.open(archive_path, "r|") as archive:
+                member = next(iter(archive))
+                self.assertTrue(member.sparse)
+                self.assertIn((0, 0), [tuple(item) for item in member.sparse])
+                destination, sha256 = backup.stream_object(
+                    stage_objects, stage_incoming, external_objects,
+                    archive.extractfile(member), member.size,
+                    [list(item) for item in member.sparse], [])
+            self.assertEqual(sha256, hashlib.sha256(source.read_bytes()).hexdigest())
+            self.assertEqual(backup.copy_staged_objects(stage_objects, external_objects), 1)
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+
+
+class HomeCaptureSparseTests(unittest.TestCase):
+    def test_capture_publishes_a_sparse_file_timeline(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "source"
+            source.mkdir()
+            sparse = source / "sparse.bin"
+            with sparse.open("wb") as stream:
+                stream.write(b"A" * 4096)
+                stream.seek(8 * 1024 * 1024)
+                stream.write(b"B" * 4096)
+                stream.truncate(16 * 1024 * 1024)
+            (source / "link").symlink_to("sparse.bin")
+            (source / "hard").hardlink_to(sparse)
+            (source / "dir").mkdir()
+            (source / "dir/file.txt").write_text("text\n")
+            archive_path = base / "home.tar"
+            subprocess.run(["tar", "--create", "--file", str(archive_path),
+                            "--sparse", "--acls", "--xattrs", "--numeric-owner",
+                            "--directory", str(source), "."], check=True)
+            external = base / "external"
+            external.mkdir()
+            stage = base / "stage"
+            stage.mkdir()
+            saved = backup.KIT, backup.prepare_staging
+            backup.KIT = base / "kit"
+            backup.KIT.mkdir()
+            backup.prepare_staging = lambda _root: stage
+            try:
+                with archive_path.open("rb") as stream:
+                    timeline, manifest, _created, _timelines = backup.capture_home_archive(
+                        stream, external, {}, [])
+                self.assertTrue(timeline.is_dir())
+                self.assertGreaterEqual(manifest["entry_count"], 5)
+                backup.verify_home_timeline(timeline)
+                self.assertEqual(timeline.joinpath("tree/sparse.bin").read_bytes(),
+                                 sparse.read_bytes())
+            finally:
+                backup.KIT, backup.prepare_staging = saved
+
 
 class DevelopmentOrderTests(unittest.TestCase):
     def _capture(self, directory):
@@ -273,6 +347,75 @@ class DevelopmentDetectionTests(unittest.TestCase):
             self.assertIn("repo", roots)
             self.assertIn("extra", roots)
             self.assertNotIn("plain", roots)
+
+
+class OversizedConfigTests(unittest.TestCase):
+    def test_oversized_file_is_skipped_with_a_warning(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "big.bin"
+            source.write_bytes(b"x" * 40)
+            destination = base / "snapshot" / "big.bin"
+            report = {"warnings": [], "symlinks_not_followed": [], "bytes_captured": 0}
+            saved = backup.MAX_FILE
+            backup.MAX_FILE = 10
+            try:
+                backup.copy_selection(source, destination, "big.bin", {"exclude": []}, report)
+            finally:
+                backup.MAX_FILE = saved
+            self.assertFalse(destination.exists())
+            self.assertTrue(report["warnings"])
+            self.assertTrue(any("Omitted from configuration backup" in warning
+                                and "per-file limit" in warning
+                                for warning in report["warnings"]))
+            self.assertEqual(report["oversized_files"], [str(source)])
+
+    def test_development_capture_excludes_toolchain_directories(self):
+        self.assertTrue(any("toolchain" in pattern
+                            for pattern in backup.development_exclusions()))
+
+
+class UnreadableHomeTests(unittest.TestCase):
+    @unittest.skipIf(os.geteuid() == 0, "root can read mode-000 files")
+    def test_unreadable_file_is_recorded_and_snapshot_is_published(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            home, kit, destination = base / "home", base / "kit", base / "snapshot"
+            (home / "repo/.git").mkdir(parents=True)
+            (home / "repo/main.py").write_text("print('x')\n")
+            secret = home / "repo/INDEX.md"
+            secret.write_text("private\n")
+            secret.chmod(0)
+            config = {"coverage": "system-wide-configuration", "home_include": [],
+                      "home_reference_only": [], "system_reference_only": [],
+                      "apt_review_only": [], "exclude": []}
+            saved = backup.HOME, backup.KIT, backup.collect_inventory, backup.SYSTEM_CONFIG_ROOTS
+            backup.HOME, backup.KIT = home, kit
+            backup.collect_inventory = lambda *args, **kwargs: None
+            backup.SYSTEM_CONFIG_ROOTS = ()
+            try:
+                report = backup._original_build_snapshot(destination, config)
+            finally:
+                secret.chmod(0o600)
+                backup.HOME, backup.KIT, backup.collect_inventory, backup.SYSTEM_CONFIG_ROOTS = saved
+            self.assertFalse((destination / "home/repo/INDEX.md").exists())
+            unreadable = json.loads(
+                (destination / "inventory/unreadable-files.json").read_text())
+            self.assertEqual(unreadable["format"], "ubuntu-unreadable-files-v1")
+            self.assertEqual([entry["path"] for entry in unreadable["files"]], [str(secret)])
+            entry = unreadable["files"][0]
+            self.assertEqual(entry["uid"], os.getuid())
+            self.assertEqual(entry["gid"], os.getgid())
+            self.assertEqual(entry["mode"], 0)
+            self.assertEqual(entry["kind"], "file")
+            self.assertEqual(entry["reason"], "permission denied")
+            self.assertFalse(report["coverage_complete"])
+            self.assertEqual(report["unreadable_count"], 1)
+            manifest = json.loads((destination / "manifest.json").read_text())
+            self.assertIn("inventory/unreadable-files.json",
+                          {record["path"] for record in manifest["files"]})
+            backup.verify_tree(destination)
 
 
 class DevelopmentCaptureTests(unittest.TestCase):
@@ -500,6 +643,8 @@ class SavedDriveMountTests(unittest.TestCase):
     def test_plan_uses_label_and_never_drops_nofail(self):
         self.assertEqual(backup.default_mount_point(self.device()),
                          Path("/media") / pwd.getpwuid(os.geteuid()).pw_name / "1")
+        self.assertEqual(backup.default_mount_point(self.device(label="UBUNTU_BACKUP")),
+                         Path("/media") / pwd.getpwuid(os.geteuid()).pw_name / "ubuntu-backup")
         plan = backup.mount_plan(self.device(), self.root / "1")
         self.assertEqual(plan["mount_point"], (self.root / "1").resolve())
         self.assertIn("nofail", plan["options"])
@@ -560,6 +705,29 @@ class SavedDriveMountTests(unittest.TestCase):
             self.assertEqual(backup.mount_saved(), "mounted")
         self.assertIn(["sudo", "-n", "/usr/bin/mount", str(target)], calls)
 
+    def test_stale_fstab_falls_back_to_the_backup_label(self):
+        from unittest import mock
+        self.fstab.write_text("# Managed by ubuntu-backup v1 (backup drive boot mount)\n"
+                              "UUID=old-unattached /media/old ext4 defaults,nofail 0 2\n")
+        target = self.root / "drive"
+        target.mkdir()
+        backup.attached_drives = lambda: [self.device(
+            label="ubuntu-backup", fstype="ext4", mountpoints=[], uuid="new-uuid")]
+        states = [[], [{"directory": target, "uuid": "new-uuid", "marker": {"id": "x"}}]]
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        backup.subprocess.run = fake_run
+        with mock.patch.object(backup, "mounted_backup_drives",
+                               side_effect=lambda: states.pop(0) if states else []), \
+             mock.patch.object(backup.shutil, "which", return_value="/usr/bin/udisksctl"), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(backup.mount_saved(), "mounted")
+        self.assertIn(["udisksctl", "mount", "-b", "/dev/sda1", "--no-user-interaction"], calls)
+
     def test_quiet_mode_is_silent_for_routine_states(self):
         backup.attached_drives = lambda: []
         backup.mounted_backup_drives = lambda: []
@@ -611,6 +779,37 @@ class SavedDriveMountTests(unittest.TestCase):
         stored = json.loads((self.root / "config/settings.json").read_text())
         self.assertEqual(stored["external_backup"], {"subdirectory": ""})
 
+    def test_ext4_lost_and_found_does_not_block_adoption(self):
+        mount = self.root / "mount"
+        (mount / "lost+found").mkdir(parents=True)
+        saved = (backup.mount_info, backup.validate_external_directory, backup.on_source_filesystem)
+        backup.mount_info = lambda path: {"uuid": "a8b1104a", "fstype": "ext4"}
+        backup.validate_external_directory = lambda path: path
+        backup.on_source_filesystem = lambda path: False
+        try:
+            with redirect_stdout(io.StringIO()):
+                backup.set_external(str(mount))
+            marker = json.loads((mount / ".ubuntu-configuration-target.json").read_text())
+            self.assertEqual(marker["format"], backup.FORMAT)
+            stored = json.loads((self.root / "config/settings.json").read_text())
+            self.assertEqual(stored["external_backup"], {"subdirectory": ""})
+        finally:
+            backup.mount_info, backup.validate_external_directory, backup.on_source_filesystem = saved
+
+    def test_unrelated_nonempty_mount_is_still_refused(self):
+        mount = self.root / "mount"
+        mount.mkdir()
+        (mount / "not-a-backup").write_text("keep me\n")
+        saved = (backup.mount_info, backup.on_source_filesystem)
+        backup.mount_info = lambda path: {"uuid": "a8b1104a", "fstype": "ext4"}
+        backup.on_source_filesystem = lambda path: False
+        try:
+            with self.assertRaises(backup.ConfigError):
+                backup.set_external(str(mount))
+        finally:
+            backup.mount_info, backup.on_source_filesystem = saved
+        self.assertTrue((mount / "not-a-backup").is_file())
+
     def test_mount_drive_needs_a_terminal_for_sudo(self):
         saved = backup.sys.stdin
         backup.sys.stdin = io.StringIO("")
@@ -619,6 +818,517 @@ class SavedDriveMountTests(unittest.TestCase):
                 backup.mount_drive(self.device(), str(self.root / "1"))
         finally:
             backup.sys.stdin = saved
+
+
+class FullHomeSafetyTests(unittest.TestCase):
+    def test_home_backup_lock_rejects_a_second_capture(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.KIT
+            backup.KIT = Path(directory)
+            try:
+                with backup.home_backup_lock():
+                    with self.assertRaises(backup.ConfigError):
+                        with backup.home_backup_lock():
+                            pass
+            finally:
+                backup.KIT = saved
+
+    def test_home_identity_ignores_unrelated_hardware(self):
+        hardware = {
+            "architecture": "x86_64", "vendor": "vendor", "model": "model",
+            "complete": True,
+            "disks": [{"uuid": "usb-drive"}],
+            "network": [{"name": "eth0", "address": "00:11:22:33:44:55"}],
+            "gpus": [{"vendor": "gpu"}],
+        }
+        from unittest import mock
+        with mock.patch.object(backup, "hardware_inventory", return_value=hardware), \
+             mock.patch.object(backup, "system_disk", return_value="/dev/sda"):
+            identity = backup.home_identity()
+        self.assertEqual(set(identity["hardware"]),
+                         {"architecture", "vendor", "model", "source_disk", "complete"})
+        self.assertEqual(identity["hardware"]["source_disk"], "/dev/sda")
+        self.assertNotIn("disks", identity["hardware"])
+        self.assertNotIn("network", identity["hardware"])
+
+
+class FullHomeRunIdTests(unittest.TestCase):
+    def test_home_worker_receives_the_configuration_run_id(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.KIT
+            backup.KIT = Path(directory)
+            calls = []
+            config = {"external_backup": {"subdirectory": ""}, "home_snapshot": "off"}
+            identity = {"hardware": {"complete": True}, "mounts": [{"mount": "/home"}]}
+
+            def fake_run_logged(command, log_path):
+                calls.append(command)
+                Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(log_path).write_text("")
+
+            try:
+                with (
+                    mock.patch.object(backup, "settings", return_value=config),
+                    mock.patch.object(backup, "external_directory", return_value=Path("/tmp/drive")),
+                    mock.patch.object(backup, "home_identity", return_value=identity),
+                    mock.patch.object(backup, "run_logged", side_effect=fake_run_logged),
+                ):
+                    self.assertTrue(backup.wizard_home_backup("20261106T113637.000000Z"))
+            finally:
+                backup.KIT = saved
+            command = calls[-1]
+            self.assertIn("--run-id", command)
+            self.assertEqual(command[command.index("--run-id") + 1], "20261106T113637.000000Z")
+
+
+class LoggedWorkerTests(unittest.TestCase):
+    def test_child_output_is_logged_and_failure_is_reported(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            log_path = Path(directory) / "worker.log"
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(backup.ConfigError) as caught:
+                    backup.run_logged(
+                        ["/bin/sh", "-c", "echo child-out; echo child-err >&2; exit 7"],
+                        log_path)
+            self.assertIn("status 7", str(caught.exception))
+            text = log_path.read_text()
+            self.assertIn("child-out", text)
+            self.assertIn("child-err", text)
+            self.assertEqual(oct(log_path.stat().st_mode & 0o777), "0o600")
+
+
+class NativeCaptureFlagTests(unittest.TestCase):
+    def test_native_core_path_uses_environment_override(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            binary = Path(directory) / "ubackup-core"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o700)
+            saved = os.environ.get("UBUNTU_BACKUP_NATIVE")
+            os.environ["UBUNTU_BACKUP_NATIVE"] = str(binary)
+            try:
+                self.assertEqual(backup.native_core_path(), binary)
+            finally:
+                if saved is None:
+                    os.environ.pop("UBUNTU_BACKUP_NATIVE", None)
+                else:
+                    os.environ["UBUNTU_BACKUP_NATIVE"] = saved
+
+    def test_native_home_command_includes_ownership_and_timeline(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            binary = Path(directory) / "ubackup-core"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o700)
+            saved = os.environ.get("UBUNTU_BACKUP_NATIVE")
+            os.environ["UBUNTU_BACKUP_NATIVE"] = str(binary)
+            try:
+                command = backup.native_home_command(
+                    Path("/home"), Path("/media/backup"),
+                    "20261106T160000.000000Z", 1000, 1000,
+                    {"host": "test"}, ["ubuntu-backup/data/backups"])
+            finally:
+                if saved is None:
+                    os.environ.pop("UBUNTU_BACKUP_NATIVE", None)
+                else:
+                    os.environ["UBUNTU_BACKUP_NATIVE"] = saved
+            self.assertEqual(command[0], str(binary))
+            self.assertIn("--timeline", command)
+            self.assertEqual(command[command.index("--timeline") + 1],
+                             "/media/backup/timeline/home")
+            self.assertEqual(command[command.index("--owner-uid") + 1], "1000")
+            self.assertIn("--exclude-prefix", command)
+            self.assertEqual(command[command.index("--identity-json") + 1],
+                             '{"host":"test"}')
+
+    def test_home_worker_receives_native_capture_flag(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.KIT
+            backup.KIT = Path(directory)
+            calls = []
+            config = {"external_backup": {"subdirectory": ""}, "home_snapshot": "off"}
+            identity = {"hardware": {"complete": True}, "mounts": [{"mount": "/home"}]}
+
+            def fake_run_logged(command, log_path):
+                calls.append(command)
+                Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(log_path).write_text("")
+
+            try:
+                with (
+                    mock.patch.object(backup, "settings", return_value=config),
+                    mock.patch.object(backup, "external_directory", return_value=Path("/tmp/drive")),
+                    mock.patch.object(backup, "home_identity", return_value=identity),
+                    mock.patch.object(backup, "run_logged", side_effect=fake_run_logged),
+                    mock.patch.object(backup, "verify_path", return_value={}),
+                ):
+                    self.assertTrue(backup.wizard_home_backup(
+                        "20261106T113637.000000Z", native_capture=True))
+            finally:
+                backup.KIT = saved
+            self.assertIn("--native-capture", calls[-1])
+
+
+class PrepareDriveIntegrationTests(unittest.TestCase):
+    def test_prepare_new_drive_formats_mounts_and_selects(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            mount = root / "mnt"
+            mount.mkdir()
+            device_path = root / "fake-device"
+            device_path.touch()
+            part_path = "/dev/fake-part"
+            size = 8 * 1024 ** 3
+            disk = {
+                "path": str(device_path), "type": "disk", "removable": True,
+                "transport": "usb", "mountpoints": [], "size": size,
+                "fstype": None, "uuid": None, "label": None, "model": "test drive",
+            }
+            child = {
+                "path": part_path, "type": "part", "removable": True,
+                "transport": "usb", "mountpoints": ["/media/test"], "size": size,
+                "fstype": "ext4", "uuid": "old", "label": None, "model": "test drive",
+            }
+            initial = [disk, child]
+            initial_unmounted = [disk, dict(child, mountpoints=[])]
+            formatted = [dict(disk, fstype="ext4", uuid="a8b1104a")]
+            phrase = f"FORMAT {device_path} {size}"
+            config = {"keep_snapshots": 30, "keep_local_backups": False,
+                      "external_backup": None, "home_snapshot": "off",
+                      "coverage": "system-wide-configuration", "development_include": [],
+                      "home_include": [], "home_reference_only": [],
+                      "system_reference_only": [], "exclude": [], "apt_review_only": [],
+                      "exclude_cpus": []}
+            saved = backup.KIT
+            backup.KIT = root
+            calls = []
+            mount_drive = mock.Mock(return_value=str(mount))
+
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            try:
+                def parent(value):
+                    return str(device_path) if value == part_path else "/dev/sda"
+
+                with mock.patch.object(backup, "attached_drives",
+                                       side_effect=[initial, initial, initial_unmounted, formatted]), \
+                     mock.patch.object(backup, "system_disk", return_value="/dev/nvme0n1"), \
+                     mock.patch.object(backup, "parent_disk", side_effect=parent), \
+                     mock.patch.object(backup, "mount_drive", mount_drive), \
+                     mock.patch.object(backup, "mount_info",
+                                       return_value={"uuid": "a8b1104a", "fstype": "ext4"}), \
+                     mock.patch.object(backup, "validate_external_directory",
+                                       side_effect=lambda path: path), \
+                     mock.patch.object(backup, "on_source_filesystem", return_value=False), \
+                     mock.patch.object(backup, "settings", return_value=dict(config)), \
+                     mock.patch.object(backup.shutil, "which",
+                                       side_effect=lambda name: "/usr/bin/" + name), \
+                     mock.patch.object(backup.stat, "S_ISBLK", return_value=True), \
+                     mock.patch.object(backup.sys.stdin, "isatty", return_value=True), \
+                     mock.patch.object(backup, "ask", side_effect=["1", phrase]), \
+                     mock.patch.object(backup, "confirm", return_value=True), \
+                     mock.patch.object(backup.subprocess, "run", side_effect=fake_run), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    result = backup.wizard_prepare_drive()
+            finally:
+                backup.KIT = saved
+
+            self.assertEqual(result, str(mount))
+            self.assertEqual(calls[0], ["sudo", "umount", "/media/test"])
+            self.assertEqual(calls[1], ["sudo", "wipefs", "-a", str(device_path)])
+            self.assertEqual(calls[2], ["sudo", "mkfs.ext4", "-F", "-L", "ubuntu-backup",
+                                        str(device_path)])
+            self.assertEqual(mount_drive.call_count, 1)
+            self.assertIsInstance(mount_drive.call_args.args[1], str)
+            marker = json.loads((mount / ".ubuntu-configuration-target.json").read_text())
+            self.assertEqual(marker["format"], backup.FORMAT)
+            stored = json.loads((root / "config/settings.json").read_text())
+            self.assertEqual(stored["external_backup"], {"subdirectory": ""})
+
+
+class DriveFormatTests(unittest.TestCase):
+    def test_format_refuses_unsafe_devices(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            path = Path(directory) / "fake-device"
+            path.touch()
+            base = {"path": str(path), "type": "disk", "removable": True,
+                    "transport": "usb", "mountpoints": [], "size": 8 * 1024 ** 3,
+                    "fstype": None, "uuid": None, "label": None}
+            cases = [
+                ("system", [dict(base)], "/dev/sda", "/dev/sda"),
+                ("non-usb", [dict(base, removable=False, transport="sata")], "/dev/sdb", "/dev/nvme0n1"),
+                ("unsupported-type", [dict(base, type="crypt")], "/dev/sdb", "/dev/nvme0n1"),
+                ("partition", [dict(base, type="part")], "/dev/sdb", "/dev/nvme0n1"),
+            ]
+            for name, devices, parent, system in cases:
+                with self.subTest(name=name), \
+                     mock.patch.object(backup, "attached_drives", return_value=devices), \
+                     mock.patch.object(backup, "system_disk", return_value=system), \
+                     mock.patch.object(backup, "parent_disk",
+                                       side_effect=lambda item: parent), \
+                     mock.patch.object(backup.stat, "S_ISBLK", return_value=True), \
+                     mock.patch.object(backup.sys.stdin, "isatty", return_value=True), \
+                     mock.patch.object(backup.subprocess, "run") as run:
+                    with self.assertRaises(backup.ConfigError):
+                        backup.format_drive(str(path))
+                    run.assert_not_called()
+
+    def test_candidates_skip_system_partitioned_and_non_usb_disks(self):
+        from unittest import mock
+        gib = 1024 ** 3
+        devices = [
+            {"path": "/dev/sda", "type": "disk", "removable": True, "transport": "usb",
+             "mountpoints": [], "size": 8 * gib},
+            {"path": "/dev/sda1", "type": "part", "removable": True, "transport": "usb",
+             "mountpoints": [], "size": 8 * gib},
+            {"path": "/dev/sdb", "type": "disk", "removable": True, "transport": "usb",
+             "mountpoints": [], "size": 8 * gib},
+            {"path": "/dev/sdc", "type": "disk", "removable": False, "transport": "sata",
+             "mountpoints": [], "size": 8 * gib},
+            {"path": "/dev/sdd", "type": "disk", "removable": True, "transport": "usb",
+             "mountpoints": ["/media/x"], "size": 8 * gib},
+            {"path": "/dev/sde", "type": "disk", "removable": True, "transport": "usb",
+             "mountpoints": [], "size": 1 * gib},
+            {"path": "/dev/nvme0n1p1", "type": "part", "removable": False, "transport": None,
+             "mountpoints": [], "size": 8 * gib},
+        ]
+
+        def parent(path):
+            if path.startswith("/dev/sda"):
+                return "/dev/sda"
+            if path == "/dev/nvme0n1p1":
+                return "/dev/nvme0n1"
+            return path
+
+        with mock.patch.object(backup, "attached_drives", return_value=devices), \
+             mock.patch.object(backup, "system_disk", return_value="/dev/nvme0n1"), \
+             mock.patch.object(backup, "parent_disk", side_effect=parent):
+            candidates = backup._format_candidates()
+        self.assertEqual([item["path"] for item in candidates],
+                         ["/dev/sda", "/dev/sdb", "/dev/sdd"])
+
+
+class SnapshotCapabilityTests(unittest.TestCase):
+    def test_auto_falls_back_and_required_refuses(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            with mock.patch.object(backup, "_snapshot_btrfs_info", return_value=None), \
+                 mock.patch.object(backup, "_snapshot_zfs_info", return_value=None), \
+                 mock.patch.object(backup, "_snapshot_lvm_info", return_value=None):
+                self.assertIsNone(backup.create_home_snapshot({"home_snapshot": "off"}, kit))
+                with redirect_stderr(io.StringIO()):
+                    self.assertIsNone(backup.create_home_snapshot({"home_snapshot": "auto"}, kit))
+                with self.assertRaises(backup.ConfigError):
+                    backup.create_home_snapshot({"home_snapshot": "required"}, kit)
+
+
+class HomeTimelineVerificationTests(unittest.TestCase):
+    def test_same_size_object_corruption_is_detected(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            data = b"hello"
+            sha256 = hashlib.sha256(data).hexdigest()
+            timeline = base / "timeline/home/home-full-20260101T000000.000000Z"
+            tree = timeline / "tree"
+            tree.mkdir(parents=True)
+            objects = base / "baseline/home/objects"
+            stored = backup.object_path(objects, sha256)
+            stored.parent.mkdir(parents=True)
+            stored.write_bytes(data)
+            (tree / "file").symlink_to(os.path.relpath(stored, tree))
+            entries = timeline / "entries.ndjson"
+            entries.write_text(json.dumps({
+                "path": "file", "type": "file", "size": len(data), "sha256": sha256,
+            }) + "\n")
+            (timeline / "manifest.json").write_text(json.dumps({
+                "format": backup.FORMAT, "kind": "full-home-linked",
+                "storage": backup.LINKED_STORAGE, "entry_count": 1,
+                "logical_bytes": len(data), "entries_sha256": backup.digest(entries),
+            }))
+            backup.verify_home_timeline(timeline)
+            stored.write_bytes(b"HELLO")  # same size, different bytes
+            with self.assertRaises(backup.ConfigError):
+                backup.verify_home_timeline(timeline)
+
+
+class RunIdentityTests(unittest.TestCase):
+    def test_timeline_and_history_share_the_same_run_id(self):
+        run_id = "20261106T113637.000000Z"
+        self.assertEqual(backup.dated_config_name(run_id), "ubuntu-config-" + run_id)
+        self.assertEqual(backup.history_timestamp(run_id), "2026-11-06 11:36:37Z")
+        with self.assertRaises(backup.ConfigError):
+            backup.dated_config_name("../escape")
+
+
+class BackupWarningTests(unittest.TestCase):
+    def test_warning_run_reports_omissions_and_sets_exit_code(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = (backup.KIT, backup._STATUS_RUN, backup._EXIT_CODE,
+                     backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS)
+            backup.KIT, backup._STATUS_RUN, backup._EXIT_CODE = Path(directory), False, 0
+            run_id = "20261106T113637.000000Z"
+            calls = []
+
+            def fake_impl(skip_external=False):
+                backup._LAST_BACKUP_RUN_ID = run_id
+                backup._LAST_BACKUP_WARNINGS = 2
+                return "/tmp/backup"
+
+            try:
+                with (
+                    mock.patch.object(backup, "_backup_impl", side_effect=fake_impl),
+                    mock.patch.object(backup, "_diagnose_previous_status"),
+                    mock.patch.object(backup, "_write_status",
+                                      side_effect=lambda *args, **kwargs: calls.append(("status", args, kwargs))),
+                    mock.patch.object(backup, "_status_history",
+                                      side_effect=lambda *args, **kwargs: calls.append(("history", args, kwargs))),
+                ):
+                    self.assertEqual(backup.backup(), "/tmp/backup")
+                self.assertEqual(backup._EXIT_CODE, 3)
+            finally:
+                (backup.KIT, backup._STATUS_RUN, backup._EXIT_CODE,
+                 backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS) = saved
+            status = next(item for item in calls
+                          if item[0] == "status" and item[1][0] == "complete")
+            self.assertEqual(status[1][:2], ("complete", "complete"))
+            self.assertIn("(warnings): 2 unreadable file(s)", status[1][2])
+            self.assertTrue(status[2]["warnings"])
+            self.assertEqual(status[2]["omissions"], 2)
+            history = next(item for item in calls
+                           if item[0] == "history" and item[1][0] == "complete")
+            self.assertEqual(history[2]["at"], run_id)
+
+
+class AtomicFailureTests(unittest.TestCase):
+    def test_failed_capture_publishes_no_snapshot_or_timeline(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            (kit / "config").mkdir()
+            (kit / "config/settings.json").write_text(json.dumps({
+                "home_snapshot": "off", "keep_snapshots": 3, "keep_local_backups": True,
+                "coverage": "system-wide-configuration", "backup_calendar": "daily",
+                "development_include": [], "home_include": [], "home_reference_only": [],
+                "system_reference_only": [], "exclude": [], "apt_review_only": [],
+                "exclude_cpus": [], "external_backup": None,
+            }))
+            saved = backup.KIT, backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS
+            backup.KIT = kit
+            try:
+                with mock.patch.object(backup, "build_snapshot",
+                                       side_effect=backup.ConfigError("capture failed")):
+                    with self.assertRaises(backup.ConfigError):
+                        backup._backup_impl()
+            finally:
+                backup.KIT, backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS = saved
+            self.assertFalse((kit / "snapshot").exists())
+            self.assertEqual(list((kit / "backups").iterdir()), [])
+            self.assertEqual([path.name for path in kit.iterdir()
+                              if path.name.startswith(".snapshot-")], [])
+
+
+class SystemdWarningTests(unittest.TestCase):
+    def test_user_service_accepts_warning_exit_code(self):
+        from unittest import mock
+        with mock.patch.object(backup, "settings", return_value={"backup_calendar": "daily"}):
+            service, timer = backup.systemd_units()
+        self.assertIn("SuccessExitStatus=3", service)
+        self.assertNotIn("SuccessExitStatus", timer)
+
+
+class BackupStatusTests(unittest.TestCase):
+    def test_cli_backup_publishes_complete_status(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = (backup.KIT, backup._STATUS_RUN, backup._EXIT_CODE,
+                     backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS)
+            backup.KIT, backup._STATUS_RUN = Path(directory), False
+            backup._EXIT_CODE, backup._LAST_BACKUP_WARNINGS = 0, 0
+            calls = []
+            try:
+                with (
+                    mock.patch.object(backup, "_backup_impl", return_value="/tmp/backup"),
+                    mock.patch.object(backup, "_diagnose_previous_status"),
+                    mock.patch.object(backup, "_write_status",
+                                      side_effect=lambda *args, **kwargs: calls.append(("status", args))),
+                    mock.patch.object(backup, "_status_history",
+                                      side_effect=lambda *args, **kwargs: calls.append(("history", args))),
+                ):
+                    self.assertEqual(backup.backup(), "/tmp/backup")
+            finally:
+                (backup.KIT, backup._STATUS_RUN, backup._EXIT_CODE,
+                 backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS) = saved
+            self.assertIn(("status", ("complete", "complete", "Configuration backup complete")),
+                          calls)
+            self.assertTrue(any(call[0] == "history" for call in calls))
+
+    def test_failed_backup_links_the_diagnostic_log(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = (backup.KIT, backup._STATUS_RUN, backup._EXIT_CODE,
+                     backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS)
+            backup.KIT, backup._STATUS_RUN = Path(directory), False
+            backup._EXIT_CODE, backup._LAST_BACKUP_WARNINGS = 0, 0
+            calls = []
+            try:
+                with (
+                    mock.patch.object(backup, "_backup_impl",
+                                      side_effect=backup.ConfigError("capture failed")),
+                    mock.patch.object(backup, "_diagnose_previous_status"),
+                    mock.patch.object(backup, "_write_status",
+                                      side_effect=lambda *args, **kwargs: calls.append(("status", args))),
+                    mock.patch.object(backup, "_status_history",
+                                      side_effect=lambda *args, **kwargs: calls.append(("history", args))),
+                ):
+                    with self.assertRaises(backup.ConfigError):
+                        backup.backup()
+                self.assertEqual(backup._EXIT_CODE, 0)
+            finally:
+                (backup.KIT, backup._STATUS_RUN, backup._EXIT_CODE,
+                 backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS) = saved
+            history = next(item for item in calls
+                           if item[0] == "history" and item[1][0] == "failed")
+            self.assertTrue(str(history[1][2]).endswith("logs/ubuntu-backup.log"))
+
+
+class DeployCompatibilityTests(unittest.TestCase):
+    def test_dry_run_does_not_require_source_system_inventory(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            home, kit, snapshot = base / "home", base / "kit", base / "snapshot"
+            home.mkdir()
+            (snapshot / "home").mkdir(parents=True)
+            content = b"# bashrc\n"
+            (snapshot / "home/.bashrc").write_bytes(content)
+            manifest = {
+                "format": backup.FORMAT,
+                "created_at": "2026-01-01T00:00:00Z",
+                "files": [{
+                    "path": "home/.bashrc", "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "executable": False,
+                }],
+            }
+            (snapshot / "manifest.json").write_text(json.dumps(manifest))
+            args = argparse.Namespace(
+                snapshot=str(snapshot), apply=False, overwrite=False, packages=False,
+                snaps=False, flatpaks=False, desktop_settings=False, build=False,
+            )
+            saved = backup.HOME, backup.KIT
+            backup.HOME, backup.KIT = home, kit
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backup.deploy(args)
+            finally:
+                backup.HOME, backup.KIT = saved
+            self.assertFalse((home / ".bashrc").exists())
+            self.assertTrue((kit / "plans/last-deploy.json").is_file())
 
 
 if __name__ == "__main__":

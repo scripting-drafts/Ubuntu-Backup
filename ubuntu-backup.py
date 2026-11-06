@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 
 
@@ -92,16 +93,40 @@ def write_json(path, value):
 
 def settings():
     value = json.loads((KIT / "config/settings.json").read_text())
-    if not isinstance(value["keep_snapshots"], int) or value["keep_snapshots"] < 1:
+    if not isinstance(value, dict):
+        raise ConfigError("settings.json must contain an object.")
+    defaults = globals().get("EMBEDDED_DEFAULT_SETTINGS")
+    if isinstance(defaults, dict):
+        value = {**defaults, **value}
+    value.setdefault("home_snapshot", "off")
+    if value["home_snapshot"] not in ("off", "auto", "required"):
+        raise ConfigError("home_snapshot must be off, auto, or required.")
+    if type(value.get("keep_snapshots")) is not int or value["keep_snapshots"] < 1:
         raise ConfigError("keep_snapshots must be a positive integer.")
     if not isinstance(value.get("keep_local_backups", False), bool):
         raise ConfigError("keep_local_backups must be true or false.")
-    development = value.get("development_include", [])
-    if not isinstance(development, list) or not all(isinstance(item, str) for item in development):
-        raise ConfigError("development_include must be a list of home-relative paths.")
+    if not isinstance(value.get("coverage"), str):
+        raise ConfigError("coverage must be a string.")
+    if value.get("backup_calendar", "daily") not in ("daily", "weekly"):
+        raise ConfigError("backup_calendar must be daily or weekly.")
+    for key in ("development_include", "home_include", "home_reference_only",
+                "system_reference_only", "exclude", "apt_review_only"):
+        items = value.get(key, [])
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            raise ConfigError(key + " must be a list of strings.")
     excluded = value.get("exclude_cpus", [])
     if not isinstance(excluded, list) or not all(type(cpu) is int and cpu >= 0 for cpu in excluded):
         raise ConfigError("exclude_cpus must be a list of CPU numbers.")
+    external = value.get("external_backup")
+    if external is not None:
+        if not isinstance(external, dict):
+            raise ConfigError("external_backup must be an object or null.")
+        subdirectory = external.get("subdirectory", "")
+        if not isinstance(subdirectory, str):
+            raise ConfigError("external_backup.subdirectory must be a string.")
+        relative = PurePosixPath(subdirectory)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ConfigError("external_backup.subdirectory must stay below the drive root.")
     return value
 
 
@@ -360,6 +385,7 @@ def copy_selection(source, destination, relative, config, report, system=False, 
     if config.get("coverage") == "system-wide-configuration" and any(part.lower() in CONFIG_DATA_DIRS for part in PurePosixPath(relative).parts):
         report.setdefault("excluded_cache_data", []).append(str(source))
         return
+    info = None
     try:
         info = source.lstat()
         if stat.S_ISLNK(info.st_mode):
@@ -378,24 +404,42 @@ def copy_selection(source, destination, relative, config, report, system=False, 
             report["warnings"].append(f"Skipped special file: {source}")
             return
         if info.st_size > MAX_FILE:
-            raise ConfigError(f"Configuration exceeds the 64 MiB per-file safety limit: {source}; no partial snapshot accepted.")
+            report["warnings"].append(
+                "Omitted from configuration backup because it exceeds the "
+                f"{MAX_FILE // (1024 * 1024)} MiB per-file limit: {source}")
+            report.setdefault("oversized_files", []).append(str(source))
+            return
         fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise ConfigError(f"Source changed type: {source}")
             data = stream.read(MAX_FILE + 1)
         if len(data) > MAX_FILE:
-            raise ConfigError(f"Source grew beyond safety limit: {source}")
+            report["warnings"].append(
+                "Omitted from configuration backup because it grew past the "
+                f"{MAX_FILE // (1024 * 1024)} MiB per-file limit: {source}")
+            report.setdefault("oversized_files", []).append(str(source))
+            return
         report["bytes_captured"] += len(data)
         if report["bytes_captured"] > MAX_TOTAL:
             raise ConfigError("Selected configurations exceed the 1 GiB safety limit; review the cache/data exclusions.")
         write(destination, data, executable=bool(info.st_mode & 0o111))
     except FileNotFoundError:
         return
-    except PermissionError:
-        if not system:
-            raise ConfigError(f"Cannot read selected home configuration: {source}") from None
-        report["warnings"].append(f"Root-only system reference not captured: {source}")
+    except PermissionError as exc:
+        if exc.filename is not None and Path(exc.filename) != source:
+            raise
+        if system:
+            report["warnings"].append(f"Root-only system reference not captured: {source}")
+            return
+        entry = {"path": str(source), "reason": "permission denied"}
+        if info is not None:
+            entry.update({"kind": "directory" if stat.S_ISDIR(info.st_mode) else "file",
+                          "mode": stat.S_IMODE(info.st_mode),
+                          "uid": info.st_uid, "gid": info.st_gid})
+        else:
+            entry["kind"] = "unknown"
+        report.setdefault("unreadable_files", []).append(entry)
 
 
 CODE_SUFFIXES = {".sh": "shell", ".bash": "shell", ".zsh": "shell", ".dash": "shell",
@@ -412,7 +456,7 @@ DEVELOPMENT_MARKERS = (".git", "Makefile", "makefile", "CMakeLists.txt", "pyproj
                        "pom.xml", "build.gradle", "build.gradle.kts")
 DEVELOPMENT_SKIP_DIRS = ("node_modules", ".venv", "venv", "env", "target", "build", "dist", "out",
                          ".tox", ".mypy_cache", ".pytest_cache", ".next", ".nuxt", "coverage",
-                         ".nyc_output", ".gradle")
+                         ".nyc_output", ".gradle", "toolchain")
 HEADER_LIBRARIES = {"X11/": ["-lX11"], "Xrandr": ["-lXrandr"], "Xinerama": ["-lXinerama"],
                     "Xext": ["-lXext"], "Xfixes": ["-lXfixes"], "GL/": ["-lGL"],
                     "pthread.h": ["-lpthread"], "math.h": ["-lm"], "dlfcn.h": ["-ldl"],
@@ -1084,7 +1128,8 @@ def build_snapshot(destination, config):
         config["home_include"] = [name for name in config["home_include"] if not any(
             name.startswith(parent + "/") for parent in config["home_include"] if parent != name and "*" not in parent)]
         config["system_reference_only"] = list(SYSTEM_CONFIG_ROOTS)
-    report = {"warnings": [], "unavailable_commands": [], "symlinks_not_followed": [], "bytes_captured": 0}
+    report = {"warnings": [], "unavailable_commands": [], "symlinks_not_followed": [],
+              "unreadable_files": [], "bytes_captured": 0}
     collect_inventory(destination / "inventory", config, report)
     for section, folder in (("home_include", "home"), ("home_reference_only", "reference-home")):
         for pattern in config[section]:
@@ -1174,6 +1219,18 @@ def build_snapshot(destination, config):
                                   "previous_capture_at": developments.get("previous_capture_at"),
                                   "packages": developments.get("references", {}).get("packages", []),
                                   "libraries": developments.get("references", {}).get("libraries", [])}
+    unreadable = sorted(report.get("unreadable_files", []), key=lambda entry: entry["path"])
+    report["unreadable_files"] = unreadable
+    report["unreadable_count"] = len(unreadable)
+    report["coverage_complete"] = not unreadable
+    if unreadable:
+        report["warnings"].append(
+            f"{len(unreadable)} unreadable path(s) recorded in inventory/unreadable-files.json")
+    write_json(destination / "inventory/unreadable-files.json", {
+        "format": "ubuntu-unreadable-files-v1",
+        "captured_at": timestamp(),
+        "files": unreadable,
+    })
     write_json(destination / "inventory/capture-report.json", report)
     records = []
     for path in regular_files(destination):
@@ -1256,6 +1313,18 @@ def prune(directory, keep):
 
 
 DATED_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\Z")
+RUN_ID_RE = re.compile(r"\d{8}T\d{6}\.\d{6}Z\Z")
+
+
+def run_id_value(value=None):
+    value = value or timestamp()
+    if not RUN_ID_RE.fullmatch(value):
+        raise ConfigError("Backup run identifiers must be UTC timestamps.")
+    return value
+
+
+def dated_config_name(run_id=None):
+    return "ubuntu-config-" + run_id_value(run_id)
 
 
 def dated_snapshots(directory):
@@ -1619,7 +1688,7 @@ def mount_info(path):
 def attached_drives():
     """Discover attached block filesystems without mounting or modifying them."""
     result = subprocess.run(["lsblk", "--json", "--bytes", "--output",
-                             "PATH,TYPE,TRAN,RM,SIZE,FSTYPE,UUID,LABEL,MOUNTPOINTS"],
+                             "PATH,TYPE,TRAN,RM,SIZE,FSTYPE,UUID,LABEL,MODEL,MOUNTPOINTS"],
                             capture_output=True, text=True, timeout=15, check=True)
     devices = []
     def visit(nodes, transport=None, removable=False):
@@ -1633,7 +1702,7 @@ def attached_drives():
                 devices.append({"path": node.get("path"), "type": kind, "transport": node_transport,
                                 "removable": node_removable, "size": node.get("size"),
                                 "fstype": node.get("fstype"), "uuid": node.get("uuid"),
-                                "label": node.get("label"),
+                                "label": node.get("label"), "model": node.get("model"),
                                 "mountpoints": [p for p in (node.get("mountpoints") or []) if p and not p.startswith("[")]})
             visit(node.get("children") or [], node_transport, node_removable)
     # Preserve lsblk discovery order. It does not provide connection timestamps.
@@ -1668,15 +1737,45 @@ if not uuid_value.replace("-", "").isalnum() or not mount_point.is_absolute():
 original = FSTAB.read_bytes()
 entry = f"UUID={uuid_value} {mount_point} {fstype} {options} 0 2\\n"
 lines = original.decode().splitlines(keepends=True)
-if not any(line.split("#", 1)[0].split()[:1] == [f"UUID={uuid_value}"] for line in lines):
-    if lines and not lines[-1].endswith("\\n"):
-        lines[-1] += "\\n"
-    lines += ["\\n", COMMENT + " (backup drive boot mount)\\n", entry]
+kept = []
+pending_comment = None
+current_seen = False
+changed = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        pending_comment = line
+        kept.append(line)
+        continue
+    if not stripped:
+        pending_comment = None
+        kept.append(line)
+        continue
+    fields = stripped.split("#", 1)[0].split()
+    managed = pending_comment is not None and COMMENT in pending_comment
+    pending_comment = None
+    if len(fields) >= 4 and fields[1] == str(mount_point) and fields[0].startswith("UUID="):
+        if fields[0] == f"UUID={uuid_value}" and not current_seen:
+            current_seen = True
+            kept.append(line)
+            continue
+        if managed:
+            if kept and kept[-1].strip().startswith("#") and COMMENT in kept[-1]:
+                kept.pop()
+            changed = True
+            continue
+    kept.append(line)
+if not current_seen:
+    if kept and not kept[-1].endswith("\\n"):
+        kept[-1] += "\\n"
+    kept += ["\\n", COMMENT + " (backup drive boot mount)\\n", entry]
+    changed = True
+if changed:
     temporary = FSTAB.with_name(".fstab.ubuntu-backup-" + str(os.getpid()))
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(descriptor, "w") as output:
-            output.write("".join(lines))
+            output.write("".join(kept))
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, FSTAB)
@@ -1749,8 +1848,9 @@ def parent_disk(path):
 
 
 def default_mount_point(device):
-    label = re.sub(r"[^A-Za-z0-9._-]+", "-", str(device.get("label") or "")).strip(".-")
-    name = label or (device.get("uuid") or "")[:8] or "drive"
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", str(device.get("label") or "")).strip(".-").lower()
+    label = label.replace("_", "-")
+    name = label or (device.get("uuid") or "")[:8].lower() or "drive"
     return Path("/media") / pwd.getpwuid(os.geteuid()).pw_name / name
 
 
@@ -1788,7 +1888,7 @@ def mount_plan(device, mount_point=None):
             "options": MOUNT_OPTIONS, "existing": existing is not None}
 
 
-def mount_drive(device, mount_point=None, recursive=False):
+def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
     """Mount a prepared Linux filesystem at boot and give it to the current user."""
     plan = mount_plan(device, mount_point)
     if not sys.stdin.isatty():
@@ -1797,7 +1897,7 @@ def mount_drive(device, mount_point=None, recursive=False):
     print(f"Filesystem:  {plan['fstype']} (UUID {plan['uuid']})")
     print("fstab:       " + ("already configured; mounting now" if plan["existing"]
                              else "add a nofail boot entry owned by you"))
-    if not confirm("Mount this filesystem and make it writable by this account?"):
+    if not assume_yes and not confirm("Mount this filesystem and make it writable by this account?"):
         raise ConfigError("Mount cancelled; nothing was changed.")
     with tempfile.NamedTemporaryFile("w", dir=KIT, prefix=".mount-drive-", suffix=".py", delete=False) as helper:
         helper.write(MOUNT_HELPER)
@@ -1816,7 +1916,15 @@ def mount_drive(device, mount_point=None, recursive=False):
             print(line)
     if result.returncode:
         raise ConfigError("Mount failed; /etc/fstab was left unchanged.")
-    information = mount_info(plan["mount_point"])
+    information = None
+    for attempt in range(10):
+        try:
+            information = mount_info(plan["mount_point"])
+            break
+        except ConfigError:
+            if attempt == 9:
+                raise
+            time.sleep(0.2)
     if information["uuid"] != plan["uuid"]:
         raise ConfigError("Mounted filesystem does not match the selected UUID.")
     if plan["mount_point"].stat().st_uid != os.geteuid():
@@ -1839,14 +1947,48 @@ def mount_saved(check=False, quiet=False):
         if not quiet:
             print("Mounted: " + str(mounted[0]["directory"]))
         return "mounted"
+    def mount_by_label():
+        devices = attached_drives()
+        candidates = [
+            device for device in devices
+            if (device.get("label") or "").lower() == "ubuntu-backup"
+            and device.get("fstype") == "ext4"
+            and not device.get("mountpoints")
+        ]
+        if not candidates:
+            return None
+        if check:
+            print("Backup-labelled filesystem is attached but not mounted: "
+                  + ", ".join(device["path"] for device in candidates))
+            return "present"
+        if not shutil.which("udisksctl"):
+            return "failed"
+        for device in candidates:
+            subprocess.run(["udisksctl", "mount", "-b", device["path"], "--no-user-interaction"],
+                           capture_output=True, text=True, check=False)
+            for _attempt in range(6):
+                mounted = mounted_backup_drives()
+                if mounted:
+                    if not quiet:
+                        print("Mounted: " + str(mounted[0]["directory"]))
+                    return "mounted"
+                time.sleep(0.25)
+        return "failed"
+
     entries = [entry for entry in fstab_entries() if entry["managed"]]
     if not entries:
+        fallback = mount_by_label()
+        if fallback is not None:
+            return fallback
         if check or not quiet:
             print("No mounted backup marker and no managed boot entry; select the drive from menu 4 to add one.")
         return "absent"
     attached = {device.get("uuid") for device in attached_drives() if device.get("uuid")}
     present = [entry for entry in entries if entry["uuid"] in attached]
     if not present:
+        fallback = mount_by_label()
+        if fallback is not None:
+            return fallback
         if check or not quiet:
             print("The filesystem declared in /etc/fstab is not attached. "
                   "If the drive was replaced or reformatted, select it again from menu 4; nothing was changed.")
@@ -2012,10 +2154,10 @@ def validate_external_directory(directory):
     return directory
 
 
-def copy_external_snapshot(snapshot, config):
+def copy_external_snapshot(snapshot, config, run_id=None):
     """Publish a dated external configuration timeline with one shared baseline."""
     with pinned_external(config) as (root, directory):
-        name = snapshot.name if DATED_RE.fullmatch(snapshot.name) else "ubuntu-config-" + timestamp()
+        name = snapshot.name if DATED_RE.fullmatch(snapshot.name) else dated_config_name(run_id)
         result, created, shared = create_linked_config_snapshot(snapshot, root, name)
         prune_linked_config(root, config["keep_snapshots"])
         display = directory / result.relative_to(root)
@@ -2059,6 +2201,21 @@ def copy_external(path, config, filename=None):
     print(f"External copy verified: {directory / output_name}")
 
 
+def _claim_directory(directory):
+    """Offer one sudo ownership fix for a mounted but otherwise valid drive root."""
+    if os.access(directory, os.W_OK):
+        return
+    command = f"sudo chown {os.geteuid()}:{os.getegid()} {directory}"
+    if not sys.stdin.isatty():
+        raise ConfigError("Backup drive is not writable by this account. " + command)
+    if not confirm(f"Take ownership of {directory} with sudo?", True):
+        raise ConfigError("Backup drive remains read-only; no backup was configured.")
+    result = subprocess.run(["sudo", "chown", f"{os.geteuid()}:{os.getegid()}", str(directory)],
+                            check=False)
+    if result.returncode or not os.access(directory, os.W_OK):
+        raise ConfigError("Could not take ownership of the backup drive; nothing was changed.")
+
+
 def set_external(mount_point, disable=False):
     config = settings()
     if disable:
@@ -2074,9 +2231,27 @@ def set_external(mount_point, disable=False):
             raise ConfigError("Backup drive must be on a different filesystem from home and the OS.")
         directory = mount
         marker = directory / ".ubuntu-configuration-target.json"
-        if directory.exists() and any(directory.iterdir()) and not marker.is_file():
-            raise ConfigError("Refusing to adopt a nonempty directory without a backup marker.")
+        if directory.exists():
+            try:
+                entries = list(directory.iterdir())
+            except OSError:
+                _claim_directory(directory)
+                try:
+                    entries = list(directory.iterdir())
+                except OSError as exc:
+                    raise ConfigError(
+                        "Cannot inspect the mounted backup directory. "
+                        f"Take ownership first: sudo chown {os.geteuid()}:{os.getegid()} {directory} "
+                        f"({exc})") from None
+            # A freshly formatted ext4 root normally contains only lost+found.
+            adoptable = all(entry.name == "lost+found" and entry.is_dir() and not entry.is_symlink()
+                            for entry in entries)
+            if entries and not marker.is_file() and not adoptable:
+                raise ConfigError("Refusing to adopt a nonempty directory without a backup marker. "
+                                  "Choose an empty drive or a dedicated empty subdirectory.")
+            _claim_directory(directory)
         mkdir(directory)
+        _claim_directory(directory)
         if marker.is_symlink():
             raise ConfigError("Drive marker must not be a symlink.")
         marker_existed = marker.exists()
@@ -2085,7 +2260,12 @@ def set_external(mount_point, disable=False):
             if existing.get("format") != FORMAT or not isinstance(existing.get("id"), str):
                 raise ConfigError("Refusing an unrecognized backup drive marker.")
         else:
-            write_json(marker, {"format": FORMAT, "id": str(uuid.uuid4())})
+            try:
+                write_json(marker, {"format": FORMAT, "id": str(uuid.uuid4())})
+            except OSError as exc:
+                raise ConfigError(
+                    "Cannot write the backup marker on this drive; no backup was configured. "
+                    f"Check ownership/permissions: {exc}") from None
         # Only the relative subdirectory is persisted: the UUID lives in the filesystem
         # superblock, the identity in the marker, and the mount path in /etc/fstab.
         external = {"subdirectory": ""}
@@ -2111,7 +2291,54 @@ def set_external(mount_point, disable=False):
 
 
 def backup(skip_external=False):
+    """Run one configuration backup, publishing status for timer/CLI runs."""
+    global _STATUS_RUN, _EXIT_CODE
+    manage_status = not _STATUS_RUN
+    if manage_status:
+        _STATUS_RUN = True
+        _EXIT_CODE = 0
+        _diagnose_previous_status()
+        _status_history("started", "Configuration backup started")
+        _write_status("running", "configuration", "Capturing configuration")
+    try:
+        result = _backup_impl(skip_external)
+    except KeyboardInterrupt:
+        if manage_status:
+            message = "Configuration backup cancelled"
+            _write_status("cancelled", "cancelled", message)
+            _status_history("cancelled", message, at=_LAST_BACKUP_RUN_ID)
+        raise
+    except Exception as exc:
+        if manage_status:
+            message = f"Configuration backup failed: {type(exc).__name__}: {exc}"
+            _write_status("failed", "failed", message)
+            _status_history("failed", message, KIT / "logs/ubuntu-backup.log",
+                            at=_LAST_BACKUP_RUN_ID)
+        raise
+    else:
+        if manage_status:
+            warnings = _LAST_BACKUP_WARNINGS
+            message = "Configuration backup complete"
+            if warnings:
+                message += f" (warnings): {warnings} unreadable file(s)"
+                _EXIT_CODE = 3
+            _write_status("complete", "complete", message,
+                          result=str(result) if result else None,
+                          warnings=bool(warnings), omissions=warnings)
+            _status_history("complete", message, result, at=_LAST_BACKUP_RUN_ID)
+        return result
+    finally:
+        if manage_status:
+            _STATUS_RUN = False
+
+
+def _backup_impl(skip_external=False):
+    global _LAST_BACKUP_RUN_ID, _LAST_BACKUP_WARNINGS
+    _LAST_BACKUP_RUN_ID = None
+    _LAST_BACKUP_WARNINGS = 0
     config = settings()
+    run_id = run_id_value()
+    _LAST_BACKUP_RUN_ID = run_id
     mkdir(KIT / "backups")
     lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "a") as lock:
@@ -2132,6 +2359,7 @@ def backup(skip_external=False):
         external_path = None
         try:
             report = build_snapshot(stage, config)
+            _LAST_BACKUP_WARNINGS = len(report.get("unreadable_files", []))
             verify_tree(stage)
             keep_local = bool(config.get("keep_local_backups", False))
             external_enabled = not skip_external and config["external_backup"] is not None
@@ -2158,13 +2386,16 @@ def backup(skip_external=False):
                       f"{development.get('previous_capture_at') or 'first capture'}: {summary}.")
             if report["warnings"]:
                 print(f"Warnings: {len(report['warnings'])} (see capture-report.json)")
+            if _LAST_BACKUP_WARNINGS:
+                print(f"Unreadable paths: {_LAST_BACKUP_WARNINGS} "
+                      "(see inventory/unreadable-files.json)")
             if skip_external:
                 print("External copy skipped for this run; saved target was not changed.")
             elif config["external_backup"] is None:
                 print("External backup drive: not configured.")
             else:
                 try:
-                    external_path = copy_external_snapshot(current, config)
+                    external_path = copy_external_snapshot(current, config, run_id)
                 except (ConfigError, OSError, ValueError, KeyError, tarfile.TarError) as exc:
                     if isinstance(exc, FileNotFoundError):
                         raise ConfigError("Workspace disappeared during backup; no partial backup was published.") from None
@@ -2204,24 +2435,30 @@ def restore(path=None):
     mkdir(KIT / "restored")
     destination = Path(tempfile.mkdtemp(prefix="ubuntu-config-", dir=KIT / "restored"))
     records = {record["path"]: record for record in manifest["files"]}
-    if path.is_dir() and not path.is_symlink():
-        if manifest.get("storage") == LINKED_STORAGE:
-            sources = [safe_join(path, record["path"], allow_final_symlink=True) for record in manifest["files"]]
+    try:
+        if path.is_dir() and not path.is_symlink():
+            if manifest.get("storage") == LINKED_STORAGE:
+                sources = [safe_join(path, record["path"], allow_final_symlink=True)
+                           for record in manifest["files"]]
+            else:
+                sources = regular_files(path)
+            for source in sources:
+                name = source.relative_to(path).as_posix()
+                write(checked_path(destination, name), source.read_bytes(),
+                      executable=records.get(name, {}).get("executable", False))
+            if manifest.get("storage") == LINKED_STORAGE:
+                write_json(destination / "manifest.json", dict(manifest, storage="local-snapshot"))
         else:
-            sources = regular_files(path)
-        for source in sources:
-            name = source.relative_to(path).as_posix()
-            write(checked_path(destination, name), source.read_bytes(),
-                  executable=records.get(name, {}).get("executable", False))
-        if manifest.get("storage") == LINKED_STORAGE:
-            write_json(destination / "manifest.json", dict(manifest, storage="local-snapshot"))
-    else:
-        with tarfile.open(path, "r:gz") as archive:
-            for member in archive.getmembers():
-                executable = records.get(member.name, {}).get("executable", False)
-                with archive.extractfile(member) as stream:
-                    write(checked_path(destination, member.name), stream.read(), executable=executable)
-    verify_tree(destination)
+            with tarfile.open(path, "r:gz") as archive:
+                for member in archive.getmembers():
+                    executable = records.get(member.name, {}).get("executable", False)
+                    with archive.extractfile(member) as stream:
+                        write(checked_path(destination, member.name), stream.read(),
+                              executable=executable)
+        verify_tree(destination)
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
     print(f"Recovered safely into: {destination}")
     entrypoint = next((name for name in ("kit/ubuntu-backup.py",)
                        if (destination / name).exists()), "kit/deploy.sh")
@@ -2373,8 +2610,14 @@ def deploy(args):
     if args.snaps or args.flatpaks or args.desktop_settings:
         print(f"Optional actions: snaps={args.snaps}, flatpaks={args.flatpaks}, desktop settings={args.desktop_settings}")
     print(f"Full plan: {KIT / 'plans/last-deploy.json'}")
-    old_home = json.loads((source / "inventory/source-system.json").read_text())["home"]
-    if old_home != str(HOME):
+    try:
+        source_info = json.loads((source / "inventory/source-system.json").read_text())
+        old_home = source_info.get("home") if isinstance(source_info, dict) else None
+    except (OSError, ValueError, TypeError):
+        old_home = None
+    if old_home is None:
+        print("Warning: source home is unavailable in this snapshot; review absolute paths in scripts and launchers.")
+    elif old_home != str(HOME):
         print(f"Warning: old home was {old_home}; review absolute paths in scripts and launchers.")
     if not args.apply:
         print("Nothing installed or applied. Use --apply; add --overwrite only to replace conflicting files.")
@@ -2386,16 +2629,42 @@ def deploy(args):
         if result.returncode:
             print(f"Warning: APT returned {result.returncode}; continuing with development reapply.")
     if args.snaps:
-        for app in json.loads((source / "inventory/snap-apps.json").read_text()):
-            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", app["name"]) or not re.fullmatch(r"[A-Za-z0-9./_-]+", app["channel"]):
+        snap_path = source / "inventory/snap-apps.json"
+        try:
+            snap_apps = json.loads(snap_path.read_text())
+        except (OSError, ValueError, TypeError):
+            print("Warning: snap inventory is unavailable; no snaps installed.")
+            snap_apps = []
+        if not isinstance(snap_apps, list):
+            raise ConfigError("Invalid snap inventory.")
+        for app in snap_apps:
+            name = app.get("name") if isinstance(app, dict) else None
+            channel = app.get("channel") if isinstance(app, dict) else None
+            if (not isinstance(name, str) or not isinstance(channel, str)
+                    or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name)
+                    or not re.fullmatch(r"[A-Za-z0-9./_-]+", channel)):
                 raise ConfigError("Invalid snap inventory.")
-            command = ["sudo", "snap", "install", app["name"], "--channel=" + app["channel"]]
-            if app["classic"]:
+            command = ["sudo", "snap", "install", name, "--channel=" + channel]
+            if app.get("classic"):
                 command.append("--classic")
             subprocess.run(command, check=True)
     if args.flatpaks:
-        remotes = subprocess.run(["flatpak", "remotes", "--user", "--columns=name"], capture_output=True, text=True, check=True).stdout.splitlines()
-        for line in (source / "inventory/flatpak-apps.tsv").read_text().splitlines():
+        flatpak_path = source / "inventory/flatpak-apps.tsv"
+        try:
+            flatpak_lines = flatpak_path.read_text().splitlines()
+        except OSError:
+            print("Warning: Flatpak inventory is unavailable; no Flatpaks installed.")
+            flatpak_lines = []
+        remotes = []
+        if flatpak_lines:
+            try:
+                remotes = subprocess.run(
+                    ["flatpak", "remotes", "--user", "--columns=name"],
+                    capture_output=True, text=True, check=True).stdout.splitlines()
+            except (OSError, subprocess.SubprocessError):
+                print("Warning: Flatpak remotes are unavailable; no Flatpaks installed.")
+                flatpak_lines = []
+        for line in flatpak_lines:
             columns = line.split("\t")
             if len(columns) < 3 or columns[1] not in remotes:
                 print("Skipping Flatpak app: configure its trusted user remote first.")
@@ -2420,9 +2689,13 @@ def deploy(args):
     if args.build:
         reapply_builds(source, set(ordered_changed))
     if args.desktop_settings:
-        before = subprocess.run(["dconf", "dump", "/"], capture_output=True, check=True).stdout
-        write(rollback / "dconf-before.ini", before)
-        subprocess.run(["dconf", "load", "/"], input=(source / "inventory/dconf.ini").read_bytes(), check=True)
+        dconf_path = source / "inventory/dconf.ini"
+        if not dconf_path.is_file():
+            print("Warning: dconf inventory is unavailable; desktop settings were not imported.")
+        else:
+            before = subprocess.run(["dconf", "dump", "/"], capture_output=True, check=True).stdout
+            write(rollback / "dconf-before.ini", before)
+            subprocess.run(["dconf", "load", "/"], input=dconf_path.read_bytes(), check=True)
     print("Deployment complete. System references, service enablement, drivers, repositories and disks were NOT replayed.")
 
 
@@ -2435,6 +2708,7 @@ Description=Private Ubuntu configuration snapshot
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 -I "{script}" backup
+SuccessExitStatus=3
 UMask=0077
 Nice=10
 IOSchedulingClass=idle
@@ -2473,7 +2747,7 @@ def install_timer():
 EMBEDDED_DEFAULT_SETTINGS = {'coverage': 'system-wide-configuration', 'keep_snapshots': 30, 'exclude_cpus': [2, 8], 'external_backup': None, 'keep_local_backups': False, 'development_include': [], 'home_include': ['.bashrc', '.bash_logout', '.bash_aliases', '.profile', '.inputrc', '.gitconfig', '.Xresources', '.xprofile', '.xsessionrc', '.config/autostart', '.config/systemd/user', '.config/mimeapps.list', '.config/user-dirs.dirs', '.config/user-dirs.locale', '.config/fontconfig', '.config/gtk-3.0/settings.ini', '.config/gtk-3.0/gtk.css', '.config/gtk-4.0/settings.ini', '.config/gtk-4.0/gtk.css', '.config/Code/User/settings.json', '.config/Code/User/keybindings.json', '.config/Code/User/snippets', '.config/sublime-text/Packages/User', '.config/libreoffice/4/user/registrymodifications.xcu', '.local/share/applications', '.local/share/fonts', '.local/share/gnome-shell/extensions', '.local/share/themes', '.local/share/icons', '.fonts', '.themes', '.icons', 'bin', '*.sh', '*.py'], 'home_reference_only': ['.local/bin', '.nvidia-settings-rc', '.config/monitors.xml'], 'system_reference_only': ['/etc/default/keyboard', '/etc/default/locale', '/etc/environment', '/etc/locale.gen', '/etc/timezone', '/etc/apt/sources.list', '/etc/apt/sources.list.d', '/etc/apt/preferences.d', '/etc/apt/keyrings', '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/modprobe.d', '/etc/modules-load.d', '/etc/udev/rules.d', '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/systemd/system', '/etc/systemd/journald.conf', '/etc/systemd/journald.conf.d', '/etc/systemd/logind.conf', '/etc/systemd/logind.conf.d', '/etc/docker/daemon.json', '/etc/containerd/config.toml', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/etc/cron.d'], 'exclude': ['**/__pycache__', '**/__pycache__/*', '**/*.pyc', '**/.git', '**/.git/*', '.ssh', '.ssh/*', '.gnupg', '.gnupg/*', '.kube', '.kube/*', '.git-credentials', '.config/gh/*', '.docker/config.json', '.config/systemd/user/ubuntu-configuration-backup.*', '.config/systemd/user/timers.target.wants/ubuntu-configuration-backup.timer', 'etc/systemd/system/snap*', 'etc/apt/auth.conf', 'etc/apt/auth.conf.d/*'], 'apt_review_only': ['linux-*', 'grub*', 'shim*', 'nvidia-*', 'libnvidia-*', 'cuda*', 'nsight*', 'firmware-*', 'oem-*', 'efibootmgr', 'os-prober', 'mokutil']}
 EMBEDDED_README = 'Ubuntu Backup: self-contained interactive configuration backup and restore.\nNo personal configuration snapshot or backup data is bundled in this repository.\nGenerated snapshots and exports contain secrets and are NOT encrypted.\nOne backup action captures configuration, development code and full /home; identical files are stored once.\nEach development change records its time, content version and package/library references; reapply follows dependency order and never pins package versions.\nFull recovery stages configuration or full /home; live /home is never overwritten.\n'
 EMBEDDED_GITIGNORE = '*\n!ubuntu-backup.py\n!README.md\n!.gitignore\n'
-EMBEDDED_ROOT_EXPORTER = '#!/usr/bin/python3 -I\n"""System-wide CONFIGURATION capture; root reads, owner writes. Never a disk image."""\n# Managed by ubuntu-configuration system capture v1\nimport argparse\nimport datetime as dt\nimport hashlib\nimport io\nimport json\nimport os\nfrom pathlib import Path\nimport pwd\nimport stat\nimport subprocess\nimport sys\nimport tarfile\nimport tempfile\n\nMARKER = "# Managed by ubuntu-configuration system capture v1"\nUNIT = "ubuntu-configuration-system"\nHELPER = Path("/usr/local/libexec/ubuntu-configuration-system-capture.py")\nROOTS = ("/etc", "/usr/local/etc", "/usr/local/libexec/ubuntu-configuration-system-capture.py")\nMAX_FILE, MAX_TOTAL = 64 * 1024 * 1024, 1024 * 1024 * 1024\nDATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",\n             "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",\n             "indexeddb", "local storage", "session storage", "service worker", "blob_storage", "__pycache__"}\nHOME_PATHS = (".config", ".local/share/applications", ".local/share/fonts", ".local/share/themes", ".local/share/icons",\n              ".local/share/gnome-shell/extensions", ".fonts", ".themes", ".icons", ".ssh/config", ".kube/config",\n              ".gnupg/gpg.conf", ".gnupg/gpg-agent.conf", ".docker/config.json", ".aws/config")\nHISTORIES = {".bash_history", ".python_history", ".scala_history", ".dotty_history", ".lesshst", ".wget-hsts",\n             ".sudo_as_admin_successful", ".Xauthority", ".ICEauthority", ".DS_Store"}\n\n\ndef collect(owner_uid, accounts=None, system_roots=ROOTS):\n    """Pinned descriptors, unlimited depth, no symlinks or nested mounts followed."""\n    files, metadata, links, omissions, excluded = {}, {}, [], [], []\n    total = 0\n\n    def scan(parent_fd, name, prefix, device=None):\n        nonlocal total\n        if name.lower() in DATA_DIRS:\n            excluded.append(prefix)\n            return\n        try:\n            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)\n            if stat.S_ISLNK(info.st_mode):\n                links.append({"path": prefix, "target": os.readlink(name, dir_fd=parent_fd)})\n                return\n            if stat.S_ISDIR(info.st_mode):\n                if device is not None and info.st_dev != device:\n                    excluded.append(prefix + " (nested mount)")\n                    return\n                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)\n                try:\n                    with os.scandir(fd) as entries:\n                        names = sorted(entry.name for entry in entries)\n                    for child in names:\n                        scan(fd, child, prefix + "/" + child, info.st_dev)\n                finally:\n                    os.close(fd)\n                return\n            if not stat.S_ISREG(info.st_mode):\n                excluded.append(prefix + " (runtime/special file)")\n                return\n            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)\n            with os.fdopen(fd, "rb") as source:\n                before = os.fstat(source.fileno())\n                if not stat.S_ISREG(before.st_mode):\n                    raise RuntimeError("Configuration changed type: " + prefix)\n                data = source.read(MAX_FILE + 1)\n                after = os.fstat(source.fileno())\n            if len(data) > MAX_FILE:\n                raise RuntimeError("Configuration exceeds 64 MiB; capture aborted: " + prefix)\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise RuntimeError("Configuration changed during read; retry capture: " + prefix)\n            total += len(data)\n            if total > MAX_TOTAL:\n                raise RuntimeError("Configuration exceeds 1 GiB; review excluded application data before retrying.")\n            files[prefix] = data\n            metadata[prefix] = {"mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid, "gid": before.st_gid}\n        except FileNotFoundError:\n            return\n        except PermissionError:\n            omissions.append(prefix + " (unreadable even with current privileges)")\n\n    for root in system_roots:\n        path = Path(root)\n        try:\n            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        except FileNotFoundError:\n            continue\n        try:\n            scan(parent, path.name, "system/" + path.as_posix().lstrip("/"))\n        finally:\n            os.close(parent)\n    chosen = []\n    for account in accounts if accounts is not None else pwd.getpwall():\n        if account.pw_uid not in (0, owner_uid) and not (1000 <= account.pw_uid < 65534 and account.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin")):\n            continue\n        home = Path(account.pw_dir)\n        if not home.is_dir() or home.is_symlink():\n            omissions.append(f"Account {account.pw_uid}: home missing or symlinked")\n            continue\n        chosen.append({"uid": account.pw_uid, "name": account.pw_name, "home": str(home)})\n        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            prefix = "home" if account.pw_uid == owner_uid else f"accounts/{account.pw_uid}/home"\n            paths = set(HOME_PATHS)\n            with os.scandir(fd) as entries:\n                paths.update(entry.name for entry in entries if entry.name.startswith(".") and entry.is_file(follow_symlinks=False)\n                             and entry.name not in HISTORIES and not entry.name.endswith((".swp", ".swo", "~"))\n                             and not entry.name.startswith(".xsession-errors"))\n            for relative in sorted(paths):\n                parent = os.dup(fd)\n                try:\n                    parts = Path(relative).parts\n                    for part in parts[:-1]:\n                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)\n                        os.close(parent)\n                        parent = child\n                    scan(parent, parts[-1], prefix + "/" + relative)\n                except FileNotFoundError:\n                    pass\n                except OSError as exc:\n                    omissions.append(prefix + "/" + relative + " (ancestor unavailable: " + exc.strerror + ")")\n                finally:\n                    os.close(parent)\n        finally:\n            os.close(fd)\n    files["inventory/privileged-links.json"] = (json.dumps(links, indent=2) + "\\n").encode()\n    files["inventory/privileged-source-metadata.json"] = (json.dumps(metadata, indent=2) + "\\n").encode()\n    files["inventory/privileged-exclusions.json"] = (json.dumps(excluded, indent=2) + "\\n").encode()\n    return files, {"accounts": chosen, "roots": list(system_roots), "omissions": omissions}\n\n\ndef units(owner_uid, kit):\n    def quote(value):\n        value = str(value)\n        if "\\n" in value or "\\r" in value:\n            raise RuntimeError("Newlines are not allowed in a scheduler path.")\n        return \'"\' + value.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\').replace("%", "%%") + \'"\'\n    service = f"""{MARKER}\n[Unit]\nDescription=System-wide configuration capture and private user backup\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 -I {HELPER} --owner {owner_uid} --workspace {quote(kit)} --run-backup\nUMask=0077\nNice=10\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths={quote(kit)}\nTimeoutStartSec=20min\n"""\n    timer = f"""{MARKER}\n[Unit]\nDescription=Daily system-wide configuration backup\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=10m\n[Install]\nWantedBy=timers.target\n"""\n    return service, timer\n\n\ndef install_scheduler(owner_uid, kit):\n    root = Path("/etc/systemd/system")\n    service, timer = units(owner_uid, kit)\n    targets = [(HELPER, globals().get("SELF_SOURCE") or Path(__file__).read_text(), 0o700),\n               (root / (UNIT + ".service"), service, 0o644), (root / (UNIT + ".timer"), timer, 0o644)]\n    HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)\n    for directory in (HELPER.parent, root):\n        info = directory.lstat()\n        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:\n            raise RuntimeError("Scheduler directories must be protected and root-owned.")\n    for path, _, _ in targets:\n        if path.is_symlink() or (path.exists() and MARKER not in path.read_text()):\n            raise RuntimeError("Refusing unmanaged scheduler file: " + str(path))\n        if path.suffix == ".service" and path.exists() and f"--owner {owner_uid} " not in path.read_text():\n            raise RuntimeError("System-wide scheduler belongs to another account.")\n    for path, text, mode in targets:\n        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".system-config-", delete=False) as output:\n            temporary = Path(output.name)\n            try:\n                output.write(text.encode())\n                os.fchmod(output.fileno(), mode)\n                os.fchown(output.fileno(), 0, 0)\n                output.flush()\n                os.fsync(output.fileno())\n                os.replace(temporary, path)\n            finally:\n                temporary.unlink(missing_ok=True)\n    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)\n    subprocess.run(["/usr/bin/systemctl", "enable", "--now", UNIT + ".timer"], check=True)\n\n\ndef main(install=False, owner_uid=None, workspace=None, run_backup=False, replace_user_timer=False):\n    os.umask(0o077)\n    if os.geteuid() != 0:\n        raise RuntimeError("Run the confirmed sudo capture action, or sudo ./capture-root-configs.sh")\n    identity = owner_uid if owner_uid is not None else os.environ.get("SUDO_UID")\n    if identity is None:\n        raise RuntimeError("A non-root sudo caller or explicit scheduler owner is required.")\n    owner = pwd.getpwuid(int(identity))\n    if owner.pw_uid == 0:\n        raise RuntimeError("A non-root backup owner is required.")\n    kit = Path(workspace).expanduser().absolute() if workspace else Path(__file__).resolve().parents[1]\n    if Path(owner.pw_dir) not in kit.parents or ".." in kit.parts or kit.is_symlink():\n        raise RuntimeError("The private workspace must be inside the backup owner\'s real home directory.")\n    files, details = collect(owner.pw_uid)\n    captured = dt.datetime.now(dt.timezone.utc).isoformat()\n    manifest = {"format": "ubuntu-configuration-v1", "kind": "system-wide-configuration-cache", "created_at": captured,\n                "captured_at": captured, **details,\n                "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),\n                           "executable": False} for name, data in sorted(files.items())]}\n    if sum(len(data) for data in files.values()) > MAX_TOTAL or len(json.dumps(manifest).encode()) > MAX_FILE:\n        raise RuntimeError("Complete configuration/metadata exceeds safety limits; old cache preserved.")\n    if install:\n        install_scheduler(owner.pw_uid, kit)\n    os.setgroups([])\n    os.setgid(owner.pw_gid)\n    os.setuid(owner.pw_uid)\n    os.environ.update(HOME=owner.pw_dir, XDG_RUNTIME_DIR=f"/run/user/{owner.pw_uid}",\n                      DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{owner.pw_uid}/bus")\n    destination = kit / "privileged-system"\n    if destination.is_symlink():\n        raise RuntimeError("Refusing a symlinked capture directory.")\n    destination.mkdir(mode=0o700, exist_ok=True)\n    destination.chmod(0o700)\n    temporary = None\n    try:\n        with tempfile.NamedTemporaryFile(dir=destination, prefix=".system-wide-", delete=False) as output:\n            temporary = Path(output.name)\n            with tarfile.open(fileobj=output, mode="w:gz") as archive:\n                payload = dict(files)\n                payload["manifest.json"] = (json.dumps(manifest, indent=2) + "\\n").encode()\n                for name, data in sorted(payload.items()):\n                    info = tarfile.TarInfo(name)\n                    info.size, info.mode = len(data), 0o600\n                    archive.addfile(info, io.BytesIO(data))\n            output.flush()\n            os.fsync(output.fileno())\n        with tarfile.open(temporary, "r:gz") as archive:\n            for record in manifest["files"]:\n                if hashlib.sha256(archive.extractfile(record["path"]).read()).hexdigest() != record["sha256"]:\n                    raise RuntimeError("Privileged cache verification failed; old cache preserved.")\n        os.replace(temporary, destination / "system-wide.tar.gz")\n        temporary = None\n        fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n    finally:\n        if temporary is not None:\n            temporary.unlink(missing_ok=True)\n    print(f"Privately captured {len(files)} configuration files across {len(details[\'accounts\'])} accounts (root plus local users); omissions: {len(details[\'omissions\'])}.")\n    if replace_user_timer:\n        old = Path(owner.pw_dir) / ".config/systemd/user/ubuntu-configuration-backup.timer"\n        if old.is_file() and not old.is_symlink() and "# Managed by ubuntu-configuration v1" in old.read_text():\n            subprocess.run(["systemctl", "--user", "disable", "--now", "ubuntu-configuration-backup.timer"], check=True)\n    if run_backup or install:\n        entrypoint = Path(owner.pw_dir) / "ubuntu-backup.py"\n        if not entrypoint.is_file():\n            entrypoint = kit / "ubuntu-backup.py"  # Compatibility with older recovered kits.\n        subprocess.run(["/usr/bin/python3", "-I", str(entrypoint), "--workspace", str(kit), "--non-interactive", "backup"], check=True)\n    else:\n        print("Now run the normal backup command without sudo. Capture includes sensitive settings; it is NOT encrypted.")\n\n\nif __name__ == "__main__":\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument("--owner", type=int)\n    parser.add_argument("--workspace", type=Path)\n    parser.add_argument("--install-timer", action="store_true")\n    parser.add_argument("--replace-user-timer", action="store_true")\n    parser.add_argument("--run-backup", action="store_true")\n    options = parser.parse_args()\n    try:\n        main(options.install_timer, options.owner, options.workspace, options.run_backup, options.replace_user_timer)\n    except (RuntimeError, OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as exc:\n        print(f"Error: {exc}", file=sys.stderr)\n        sys.exit(1)\n'
+EMBEDDED_ROOT_EXPORTER = '#!/usr/bin/python3 -I\n"""System-wide CONFIGURATION capture; root reads, owner writes. Never a disk image."""\n# Managed by ubuntu-configuration system capture v1\nimport argparse\nimport datetime as dt\nimport hashlib\nimport io\nimport json\nimport os\nfrom pathlib import Path\nimport pwd\nimport stat\nimport subprocess\nimport sys\nimport tarfile\nimport tempfile\n\nMARKER = "# Managed by ubuntu-configuration system capture v1"\nUNIT = "ubuntu-configuration-system"\nHELPER = Path("/usr/local/libexec/ubuntu-configuration-system-capture.py")\nROOTS = ("/etc", "/usr/local/etc", "/usr/local/libexec/ubuntu-configuration-system-capture.py")\nMAX_FILE, MAX_TOTAL = 64 * 1024 * 1024, 1024 * 1024 * 1024\nDATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",\n             "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",\n             "indexeddb", "local storage", "session storage", "service worker", "blob_storage", "__pycache__"}\nHOME_PATHS = (".config", ".local/share/applications", ".local/share/fonts", ".local/share/themes", ".local/share/icons",\n              ".local/share/gnome-shell/extensions", ".fonts", ".themes", ".icons", ".ssh/config", ".kube/config",\n              ".gnupg/gpg.conf", ".gnupg/gpg-agent.conf", ".docker/config.json", ".aws/config")\nHISTORIES = {".bash_history", ".python_history", ".scala_history", ".dotty_history", ".lesshst", ".wget-hsts",\n             ".sudo_as_admin_successful", ".Xauthority", ".ICEauthority", ".DS_Store"}\n\n\ndef collect(owner_uid, accounts=None, system_roots=ROOTS):\n    """Pinned descriptors, unlimited depth, no symlinks or nested mounts followed."""\n    files, metadata, links, omissions, excluded = {}, {}, [], [], []\n    total = 0\n\n    def scan(parent_fd, name, prefix, device=None):\n        nonlocal total\n        if name.lower() in DATA_DIRS:\n            excluded.append(prefix)\n            return\n        try:\n            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)\n            if stat.S_ISLNK(info.st_mode):\n                links.append({"path": prefix, "target": os.readlink(name, dir_fd=parent_fd)})\n                return\n            if stat.S_ISDIR(info.st_mode):\n                if device is not None and info.st_dev != device:\n                    excluded.append(prefix + " (nested mount)")\n                    return\n                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)\n                try:\n                    with os.scandir(fd) as entries:\n                        names = sorted(entry.name for entry in entries)\n                    for child in names:\n                        scan(fd, child, prefix + "/" + child, info.st_dev)\n                finally:\n                    os.close(fd)\n                return\n            if not stat.S_ISREG(info.st_mode):\n                excluded.append(prefix + " (runtime/special file)")\n                return\n            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)\n            with os.fdopen(fd, "rb") as source:\n                before = os.fstat(source.fileno())\n                if not stat.S_ISREG(before.st_mode):\n                    raise RuntimeError("Configuration changed type: " + prefix)\n                data = source.read(MAX_FILE + 1)\n                after = os.fstat(source.fileno())\n            if len(data) > MAX_FILE:\n                raise RuntimeError("Configuration exceeds 64 MiB; capture aborted: " + prefix)\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise RuntimeError("Configuration changed during read; retry capture: " + prefix)\n            total += len(data)\n            if total > MAX_TOTAL:\n                raise RuntimeError("Configuration exceeds 1 GiB; review excluded application data before retrying.")\n            files[prefix] = data\n            metadata[prefix] = {"mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid, "gid": before.st_gid}\n        except FileNotFoundError:\n            return\n        except PermissionError:\n            omissions.append(prefix + " (unreadable even with current privileges)")\n\n    for root in system_roots:\n        path = Path(root)\n        try:\n            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        except FileNotFoundError:\n            continue\n        try:\n            scan(parent, path.name, "system/" + path.as_posix().lstrip("/"))\n        finally:\n            os.close(parent)\n    chosen = []\n    for account in accounts if accounts is not None else pwd.getpwall():\n        if account.pw_uid not in (0, owner_uid) and not (1000 <= account.pw_uid < 65534 and account.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin")):\n            continue\n        home = Path(account.pw_dir)\n        if not home.is_dir() or home.is_symlink():\n            omissions.append(f"Account {account.pw_uid}: home missing or symlinked")\n            continue\n        chosen.append({"uid": account.pw_uid, "name": account.pw_name, "home": str(home)})\n        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            prefix = "home" if account.pw_uid == owner_uid else f"accounts/{account.pw_uid}/home"\n            paths = set(HOME_PATHS)\n            with os.scandir(fd) as entries:\n                paths.update(entry.name for entry in entries if entry.name.startswith(".") and entry.is_file(follow_symlinks=False)\n                             and entry.name not in HISTORIES and not entry.name.endswith((".swp", ".swo", "~"))\n                             and not entry.name.startswith(".xsession-errors"))\n            for relative in sorted(paths):\n                parent = os.dup(fd)\n                try:\n                    parts = Path(relative).parts\n                    for part in parts[:-1]:\n                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)\n                        os.close(parent)\n                        parent = child\n                    scan(parent, parts[-1], prefix + "/" + relative)\n                except FileNotFoundError:\n                    pass\n                except OSError as exc:\n                    omissions.append(prefix + "/" + relative + " (ancestor unavailable: " + exc.strerror + ")")\n                finally:\n                    os.close(parent)\n        finally:\n            os.close(fd)\n    files["inventory/privileged-links.json"] = (json.dumps(links, indent=2) + "\\n").encode()\n    files["inventory/privileged-source-metadata.json"] = (json.dumps(metadata, indent=2) + "\\n").encode()\n    files["inventory/privileged-exclusions.json"] = (json.dumps(excluded, indent=2) + "\\n").encode()\n    return files, {"accounts": chosen, "roots": list(system_roots), "omissions": omissions}\n\n\ndef units(owner_uid, kit):\n    def quote(value):\n        value = str(value)\n        if "\\n" in value or "\\r" in value:\n            raise RuntimeError("Newlines are not allowed in a scheduler path.")\n        return \'"\' + value.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\').replace("%", "%%") + \'"\'\n    service = f"""{MARKER}\n[Unit]\nDescription=System-wide configuration capture and private user backup\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 -I {HELPER} --owner {owner_uid} --workspace {quote(kit)} --run-backup\nUMask=0077\nNice=10\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths={quote(kit)}\nSuccessExitStatus=3\nTimeoutStartSec=20min\n"""\n    timer = f"""{MARKER}\n[Unit]\nDescription=Daily system-wide configuration backup\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=10m\n[Install]\nWantedBy=timers.target\n"""\n    return service, timer\n\n\ndef install_scheduler(owner_uid, kit):\n    root = Path("/etc/systemd/system")\n    service, timer = units(owner_uid, kit)\n    targets = [(HELPER, globals().get("SELF_SOURCE") or Path(__file__).read_text(), 0o700),\n               (root / (UNIT + ".service"), service, 0o644), (root / (UNIT + ".timer"), timer, 0o644)]\n    HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)\n    for directory in (HELPER.parent, root):\n        info = directory.lstat()\n        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:\n            raise RuntimeError("Scheduler directories must be protected and root-owned.")\n    for path, _, _ in targets:\n        if path.is_symlink() or (path.exists() and MARKER not in path.read_text()):\n            raise RuntimeError("Refusing unmanaged scheduler file: " + str(path))\n        if path.suffix == ".service" and path.exists() and f"--owner {owner_uid} " not in path.read_text():\n            raise RuntimeError("System-wide scheduler belongs to another account.")\n    for path, text, mode in targets:\n        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".system-config-", delete=False) as output:\n            temporary = Path(output.name)\n            try:\n                output.write(text.encode())\n                os.fchmod(output.fileno(), mode)\n                os.fchown(output.fileno(), 0, 0)\n                output.flush()\n                os.fsync(output.fileno())\n                os.replace(temporary, path)\n            finally:\n                temporary.unlink(missing_ok=True)\n    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)\n    subprocess.run(["/usr/bin/systemctl", "enable", "--now", UNIT + ".timer"], check=True)\n\n\ndef main(install=False, owner_uid=None, workspace=None, run_backup=False, replace_user_timer=False):\n    os.umask(0o077)\n    if os.geteuid() != 0:\n        raise RuntimeError("Run the confirmed sudo capture action, or sudo ./capture-root-configs.sh")\n    identity = owner_uid if owner_uid is not None else os.environ.get("SUDO_UID")\n    if identity is None:\n        raise RuntimeError("A non-root sudo caller or explicit scheduler owner is required.")\n    owner = pwd.getpwuid(int(identity))\n    if owner.pw_uid == 0:\n        raise RuntimeError("A non-root backup owner is required.")\n    kit = Path(workspace).expanduser().absolute() if workspace else Path(__file__).resolve().parents[1]\n    if Path(owner.pw_dir) not in kit.parents or ".." in kit.parts or kit.is_symlink():\n        raise RuntimeError("The private workspace must be inside the backup owner\'s real home directory.")\n    files, details = collect(owner.pw_uid)\n    captured = dt.datetime.now(dt.timezone.utc).isoformat()\n    manifest = {"format": "ubuntu-configuration-v1", "kind": "system-wide-configuration-cache", "created_at": captured,\n                "captured_at": captured, **details,\n                "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),\n                           "executable": False} for name, data in sorted(files.items())]}\n    if sum(len(data) for data in files.values()) > MAX_TOTAL or len(json.dumps(manifest).encode()) > MAX_FILE:\n        raise RuntimeError("Complete configuration/metadata exceeds safety limits; old cache preserved.")\n    if install:\n        install_scheduler(owner.pw_uid, kit)\n    os.setgroups([])\n    os.setgid(owner.pw_gid)\n    os.setuid(owner.pw_uid)\n    os.environ.update(HOME=owner.pw_dir, XDG_RUNTIME_DIR=f"/run/user/{owner.pw_uid}",\n                      DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{owner.pw_uid}/bus")\n    destination = kit / "privileged-system"\n    if destination.is_symlink():\n        raise RuntimeError("Refusing a symlinked capture directory.")\n    destination.mkdir(mode=0o700, exist_ok=True)\n    destination.chmod(0o700)\n    temporary = None\n    try:\n        with tempfile.NamedTemporaryFile(dir=destination, prefix=".system-wide-", delete=False) as output:\n            temporary = Path(output.name)\n            with tarfile.open(fileobj=output, mode="w:gz") as archive:\n                payload = dict(files)\n                payload["manifest.json"] = (json.dumps(manifest, indent=2) + "\\n").encode()\n                for name, data in sorted(payload.items()):\n                    info = tarfile.TarInfo(name)\n                    info.size, info.mode = len(data), 0o600\n                    archive.addfile(info, io.BytesIO(data))\n            output.flush()\n            os.fsync(output.fileno())\n        with tarfile.open(temporary, "r:gz") as archive:\n            for record in manifest["files"]:\n                if hashlib.sha256(archive.extractfile(record["path"]).read()).hexdigest() != record["sha256"]:\n                    raise RuntimeError("Privileged cache verification failed; old cache preserved.")\n        os.replace(temporary, destination / "system-wide.tar.gz")\n        temporary = None\n        fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n    finally:\n        if temporary is not None:\n            temporary.unlink(missing_ok=True)\n    print(f"Privately captured {len(files)} configuration files across {len(details[\'accounts\'])} accounts (root plus local users); omissions: {len(details[\'omissions\'])}.")\n    if replace_user_timer:\n        old = Path(owner.pw_dir) / ".config/systemd/user/ubuntu-configuration-backup.timer"\n        if old.is_file() and not old.is_symlink() and "# Managed by ubuntu-configuration v1" in old.read_text():\n            subprocess.run(["systemctl", "--user", "disable", "--now", "ubuntu-configuration-backup.timer"], check=True)\n    if run_backup or install:\n        entrypoint = Path(owner.pw_dir) / "ubuntu-backup.py"\n        if not entrypoint.is_file():\n            entrypoint = kit / "ubuntu-backup.py"  # Compatibility with older recovered kits.\n        child = subprocess.run(["/usr/bin/python3", "-I", str(entrypoint), "--workspace", str(kit), "--non-interactive", "backup"], check=False)\n        if child.returncode not in (0, 3):\n            raise RuntimeError("Configuration backup exited with status " + str(child.returncode))\n        if child.returncode == 3:\n            raise SystemExit(3)\n    else:\n        print("Now run the normal backup command without sudo. Capture includes sensitive settings; it is NOT encrypted.")\n\n\nif __name__ == "__main__":\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument("--owner", type=int)\n    parser.add_argument("--workspace", type=Path)\n    parser.add_argument("--install-timer", action="store_true")\n    parser.add_argument("--replace-user-timer", action="store_true")\n    parser.add_argument("--run-backup", action="store_true")\n    options = parser.parse_args()\n    try:\n        main(options.install_timer, options.owner, options.workspace, options.run_backup, options.replace_user_timer)\n    except (RuntimeError, OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as exc:\n        print(f"Error: {exc}", file=sys.stderr)\n        sys.exit(1)\n'
 # This interface is appended to the standalone backend by build-single-file.py.
 import base64
 import copy
@@ -2523,7 +2797,8 @@ def private_workspace(path):
         entries = {entry.name for entry in path.iterdir()}
         known = {"backups", "snapshot", ".previous-snapshot", "restored", "rollback",
                  "plans", "profiles", "privileged-system", "system-integration-recovery",
-                 "staging", "config", "logs", "status.json", "history.txt", ".tray.lock", ".maintenance.lock"}
+                 "staging", "config", "logs", "status.json", "history.txt", ".tray.lock",
+                 ".maintenance.lock", ".home.lock", ".status.lock", ".home-snapshot"}
         if entries and not (path / "config/settings.json").is_file():
             # A recovered archive's kit/ is also a valid starting workspace.
             if not entries <= known and not (path.parent / "manifest.json").is_file():
@@ -2534,6 +2809,7 @@ def private_workspace(path):
     if not (KIT / "config/settings.json").exists():
         defaults = copy.deepcopy(EMBEDDED_DEFAULT_SETTINGS)
         defaults["external_backup"] = None  # A new machine never inherits a disk choice.
+        defaults["home_snapshot"] = "off"
         write_json(KIT / "config/settings.json", defaults)
     if not (KIT / "README.md").exists():
         write(KIT / "README.md", WORKSPACE_README)
@@ -2748,6 +3024,10 @@ def capture_root(non_interactive=False, install=False, replace_user_timer=False,
         print(line)
     for line in result.stderr.splitlines():
         print(line, file=sys.stderr)
+    if result.returncode == 3:
+        print("System-wide capture completed with warnings; inspect unreadable-files.json.",
+              file=sys.stderr)
+        return
     if result.returncode:
         detail = "System-wide capture failed"
         errors = [line for line in result.stderr.splitlines() if line.strip()]
@@ -2769,6 +3049,7 @@ Description=Private Ubuntu configuration snapshot (single-file kit)
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 -I {quote(HOME / 'ubuntu-backup.py')} --workspace {quote(KIT)} --non-interactive backup
+SuccessExitStatus=3
 UMask=0077
 Nice=10
 IOSchedulingClass=idle
@@ -2834,8 +3115,14 @@ def show_status():
     print("Config data and archives are private but NOT encrypted.")
 
 
-def choose_snapshot(default="1"):
-    print("1. Personal configuration bundled in this script")
+def choose_snapshot(default=None):
+    has_profile = bool(EMBEDDED_PROFILE)
+    has_workspace = ((KIT / "snapshot/manifest.json").is_file()
+                     or (KIT.parent / "manifest.json").is_file())
+    if default is None:
+        default = "1" if has_profile else ("2" if has_workspace else "0")
+    print("1. Personal configuration bundled in this script"
+          + ("" if has_profile else " (not available)"))
     print("2. Latest workspace snapshot (may describe this machine, not the old one)")
     print("3. A recovered snapshot directory\n0. Cancel")
     while True:
@@ -2843,9 +3130,17 @@ def choose_snapshot(default="1"):
         if choice == "0":
             return None
         if choice == "1":
-            return bundled_profile()
+            try:
+                return bundled_profile()
+            except ConfigError as exc:
+                print(exc)
+                continue
         if choice == "2":
-            return _original_default_snapshot()
+            try:
+                return _original_default_snapshot()
+            except ConfigError as exc:
+                print(exc)
+                continue
         if choice == "3":
             value = ask("Snapshot directory (blank cancels)")
             return Path(value).expanduser().resolve() if value else None
@@ -3013,6 +3308,160 @@ def wizard_verify():
     print(f"Verified {result.get('entry_count', len(result.get('files', [])))} entries.")
 
 
+def _disk_mounts(device, devices):
+    """Every mount on a whole disk or any of its partitions."""
+    children = [item for item in devices
+                if item is not device and item.get("path")
+                and parent_disk(item["path"]) == device.get("path")]
+    mounts = []
+    for item in [device, *children]:
+        mounts.extend(item.get("mountpoints") or [])
+    return sorted(set(mounts))
+
+
+def _format_candidates(include_internal=False):
+    """Whole disks that are safe to offer for formatting; partitions are excluded."""
+    system = system_disk()
+    if not system:
+        raise ConfigError("Cannot determine the system disk; refusing to offer formatting.")
+    devices = attached_drives()
+    candidates = []
+    for device in devices:
+        path = device.get("path")
+        if not path or device.get("type") != "disk":
+            continue
+        if not include_internal and not (device.get("removable") or device.get("transport") == "usb"):
+            continue
+        if parent_disk(path) == system:
+            continue
+        size = device.get("size")
+        if not isinstance(size, int) or size < 4 * 1024 ** 3:
+            continue
+        device["format_mounts"] = _disk_mounts(device, devices)
+        candidates.append(device)
+    candidates.sort(key=lambda item: (not item.get("removable"), str(item.get("path"))))
+    return candidates
+
+
+def format_drive(device_path, allow_internal=False, assume_yes=False):
+    """Format one explicitly selected whole disk as ext4, never a partition."""
+    if not sys.stdin.isatty():
+        raise ConfigError("Formatting needs an interactive terminal.")
+    path = Path(device_path)
+    if not path.is_absolute() or path.is_symlink():
+        raise ConfigError("Choose an absolute block-device path.")
+    try:
+        if not stat.S_ISBLK(path.stat().st_mode):
+            raise ConfigError("Not a block device: " + str(path))
+    except OSError as exc:
+        raise ConfigError(f"Cannot inspect {path}: {exc}") from None
+    devices = attached_drives()
+    selected = next((item for item in devices if item.get("path") == str(path)), None)
+    if selected is None:
+        raise ConfigError("The selected device is no longer attached.")
+    if selected.get("type") != "disk":
+        raise ConfigError("Prepare new drive formats a whole disk, not a partition. "
+                          "Select the disk itself (for example /dev/sda).")
+    mounted = _disk_mounts(selected, devices)
+    internal = not (selected.get("removable") or selected.get("transport") == "usb")
+    if internal and not allow_internal:
+        raise ConfigError("This drive is internal/non-removable. Rerun with --allow-internal "
+                          "and an explicit INTERNAL confirmation if it is a dedicated backup disk.")
+    system = system_disk()
+    if not system or parent_disk(str(path)) == system:
+        raise ConfigError("Refusing to format the disk that holds the running system.")
+    size = selected.get("size")
+    if not isinstance(size, int) or size < 4 * 1024 ** 3:
+        raise ConfigError("Refusing to format a device smaller than 4 GiB.")
+    if not shutil.which("mkfs.ext4") or not shutil.which("sudo"):
+        raise ConfigError("mkfs.ext4 and sudo are required to format a drive.")
+    print(f"Selected disk: {path} ({size / 2**30:.1f} GiB, "
+          f"{selected.get('model') or 'unknown model'}"
+          f"{', INTERNAL DISK' if internal else ''})")
+    print("This permanently erases the partition table and every file on the whole disk.")
+    if mounted:
+        print("These mounts will be unmounted first: " + ", ".join(mounted))
+    if not assume_yes:
+        phrase = f"FORMAT {'INTERNAL ' if internal else ''}{path} {size}"
+        if ask(f"Type {phrase} to erase it") != phrase:
+            print("Format cancelled; nothing was changed.")
+            return None
+        if not confirm("Final confirmation: erase this device and create ext4?", False):
+            print("Format cancelled; nothing was changed.")
+            return None
+    for mountpoint in mounted:
+        result = subprocess.run(["sudo", "umount", mountpoint], check=False)
+        if result.returncode:
+            raise ConfigError(f"Could not unmount {mountpoint}; close apps using it and retry.")
+    if mounted:
+        devices = attached_drives()
+        selected = next((item for item in devices if item.get("path") == str(path)), None)
+        if selected is None:
+            raise ConfigError("The selected disk disappeared after unmounting.")
+        still_mounted = _disk_mounts(selected, devices)
+        if still_mounted:
+            raise ConfigError("The disk still has mounted partitions: " + ", ".join(still_mounted))
+    if shutil.which("wipefs"):
+        subprocess.run(["sudo", "wipefs", "-a", str(path)], check=False)
+    result = subprocess.run(["sudo", "mkfs.ext4", "-F", "-L", "ubuntu-backup", str(path)],
+                            check=False)
+    if result.returncode:
+        raise ConfigError(f"Formatting failed with status {result.returncode}.")
+    refreshed = None
+    for _attempt in range(20):
+        devices = attached_drives()
+        refreshed = next((item for item in devices if item.get("path") == str(path)), None)
+        if refreshed and refreshed.get("fstype") == "ext4" and refreshed.get("uuid"):
+            break
+        time.sleep(0.5)
+    else:
+        raise ConfigError("The device was formatted but its filesystem was not detected yet; "
+                          "rerun drive selection after a moment.")
+    target = default_mount_point(refreshed)
+    try:
+        if target.exists() and any(target.iterdir()):
+            target = target.with_name(target.name + "-" + refreshed["uuid"][:8])
+    except OSError:
+        target = target.with_name(target.name + "-" + refreshed["uuid"][:8])
+    mountpoint = mount_drive(refreshed, str(target), assume_yes=assume_yes)
+    set_external(mountpoint)
+    print("Drive formatted, mounted, owned by this account, and selected for backups.")
+    return mountpoint
+
+
+def wizard_prepare_drive(allow_internal=False):
+    candidates = _format_candidates(allow_internal)
+    if not candidates and not allow_internal:
+        if confirm("No removable/USB drive was found. Include internal disks? (dangerous)", False):
+            return wizard_prepare_drive(allow_internal=True)
+        print("Connect a removable drive, ensure it is unmounted, and rescan.")
+        return None
+    if not candidates:
+        print("No unmounted device of at least 4 GiB was found.")
+        return None
+    print("FORMATTING ERASES ALL DATA. These are the eligible devices:")
+    for number, device in enumerate(candidates, 1):
+        size = device.get("size")
+        size_text = f"{size / 2**30:.1f} GiB" if isinstance(size, int) else "unknown size"
+        kind = "" if (device.get("removable") or device.get("transport") == "usb") else " [INTERNAL]"
+        mounts = device.get("format_mounts") or []
+        mounted_text = " [MOUNTED: " + ", ".join(mounts) + "]" if mounts else ""
+        print(f"{number}. {device['path']} ({size_text}, {device.get('model') or 'unknown model'}, "
+              f"{device.get('fstype') or 'no filesystem'}){kind}{mounted_text}")
+    if len(candidates) == 1:
+        selected = candidates[0]
+        print("Only one eligible disk found; using " + selected["path"])
+    else:
+        choice = ask("Device number (blank cancels)")
+        if not choice:
+            return None
+        if not choice.isdigit() or not 1 <= int(choice) <= len(candidates):
+            raise ConfigError("Choose a listed device number.")
+        selected = candidates[int(choice) - 1]
+    return format_drive(selected["path"], allow_internal=allow_internal,
+                        assume_yes=True)
+
+
 def wizard_drive(mount_point=None, disable=False):
     current = settings()["external_backup"]
     if not current:
@@ -3041,12 +3490,17 @@ def wizard_drive(mount_point=None, disable=False):
                       f"UUID {device['uuid'] or 'none'}) — {mounts}")
             print("s. Skip external backup for now; keep previous target")
             print("r. Rescan after connecting a drive   p. Enter an already-mounted path")
+            print("f. Format a new removable/USB drive (ERASES ALL DATA)")
             print("d. Disable/forget saved target (separate confirmation)")
             choice = ask("Choice", "s").lower()
             if choice in ("", "s", "0"):
                 print("External drive skipped; saved target unchanged.")
                 return False
             if choice == "r":
+                continue
+            if choice == "f":
+                if wizard_prepare_drive():
+                    return True
                 continue
             if choice == "d":
                 value = "disable"
@@ -3076,7 +3530,7 @@ def wizard_drive(mount_point=None, disable=False):
                 else:
                     value = selected["mountpoints"][0]
                 break
-            print("Choose a listed device, s, r, p or d.")
+            print("Choose a listed device, s, r, p, f or d.")
     if not value:
         return False
     if value == "disable":
@@ -3086,12 +3540,9 @@ def wizard_drive(mount_point=None, disable=False):
     mount = Path(value).expanduser().resolve()
     info = mount_info(mount)
     print(f"Mounted target: {mount}\nFilesystem UUID: {info['uuid']}\nType: {info['fstype']}")
-    if ask("Type USE DRIVE to create the private backup directory/marker there") == "USE DRIVE":
-        set_external(str(mount))
-        return True
-    else:
-        print("Drive choice unchanged.")
-        return False
+    set_external(str(mount))
+    print("Backup drive selected.")
+    return True
 
 
 def interactive_backup():
@@ -3111,12 +3562,13 @@ def interactive_backup():
         return None
 
 
-def backup_everything():
+def backup_everything(native_capture=False):
     """Single flow: privileged configuration, configuration backup, full /home."""
-    global _STATUS_RUN
+    global _STATUS_RUN, _LAST_HOME_WARNINGS
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     signal.signal(signal.SIGHUP, signal.default_int_handler)
     _STATUS_RUN = True
+    _LAST_HOME_WARNINGS = 0
     _diagnose_previous_status()
     _status_history("started", "Backup started")
     _write_status("running", "preparing", "Preparing backup")
@@ -3149,23 +3601,32 @@ def backup_everything():
             return None
         _write_status("running", "full_home", "Capturing full /home")
         print("Starting full /home capture.")
-        home_done = wizard_home_backup()
+        home_done = wizard_home_backup(_LAST_BACKUP_RUN_ID, native_capture)
+        warnings = _LAST_BACKUP_WARNINGS
+        home_warnings = _LAST_HOME_WARNINGS
         message = ("Backup operation complete: configuration and full /home."
                    if home_done else
                    "Backup operation complete: configuration only; full /home was skipped.")
-        _write_status("complete", "complete", message, result=str(path) if path else None)
-        _status_history("complete", message, path)
+        if warnings:
+            message += f" (warnings): {warnings} unreadable configuration file(s)"
+        if home_warnings:
+            message += f"; {home_warnings} full /home omission(s)"
+        _write_status("complete", "complete", message, result=str(path) if path else None,
+                      warnings=bool(warnings or home_warnings),
+                      omissions=warnings + home_warnings)
+        _status_history("complete", message, path, at=_LAST_BACKUP_RUN_ID)
         print(message)
         return path
     except KeyboardInterrupt:
         message = "Backup cancelled; no partial backup was published."
         _write_status("cancelled", "cancelled", message)
-        _status_history("cancelled", message)
+        _status_history("cancelled", message, at=_LAST_BACKUP_RUN_ID)
         raise
     except Exception as exc:
         message = f"Backup failed: {type(exc).__name__}: {exc}"
         _write_status("failed", "failed", message)
-        _status_history("failed", message)
+        _status_history("failed", message, KIT / "logs/ubuntu-backup.log",
+                        at=_LAST_BACKUP_RUN_ID)
         raise
     finally:
         _STATUS_RUN = False
@@ -3219,6 +3680,7 @@ def menu():
         print("3. Verify a snapshot, backup or timeline")
         print("4. Choose backup drive (or leave unset)")
         print("5. Automatic backup and privileged-capture schedule")
+        print("6. Format a new backup drive (ERASES ALL DATA)")
         print("u. Undo restore")
         print("s. Status")
         print("0. Exit")
@@ -3236,6 +3698,8 @@ def menu():
                 wizard_drive()
             elif choice == "5":
                 wizard_schedule()
+            elif choice == "6":
+                wizard_prepare_drive()
             elif choice == "u":
                 wizard_undo_restore()
             elif choice == "s":
@@ -3272,18 +3736,29 @@ def main():
         "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
         "backup-now": "Run the combined backup in this terminal",
+        "recover": "Restore configuration or full /home (interactive)",
         "choose-drive": "Select a backup drive; can add a boot mount",
+        "prepare-drive": "Format a drive as ext4 and select it; internal disks need --allow-internal",
         "mount-saved": "Mount the fstab-declared backup drive and verify its on-disk marker",
         "unmount-saved": "Unmount the marked backup drive; keeps the boot entry",
     }
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
+    for command in ("backup", "backup-now"):
+        commands.choices[command].add_argument(
+            "--native-capture", action="store_true",
+            help="Use the native capture engine for full /home (experimental)")
+    commands.choices["prepare-drive"].add_argument(
+        "--allow-internal", action="store_true",
+        help="Also offer non-removable internal disks (requires an INTERNAL confirmation)")
     commands.choices["mount-saved"].add_argument("--check", action="store_true", help="Report state only; mount nothing")
     commands.choices["mount-saved"].add_argument("--quiet", action="store_true", help="Silence the routine no-op states")
     worker = commands.add_parser("_capture-root-worker")
     worker.add_argument("--install-system-timer", action="store_true")
     worker.add_argument("--replace-user-timer", action="store_true")
     worker = commands.add_parser("_backup-home-worker")
+    worker.add_argument("--run-id")
+    worker.add_argument("--native-capture", action="store_true")
     sub = commands.add_parser("restore-home", help="Stage a full /home linked snapshot into a private folder; no live changes")
     sub.add_argument("timeline", nargs="?", type=Path)
     sub = commands.add_parser("install-timer", help="Enable daily/weekly unattended backups")
@@ -3319,7 +3794,7 @@ def main():
         namespace["main"](install=args.install_system_timer, replace_user_timer=args.replace_user_timer)
         return
     if args.command == "_backup-home-worker":
-        root_home_backup(workspace)
+        root_home_backup(workspace, args.run_id, args.native_capture)
         return
     if os.geteuid() == 0:
         raise ConfigError("Run normally, not with sudo. The root-capture action invokes sudo separately.")
@@ -3328,7 +3803,11 @@ def main():
     if command == "menu":
         if not interactive:
             raise ConfigError("The menu needs an interactive terminal. Use --non-interactive backup, deploy, verify, or --help.")
-        print("Personal configuration data is bundled in this file; it is NOT encrypted.")
+        if EMBEDDED_PROFILE:
+            print("Personal configuration data is bundled in this file; it is NOT encrypted.")
+        else:
+            print("No personal profile is embedded; this build uses workspace snapshots.")
+        print("Snapshots may contain secrets; they are NOT encrypted.")
         workspace = Path(ask("Private workspace folder", str(workspace)))
     private_workspace(workspace)
     if command in ("mount-saved", "unmount-saved"):
@@ -3344,7 +3823,11 @@ def main():
     if command == "menu":
         menu()
     elif command == "backup":
-        backup_everything() if interactive else backup()
+        backup_everything(native_capture=args.native_capture) if interactive else backup()
+    elif command == "recover":
+        if not interactive:
+            raise ConfigError("Recovery needs an interactive terminal.")
+        wizard_recover()
     elif command == "restore-home":
         if interactive and args.timeline is None:
             wizard_restore_home()
@@ -3359,11 +3842,15 @@ def main():
             raise ConfigError("The manual backup action needs an interactive terminal.")
         signal.signal(signal.SIGTERM, signal.default_int_handler)
         signal.signal(signal.SIGHUP, signal.default_int_handler)
-        backup_everything()
+        backup_everything(native_capture=args.native_capture)
     elif command == "choose-drive":
         if not interactive:
             raise ConfigError("Drive selection needs an interactive terminal.")
         wizard_drive()
+    elif command == "prepare-drive":
+        if not interactive:
+            raise ConfigError("Formatting a drive needs an interactive terminal.")
+        wizard_prepare_drive(allow_internal=args.allow_internal)
     elif command == "deploy":
         if interactive:
             wizard_deploy(Path(args.snapshot).expanduser() if args.snapshot else None)
@@ -3921,7 +4408,18 @@ def home_identity():
         point = fields[4].replace("\\040", " ").replace("\\134", "\\")
         if point == "/home" or point.startswith("/home/"):
             mounts.append({"mount": point, "device": fields[2], "root": fields[3]})
-    return {"hardware": hardware_inventory(), "home_device": Path("/home").stat().st_dev,
+    hardware = hardware_inventory()
+    source_disk = system_disk()
+    # Approval is about the source of /home, not every USB device or NIC that
+    # happens to be attached when the operator reviews the backup.
+    hardware_identity = {
+        "architecture": hardware.get("architecture"),
+        "vendor": hardware.get("vendor"),
+        "model": hardware.get("model"),
+        "source_disk": source_disk,
+        "complete": bool(hardware.get("complete") and source_disk),
+    }
+    return {"hardware": hardware_identity, "home_device": Path("/home").stat().st_dev,
             "mounts": sorted(mounts, key=lambda entry: entry["mount"])}
 
 
@@ -3963,10 +4461,13 @@ def stream_object(stage_objects, stage_incoming, external_objects, stream, size,
                 current = 0
                 for offset, length in sparse:
                     offset, length = int(offset), int(length)
-                    if length < 0 or offset < current:
+                    if length < 0:
                         raise ConfigError("Invalid sparse file layout in tar stream.")
                     if length == 0:
+                        # GNU tar appends (0, 0) and other zero-length sentinels.
                         continue
+                    if offset < current:
+                        raise ConfigError("Invalid sparse file layout in tar stream.")
                     if offset > current:
                         stream_hash(stream, offset - current, hasher)
                     output.seek(offset)
@@ -4088,6 +4589,10 @@ def clean_created_objects(created):
 
 
 _STATUS_RUN = False
+_EXIT_CODE = 0
+_LAST_BACKUP_RUN_ID = None
+_LAST_BACKUP_WARNINGS = 0
+_LAST_HOME_WARNINGS = 0
 
 
 def _status_path():
@@ -4117,9 +4622,25 @@ HISTORY_LIMIT_BYTES = 1024 * 1024
 HISTORY_KEEP_LINES = 500
 
 
-def _status_history(state, message, result=None):
+def history_timestamp(run_id=None):
+    if run_id:
+        try:
+            return dt.datetime.strptime(run_id, "%Y%m%dT%H%M%S.%fZ").strftime("%Y-%m-%d %H:%M:%SZ")
+        except (TypeError, ValueError):
+            pass
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _status_history(state, message, result=None, at=None):
+    lock = None
     try:
-        line = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        fd = os.open(KIT / ".status.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        lock = os.fdopen(fd, "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        lock = None
+    try:
+        line = history_timestamp(at)
         line += f"  {state.upper():9}  {message}"
         if result:
             line += f"  ->  {result}"
@@ -4135,6 +4656,12 @@ def _status_history(state, message, result=None):
             os.replace(temporary, path)
     except OSError:
         pass
+    finally:
+        if lock is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            finally:
+                lock.close()
 
 
 LOG_SEGMENT_BYTES = 16 * 1024 * 1024
@@ -4162,6 +4689,14 @@ class RotatingLog:
 
     def write(self, text):
         data = text.encode("utf-8", "replace")
+        lock = None
+        try:
+            fd = os.open(self.path.with_name("." + self.path.name + ".lock"),
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            lock = os.fdopen(fd, "a")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:
+            lock = None
         try:
             if self.path.exists() and self.path.stat().st_size + len(data) > self.segment_bytes:
                 self._rotate()
@@ -4170,6 +4705,12 @@ class RotatingLog:
             self.path.chmod(0o600)
         except OSError:
             pass
+        finally:
+            if lock is not None:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                finally:
+                    lock.close()
 
     def flush(self):
         pass
@@ -4402,7 +4943,7 @@ def verify_home_timeline(timeline, hash_objects=True):
     return manifest
 
 
-def capture_home_archive(stream, root, identity, exclusions):
+def capture_home_archive(stream, root, identity, exclusions, snapshot=None):
     """Consume a root tar stream as the normal user and publish a linked timeline."""
     objects, incoming, timelines = baseline_directories(root, "home")
     stage = prepare_staging(root)
@@ -4494,12 +5035,15 @@ def capture_home_archive(stream, root, identity, exclusions):
                     "warnings": warnings[:200], "warning_count": len(warnings),
                     "entries_sha256": digest(entries_path),
                     "restore_policy": "Stage privately. Never overwrite live /home or replay UID/hardware bindings blindly."}
+        if snapshot:
+            manifest["snapshot"] = snapshot
         write_json(temporary / "manifest.json", manifest)
         if created:
             print(f"Copying {len(created)} new objects from local staging to the backup drive...",
                   file=sys.stderr)
         copy_staged_objects(stage_objects, objects)
-        verify_home_timeline(temporary, hash_objects=False)
+        print("Verifying full /home baseline checksums...", file=sys.stderr)
+        verify_home_timeline(temporary)
         return temporary, manifest, created, timelines
     except BaseException:
         progress.abort()
@@ -4664,7 +5208,74 @@ def wizard_restore_home():
         restore_home(Path(value).expanduser())
 
 
-def wizard_home_backup():
+def run_logged(command, log_path):
+    """Run a child, streaming merged output to the terminal and a private log."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with log_path.open("w") as log:
+        log_path.chmod(0o600)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, bufsize=1)
+        try:
+            for line in process.stdout:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                log.write(line)
+                log.flush()
+            status = process.wait()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            raise
+    if status:
+        detail = log_path.read_text(errors="replace")[-2000:].strip()
+        message = f"Full /home worker exited with status {status}. Log: {log_path}"
+        if detail:
+            message += "\n" + detail
+        raise ConfigError(message)
+
+
+def native_core_path():
+    candidates = []
+    override = os.environ.get("UBUNTU_BACKUP_NATIVE")
+    if override:
+        candidates.append(Path(override).expanduser())
+    candidates.extend([
+        SCRIPT_PATH.parent / "ubackup-core",
+        SCRIPT_PATH.parent / "native" / "ubackup-core",
+        KIT.parent / "native" / "ubackup-core",
+    ])
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    raise ConfigError(
+        "Native capture core not found. Build native/ubackup-core or set UBUNTU_BACKUP_NATIVE.")
+
+
+def native_home_command(source_home, directory, run_id, owner_uid, owner_gid,
+                        identity, excluded):
+    command = [str(native_core_path()), "scan",
+               "--source", str(source_home),
+               "--objects", str(directory / "baseline/home/objects"),
+               "--entries", str(KIT / "native-home-entries.ndjson"),
+               "--report", str(KIT / "native-home-report.json"),
+               "--timeline", str(directory / "timeline/home"),
+               "--run-id", run_id_value(run_id),
+               "--owner-uid", str(owner_uid),
+               "--owner-gid", str(owner_gid),
+               "--one-file-system",
+               "--identity-json", json.dumps(identity, separators=(",", ":")),
+               "--exclusions-json", json.dumps(excluded)]
+    for prefix in excluded:
+        command.extend(["--exclude-prefix", prefix])
+    return command
+
+
+def wizard_home_backup(run_id=None, native_capture=False):
+    global _LAST_HOME_WARNINGS
     config = settings()
     if not config["external_backup"]:
         print("Choose and mount the backup drive first (menu 4). No /home data was read or copied.")
@@ -4674,22 +5285,372 @@ def wizard_home_backup():
     nested = [entry["mount"] for entry in identity["mounts"] if entry["mount"] != "/home"]
     if nested:
         raise ConfigError("Strict /home backup refuses unapproved nested mounts; prepare separate filesystem backups: " + ", ".join(nested))
-    print("Full /home includes secrets; not encrypted. Stop apps/VMs first; the capture is not atomic.")
+    print("Full /home includes secrets; not encrypted. Stop apps/VMs first.")
+    mode = config.get("home_snapshot", "off")
+    if mode == "off":
+        print("Filesystem snapshot: disabled; the capture is not atomic.")
+    else:
+        kind = snapshot_kind()
+        if kind:
+            print(f"Filesystem snapshot: {kind}; the capture will read a point-in-time source.")
+        elif mode == "required":
+            raise ConfigError("home_snapshot=required but no supported LVM/btrfs/ZFS snapshot is available.")
+        else:
+            print("Warning: no supported filesystem snapshot is available; the capture is not atomic.")
     print("Destination: " + str(directory))
     baseline = KIT / "config/home-backup-approval.json"
     changed = not baseline.is_file() or json.loads(baseline.read_text()) != identity
     if changed:
-        print("Hardware/mount layout is new or changed. Explicit review is required; nothing is adapted on backup.")
-        if ask("Type APPROVE SOURCE LAYOUT to approve this exact layout") != "APPROVE SOURCE LAYOUT":
-            return False
+        print("Hardware/mount layout recorded for this backup.")
         write_json(baseline, identity)
-    if ask("Type BACK UP ALL HOME to start the sudo, read-only capture") != "BACK UP ALL HOME":
-        return False
-    subprocess.run(["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "_backup-home-worker"], check=True)
+    print("Starting the sudo, read-only full /home capture.")
+    run_id = run_id_value(run_id)
+    command = ["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH),
+               "--workspace", str(KIT), "_backup-home-worker", "--run-id", run_id]
+    if native_capture:
+        command.append("--native-capture")
+    run_logged(command, KIT / "logs" / ("home-worker-" + run_id + ".log"))
+    if native_capture:
+        timeline = directory / "timeline" / "home" / ("home-full-" + run_id)
+        manifest = verify_path(timeline)
+        _LAST_HOME_WARNINGS = int(manifest.get("warning_count") or 0)
+        if _LAST_HOME_WARNINGS:
+            print(f"Native full /home timeline has {_LAST_HOME_WARNINGS} omission(s); "
+                  "review the capture report.", file=sys.stderr)
+        print(f"Full /home timeline verified: {timeline}")
     return True
 
 
-def root_home_backup(workspace):
+class SnapshotUnavailable(Exception):
+    pass
+
+
+class Snapshot:
+    """A read-only source snapshot and the root-only cleanup it requires."""
+
+    def __init__(self, kind, snapshot_id, source_home, release, metadata):
+        self.kind = kind
+        self.id = snapshot_id
+        self.source_home = Path(source_home)
+        self.release = release
+        self.metadata = metadata
+        self._pipe = None
+        self._supervisor = None
+
+    def start_supervisor(self):
+        """Fork a root supervisor before the writer drops privileges."""
+        if self.release is None:
+            return
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(write_fd)
+            status = 0
+            try:
+                while os.read(read_fd, 65536):
+                    pass
+                self.release()
+            except BaseException as exc:  # noqa: BLE001 - report from the root helper
+                status = 1
+                print(f"Snapshot cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            finally:
+                os._exit(status)
+        os.close(read_fd)
+        self._pipe = write_fd
+        self._supervisor = pid
+
+    def close(self):
+        if self._pipe is None:
+            return
+        os.close(self._pipe)
+        self._pipe = None
+        try:
+            _pid, status = os.waitpid(self._supervisor, 0)
+        except ChildProcessError:
+            return
+        if status:
+            print(f"Snapshot cleanup supervisor exited with status {status}.", file=sys.stderr)
+
+    def release_now(self):
+        if self.release is not None:
+            self.release()
+            self.release = None
+
+
+def _snapshot_run(args, timeout=120):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _snapshot_mount(path):
+    result = _snapshot_run(["findmnt", "-J", "-T", str(path),
+                            "--output", "TARGET,SOURCE,FSTYPE"])
+    if not result or result.returncode:
+        return {}
+    try:
+        return json.loads(result.stdout)["filesystems"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return {}
+
+
+def _snapshot_lvm_info():
+    if not all(shutil.which(name) for name in ("lvs", "vgs", "lvcreate", "mount", "umount")):
+        return None
+    try:
+        if os.stat("/home").st_dev != os.stat("/").st_dev:
+            return None
+    except OSError:
+        return None
+    mount = _snapshot_mount("/")
+    source = mount.get("source")
+    if not isinstance(source, str) or not source.startswith("/dev/"):
+        return None
+    result = _snapshot_run([
+        "lvs", "--noheadings", "--separator", "\t",
+        "-o", "vg_name,lv_name,lv_size,pool_lv", "--units", "b", "--nosuffix",
+        source,
+    ])
+    if not result or result.returncode:
+        return None
+    fields = result.stdout.strip().split("\t")
+    if len(fields) < 3:
+        return None
+    try:
+        vg, lv, size = fields[0].strip(), fields[1].strip(), int(fields[2].strip())
+    except ValueError:
+        return None
+    free_result = _snapshot_run([
+        "vgs", "--noheadings", "--separator", "\t", "-o", "vg_free",
+        "--units", "b", "--nosuffix", vg,
+    ])
+    try:
+        free = int(free_result.stdout.strip()) if free_result and free_result.returncode == 0 else 0
+    except ValueError:
+        free = 0
+    return {"kind": "lvm", "source": source, "vg": vg, "lv": lv,
+            "size": size, "free": free}
+
+
+def _snapshot_btrfs_info():
+    if not shutil.which("btrfs"):
+        return None
+    root = _snapshot_mount("/")
+    if root.get("fstype") != "btrfs":
+        return None
+    try:
+        if os.stat("/home").st_dev != os.stat("/").st_dev:
+            return None
+    except OSError:
+        return None
+    subvolume = _snapshot_run(["btrfs", "subvolume", "show", "/home"])
+    source = "/home" if subvolume and subvolume.returncode == 0 else "/"
+    return {"kind": "btrfs", "source": source}
+
+
+def _snapshot_zfs_info():
+    if not shutil.which("zfs"):
+        return None
+    root = _snapshot_mount("/")
+    if root.get("fstype") != "zfs":
+        return None
+    try:
+        if os.stat("/home").st_dev != os.stat("/").st_dev:
+            return None
+    except OSError:
+        return None
+    source = root.get("source")
+    if not isinstance(source, str) or not source:
+        return None
+    result = _snapshot_run(["zfs", "list", "-H", "-o", "name", source])
+    if not result or result.returncode:
+        return None
+    dataset = result.stdout.strip().splitlines()
+    mountpoint = _snapshot_run(["zfs", "get", "-H", "-o", "value", "mountpoint", source])
+    if not dataset or not mountpoint or mountpoint.returncode:
+        return None
+    point = mountpoint.stdout.strip()
+    if not point.startswith("/"):
+        return None
+    return {"kind": "zfs", "source": source, "dataset": dataset[0],
+            "mountpoint": point}
+
+
+def snapshot_kind():
+    for detector in (_snapshot_btrfs_info, _snapshot_zfs_info, _snapshot_lvm_info):
+        try:
+            info = detector()
+        except (OSError, subprocess.SubprocessError):
+            info = None
+        if info:
+            return info["kind"]
+    return None
+
+
+def _create_lvm_snapshot(info, kit):
+    mib = 1024 * 1024
+    if info["free"] < 2 * 1024 * mib:
+        raise SnapshotUnavailable("LVM volume group has less than 2 GiB free for a snapshot.")
+    size_mib = max(1024, min(8192, info["free"] // 2 // mib,
+                             max(1024, info["size"] // 10 // mib)))
+    snapshot_id = "ubuntu-backup-" + uuid.uuid4().hex[:8]
+    mountpoint = kit / ".home-snapshot"
+    if mountpoint.is_symlink() or mountpoint.exists():
+        raise SnapshotUnavailable("Snapshot mount point already exists: " + str(mountpoint))
+    mkdir(mountpoint)
+    started = time.monotonic()
+    snapdev = "/dev/" + info["vg"] + "/" + snapshot_id
+    result = _snapshot_run(["lvcreate", "-s", "-L", f"{size_mib}M",
+                            "-n", snapshot_id, info["vg"] + "/" + info["lv"]])
+    if not result or result.returncode:
+        mountpoint.rmdir()
+        detail = (result.stderr or "").strip() if result else "lvcreate unavailable"
+        raise SnapshotUnavailable("LVM snapshot creation failed: " + detail[-400:])
+    path_result = _snapshot_run(["lvs", "--noheadings", "-o", "lv_path",
+                                 info["vg"] + "/" + snapshot_id])
+    if path_result and path_result.returncode == 0 and path_result.stdout.strip():
+        snapdev = path_result.stdout.strip().splitlines()[0]
+    try:
+        result = _snapshot_run(["mount", "-o", "ro,nouuid", snapdev, str(mountpoint)])
+        if not result or result.returncode:
+            detail = (result.stderr or "").strip() if result else "mount unavailable"
+            raise SnapshotUnavailable("LVM snapshot mount failed: " + detail[-400:])
+    except BaseException:
+        _snapshot_run(["lvremove", "-f", snapdev])
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            pass
+        raise
+
+    def release():
+        _snapshot_run(["umount", str(mountpoint)])
+        _snapshot_run(["lvremove", "-f", snapdev])
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            pass
+
+    metadata = {"kind": "lvm", "id": snapshot_id, "created_at": timestamp(),
+                "window_ms": round((time.monotonic() - started) * 1000, 1),
+                "source": info["source"], "home": str(mountpoint / "home"),
+                "atomic": True}
+    return Snapshot("lvm", snapshot_id, mountpoint / "home", release, metadata)
+
+
+def _create_btrfs_snapshot(info, kit):
+    snapshot_id = "ubuntu-backup-" + uuid.uuid4().hex[:8]
+    destination = Path("/.ubuntu-backup-snapshot-" + snapshot_id)
+    if destination.exists() or destination.is_symlink():
+        raise SnapshotUnavailable("Btrfs snapshot destination already exists.")
+    started = time.monotonic()
+    result = _snapshot_run(["btrfs", "subvolume", "snapshot", "-r",
+                            info["source"], str(destination)])
+    if not result or result.returncode:
+        detail = (result.stderr or "").strip() if result else "btrfs unavailable"
+        raise SnapshotUnavailable("Btrfs snapshot creation failed: " + detail[-400:])
+    try:
+        destination.chmod(0o700)
+    except OSError:
+        pass
+    source_home = destination if info["source"] == "/home" else destination / "home"
+
+    def release():
+        _snapshot_run(["btrfs", "subvolume", "delete", str(destination)])
+
+    metadata = {"kind": "btrfs", "id": snapshot_id, "created_at": timestamp(),
+                "window_ms": round((time.monotonic() - started) * 1000, 1),
+                "source": info["source"], "home": str(source_home), "atomic": True}
+    return Snapshot("btrfs", snapshot_id, source_home, release, metadata)
+
+
+def _create_zfs_snapshot(info, kit):
+    snapshot_id = "ubuntu-backup-" + uuid.uuid4().hex[:8]
+    name = info["dataset"] + "@" + snapshot_id
+    started = time.monotonic()
+    result = _snapshot_run(["zfs", "snapshot", name])
+    if not result or result.returncode:
+        detail = (result.stderr or "").strip() if result else "zfs unavailable"
+        raise SnapshotUnavailable("ZFS snapshot creation failed: " + detail[-400:])
+    source_home = Path(info["mountpoint"]) / ".zfs/snapshot" / snapshot_id
+    if info["mountpoint"] == "/":
+        source_home = source_home / "home"
+
+    def release():
+        _snapshot_run(["zfs", "destroy", name])
+
+    metadata = {"kind": "zfs", "id": snapshot_id, "created_at": timestamp(),
+                "window_ms": round((time.monotonic() - started) * 1000, 1),
+                "source": info["dataset"], "home": str(source_home), "atomic": True}
+    return Snapshot("zfs", snapshot_id, source_home, release, metadata)
+
+
+def create_home_snapshot(config, kit):
+    """Create a point-in-time source snapshot, or explain why it cannot."""
+    mode = config.get("home_snapshot", "off")
+    if mode == "off":
+        return None
+    detectors = (
+        ("btrfs", _snapshot_btrfs_info, _create_btrfs_snapshot),
+        ("zfs", _snapshot_zfs_info, _create_zfs_snapshot),
+        ("lvm", _snapshot_lvm_info, _create_lvm_snapshot),
+    )
+    for kind, detector, creator in detectors:
+        try:
+            info = detector()
+        except (OSError, subprocess.SubprocessError):
+            info = None
+        if not info:
+            continue
+        try:
+            return creator(info, kit)
+        except SnapshotUnavailable as exc:
+            if mode == "required":
+                raise ConfigError(str(exc)) from None
+            print(f"Warning: {exc}; full /home capture is not atomic.", file=sys.stderr)
+            return None
+    message = "No supported filesystem snapshot is available (need LVM, btrfs, or ZFS)."
+    if mode == "required":
+        raise ConfigError(message)
+    print(f"Warning: {message} Full /home capture is not atomic.", file=sys.stderr)
+    return None
+
+
+@contextmanager
+def home_backup_lock():
+    """One full-/home capture at a time; staging is not safe to share."""
+    try:
+        fd = os.open(KIT / ".home.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise ConfigError(f"Cannot open the full /home backup lock: {exc}") from None
+    with os.fdopen(fd, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ConfigError("A full /home backup is already running; wait for it to finish.") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def root_home_backup(workspace, run_id=None, native_capture=False):
+    global KIT, HOME
+    if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
+        raise ConfigError("Use the confirmed normal-user full /home backup action.")
+    owner = pwd.getpwuid(int(os.environ["SUDO_UID"]))
+    if owner.pw_uid == 0:
+        raise ConfigError("A non-root backup owner is required.")
+    HOME = Path(owner.pw_dir)
+    KIT = Path(workspace).absolute()
+    if HOME not in KIT.parents or ".." in KIT.parts:
+        raise ConfigError("Workspace must be inside the sudo caller's home.")
+    with home_backup_lock():
+        return _root_home_backup_locked(workspace, run_id, native_capture)
+
+
+def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
     global KIT, HOME
     if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
         raise ConfigError("Use the confirmed normal-user full /home backup action.")
@@ -4708,7 +5669,7 @@ def root_home_backup(workspace):
     expected = json.loads((KIT / "config/home-backup-approval.json").read_text())
     actual = home_identity()
     if expected != actual or not actual["hardware"].get("complete"):
-        raise ConfigError("Source hardware/mount identities changed or are unknown; reapprove before backing up.")
+        raise ConfigError("Source hardware/mount identities changed or are unknown; start the backup again.")
     if any(entry["mount"] != "/home" for entry in actual["mounts"]):
         raise ConfigError("Nested /home mounts require separate reviewed filesystem backups.")
     directory = external_directory(config)
@@ -4716,14 +5677,63 @@ def root_home_backup(workspace):
     if os.fstat(fd).st_dev in (Path("/home").stat().st_dev, HOME.stat().st_dev, Path("/").stat().st_dev):
         os.close(fd)
         raise ConfigError("Backup drive must differ from every source filesystem.")
-    command = ["/usr/bin/tar", "--create", "--file=-", "--acls", "--xattrs", "--numeric-owner",
-               "--sparse", "--one-file-system", "--directory=/home"]
+    try:
+        snapshot = create_home_snapshot(config, KIT)
+        if snapshot is not None:
+            try:
+                snapshot.start_supervisor()
+            except OSError as exc:
+                snapshot.release_now()
+                raise ConfigError(f"Cannot start snapshot cleanup supervisor: {exc}") from None
+            source_home = snapshot.source_home
+            print(f"Using {snapshot.kind} source snapshot {snapshot.id}.", file=sys.stderr)
+        else:
+            source_home = Path("/home")
+    except BaseException:
+        os.close(fd)
+        raise
     relative = KIT.relative_to("/home").as_posix()
-    excluded = [relative + "/" + name for name in ("backups", "privileged-system", "restored", "rollback", "profiles", "snapshot", "staging")]
+    excluded = [relative + "/" + name for name in (
+        "backups", ".previous-snapshot", "privileged-system", "restored",
+        "rollback", "profiles", "snapshot", "staging", ".home-snapshot")]
+    if native_capture:
+        try:
+            if marker_record(Path(directory)) is None:
+                raise ConfigError("Backup drive marker is missing or invalid.")
+            native_excluded = list(excluded)
+            for name in ("native-home-entries.ndjson", "native-home-report.json"):
+                native_excluded.append((KIT / name).relative_to("/home").as_posix())
+            command = native_home_command(
+                source_home, Path(directory), run_id, owner.pw_uid, owner.pw_gid,
+                actual, native_excluded)
+            result = subprocess.run(command, capture_output=True, text=True)
+            for line in result.stdout.splitlines():
+                print(line)
+            for line in result.stderr.splitlines():
+                print(line, file=sys.stderr)
+            if result.returncode not in (0, 3):
+                raise ConfigError("Native full /home capture failed with status " + str(result.returncode))
+            if result.returncode == 3:
+                print("Native full /home capture completed with omissions.", file=sys.stderr)
+            report = json.loads((KIT / "native-home-report.json").read_text())
+            print("Native full /home timeline: " + str(report.get("timeline")))
+            return
+        finally:
+            if snapshot is not None:
+                snapshot.close()
+            os.close(fd)
+    command = ["/usr/bin/tar", "--create", "--file=-", "--acls", "--xattrs", "--numeric-owner",
+               "--sparse", "--one-file-system", "--directory=" + str(source_home)]
     for name in excluded:
         command.append("--exclude=./" + name)
     command.append(".")
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except BaseException:
+        if snapshot is not None:
+            snapshot.close()
+        os.close(fd)
+        raise
     os.setgroups([])
     os.setgid(owner.pw_gid)
     os.setuid(owner.pw_uid)
@@ -4740,18 +5750,21 @@ def root_home_backup(workspace):
     try:
         if marker_record(pinned) is None:
             raise ConfigError("Pinned backup drive marker is missing or invalid.")
-        temporary, manifest, created, timelines = capture_home_archive(child.stdout, pinned, actual, excluded)
+        temporary, manifest, created, timelines = capture_home_archive(
+            child.stdout, pinned, actual, excluded,
+            snapshot=snapshot.metadata if snapshot is not None else None)
         status = child.wait()
         thread.join()
         if status or errors:
             raise ConfigError("Strict /home capture failed; old snapshots kept. Stop changing apps and retry. " + errors.decode(errors="replace")[-2000:])
-        result = timelines / ("home-full-" + timestamp())
+        result = timelines / ("home-full-" + run_id_value(run_id))
         if result.exists() or result.is_symlink():
             raise ConfigError("Full /home timeline already exists; refusing overwrite.")
         temporary.rename(result)
         temporary = None
         fsync_directory(timelines)
-        print(f"Full /home verified: {manifest['entry_count']} entries, {len(created)} new objects.")
+        print(f"Full /home verified (checksums): {manifest['entry_count']} entries, "
+              f"{len(created)} new objects.")
     finally:
         if child.poll() is None:
             # The writer has dropped root and must not try to signal a root tar process.
@@ -4765,6 +5778,8 @@ def root_home_backup(workspace):
             shutil.rmtree(temporary)
             clean_created_objects(created)
         shutil.rmtree(KIT / "staging", ignore_errors=True)
+        if snapshot is not None:
+            snapshot.close()
         os.close(fd)
 
 def run_tray():
@@ -4817,9 +5832,11 @@ def run_tray():
     backup_item = Gtk.MenuItem(label="Run backup now")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
+    restore_option = Gtk.MenuItem(label="Restore…")
     drive_option = Gtk.MenuItem(label="Choose backup drive")
     purge_item = Gtk.MenuItem(label="Purge all data")
     options_menu = Gtk.Menu()
+    options_menu.append(restore_option)
     options_menu.append(drive_option)
     options_menu.append(purge_item)
     options_item = Gtk.MenuItem(label="Options")
@@ -4921,9 +5938,13 @@ def run_tray():
             _write_status("failed", "terminal", message)
             _status_history("failed", message)
             return
+        # Leave the result visible briefly without requiring another keypress.
+        inner = (" ".join(shlex.quote(part) for part in command)
+                 + "; status=$?; echo; sleep 8; exit $status")
         terminal_name = os.path.basename(os.path.realpath(terminal))
-        arguments = [terminal, "--", *command] if terminal_name in ("gnome-terminal", "kgx") \
-            else [terminal, "-e", " ".join(shlex.quote(part) for part in command)]
+        arguments = [terminal, "--", "/bin/bash", "-c", inner] \
+            if terminal_name in ("gnome-terminal", "kgx") \
+            else [terminal, "-e", "bash -c " + shlex.quote(inner)]
         return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
 
     drive_cache = {"at": 0.0, "ready": False, "error": None}
@@ -5106,6 +6127,7 @@ def run_tray():
         dialog.set_position(Gtk.WindowPosition.CENTER)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Forget current drive", 2)
+        dialog.add_button("Prepare new drive", 3)
         dialog.add_button("Use drive", Gtk.ResponseType.OK)
         box = dialog.get_content_area()
         box.set_spacing(8)
@@ -5131,6 +6153,9 @@ def run_tray():
         response = dialog.run()
         selected = options[chooser.get_active()][1] if options and chooser.get_active() >= 0 else None
         dialog.destroy()
+        if response == 3:
+            launch_terminal("prepare-drive")
+            return
         try:
             if response == 2:
                 set_external(None, True)
@@ -5239,6 +6264,7 @@ def run_tray():
         return False
 
     backup_item.connect("activate", backup_action)
+    restore_option.connect("activate", lambda _item: launch_terminal("recover"))
     drive_option.connect("activate", show_drive_chooser)
     purge_item.connect("activate", show_purge_dialog)
     live_item.connect("activate", show_status)
@@ -5360,7 +6386,8 @@ def run_tray():
             set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
         else:
             state = data.get("state")
-            set_icon("dialog-information-symbolic" if state == "complete" else
+            set_icon("dialog-warning-symbolic" if data.get("warnings") and state == "complete" else
+                     "dialog-information-symbolic" if state == "complete" else
                      "dialog-error-symbolic" if state == "failed" else
                      "dialog-warning-symbolic" if state == "cancelled" else "media-record-symbolic")
         return True
@@ -5388,3 +6415,5 @@ if __name__ == "__main__":
             tarfile.TarError, EOFError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+    if _EXIT_CODE:
+        sys.exit(_EXIT_CODE)

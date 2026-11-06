@@ -20,7 +20,7 @@ APPS="$DATA/applications"
 ICON="$DATA/icons/hicolor/scalable/apps/ubuntu-backup.svg"
 AUTOSTART="$CONFIG/autostart/ubuntu-backup-tray.desktop"
 WORKSPACES=("$HOME/ubuntu-backup/data" "$HOME/ubuntu-backup-data" "$HOME/ubuntu-configuration")
-FILES=("$BIN/ubuntu-backup.py" "$HOME/ubuntu-backup.py" "$HOME/ubuntu-configuration.py"
+FILES=("$BIN/ubuntu-backup.py" "$BIN/ubackup-core" "$HOME/ubuntu-backup.py" "$HOME/ubuntu-configuration.py"
        "$HOME/ubuntu-backup.zip" "$APPS/ubuntu-backup.desktop" "$AUTOSTART" "$ICON"
        "$CONFIG/systemd/user/ubuntu-configuration-backup.service"
        "$CONFIG/systemd/user/ubuntu-configuration-backup.timer"
@@ -87,27 +87,82 @@ if (( PURGE_BACKUPS )); then
     python3 - "${WORKSPACES[@]}" <<'PY'
 import json, shutil, sys
 from pathlib import Path
+
+LOCAL_DATA = ("backups", "snapshot", ".previous-snapshot", "profiles",
+              "privileged-system", "system-integration-recovery",
+              "restored", "rollback", "staging")
+EXTERNAL_DATA = ("baseline", "timeline", "ubuntu-configuration-backups")
+
+def mountpoints():
+    points = []
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return points
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        point = fields[4]
+        for encoded, char in (("\\040", " "), ("\\011", "\t"),
+                              ("\\012", "\n"), ("\\134", "\\")):
+            point = point.replace(encoded, char)
+        points.append(Path(point))
+    return points
+
+def marker_at(base):
+    marker = Path(base) / ".ubuntu-configuration-target.json"
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        value = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return None
+    if value.get("format") != "ubuntu-configuration-v1":
+        return None
+    return marker
+
 for workspace in map(Path, sys.argv[1:]):
-    for name in ("backups", "snapshot", ".previous-snapshot", "profiles", "privileged-system", "system-integration-recovery"):
+    for name in LOCAL_DATA:
         shutil.rmtree(workspace / name, ignore_errors=True)
     try:
-        value = json.loads((workspace / "config/settings.json").read_text()).get("external_backup")
-    except (OSError, ValueError):
+        settings = json.loads((workspace / "config/settings.json").read_text())
+        value = settings.get("external_backup")
+    except (OSError, ValueError, AttributeError):
         value = None
-    if not isinstance(value, dict) or not value.get("mount_point"):
+    if not isinstance(value, dict):
         continue
-    mount = Path(value["mount_point"])
-    marker = mount / (value.get("subdirectory") or "") / ".ubuntu-configuration-target.json"
-    try:
-        marker_value = json.loads(marker.read_text())
-    except (OSError, ValueError):
+
+    legacy = value.get("mount_point")
+    raw_subdirectory = value.get("subdirectory") or ""
+    if not isinstance(raw_subdirectory, str):
         continue
-    if marker_value.get("format") != "ubuntu-configuration-v1":
+    subdirectory = Path(raw_subdirectory)
+    if subdirectory.is_absolute() or ".." in subdirectory.parts:
         continue
-    root = marker.parent
-    for name in ("baseline", "timeline", "ubuntu-configuration-backups"):
-        shutil.rmtree(root / name, ignore_errors=True)
-    marker.unlink(missing_ok=True)
+    bases = [Path(legacy)] if isinstance(legacy, str) and legacy else mountpoints()
+    matches = []
+    for base in bases:
+        marker = marker_at(base / subdirectory if subdirectory.parts else base)
+        if marker is not None:
+            matches.append(marker)
+    roots = {marker.parent for marker in matches}
+    if not roots:
+        continue
+    if len(roots) > 1:
+        print("Multiple backup markers found; external purge skipped: "
+              + ", ".join(str(root) for root in sorted(roots)), file=sys.stderr)
+        continue
+    root = next(iter(roots))
+    failed = False
+    for name in EXTERNAL_DATA:
+        target = root / name
+        shutil.rmtree(target, ignore_errors=True)
+        failed = failed or target.exists()
+    if failed:
+        print("Could not fully purge external backup data at " + str(root), file=sys.stderr)
+        continue
+    (root / ".ubuntu-configuration-target.json").unlink(missing_ok=True)
     try:
         root.rmdir()
     except OSError:

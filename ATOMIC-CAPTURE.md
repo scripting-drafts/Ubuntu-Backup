@@ -1,7 +1,9 @@
 # Atomic full-`/home` capture
 
-Status: design only. Chosen approach: snapshot the source filesystem before reading it; do not
-try to emulate point-in-time consistency inside the copier.
+Status: opt-in implementation. `home_snapshot` accepts `off` (default), `auto`, or `required`.
+LVM, btrfs and ZFS detection/creation/cleanup are implemented; unsupported filesystems fall back
+to a live read under `auto`, while `required` refuses to start. The copier still never tries to
+emulate point-in-time consistency by itself.
 
 ## Why the current capture is not atomic
 

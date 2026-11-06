@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/ubuntu-backup.py"
-WORKSPACE="$HOME/ubuntu-backup/data"
+WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$HOME/ubuntu-backup/data}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 [[ -x "$BIN" ]] || { echo "Install first: ./install.sh" >&2; exit 1; }
 python3 - "$BIN" <<'PY'
