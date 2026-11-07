@@ -36,8 +36,9 @@ MARKER = "# Managed by ubuntu-configuration v1"
 WORKSPACE_README = '# Ubuntu configuration and backup\n\n- Live tool: `~/ubuntu-backup.py` (private, self-contained, not encrypted).\n- Workspace: keep its settings, snapshots/timelines and rollback journals.\n- Run `./ubuntu-backup.py` for the menu; `./ubuntu-backup.py --help` shows full docs.\n- One backup action captures configuration, development code and full `/home`; identical files are stored once.\n- Each development change records its time, content version and package/library references; reapply follows dependency order and never pins versions.\n- Full recovery stages configuration or full `/home`; live `/home` is never overwritten.\n- External copies use dated symlink timelines over shared baselines.\n- Full `/home` capture is manual, external-drive only, requires sudo approval, and is not auto-pruned.\n- Snapshots contain secrets and are not encrypted. Do not publish them.\n'
 ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
-MAX_FILE = 64 * 1024 * 1024
-MAX_TOTAL = 1024 * 1024 * 1024
+MAX_IN_MEMORY = 64 * 1024 * 1024
+MAX_FILE = 2 * 1024 * 1024 * 1024
+MAX_TOTAL = 8 * 1024 * 1024 * 1024
 STAGING_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 SYSTEM_CONFIG_ROOTS = ("/etc", "/usr/local/etc")
 CONFIG_DATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",
@@ -85,6 +86,30 @@ def write(path, data, executable=False):
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_stream(source, path, executable=False):
+    """Write a file-like object atomically without buffering it in memory."""
+    mkdir(path.parent)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".config-write-", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+            output.flush()
+            os.fchmod(output.fileno(), 0o700 if executable else 0o600)
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_path(source, path, executable=False):
+    with Path(source).open("rb") as stream:
+        write_stream(stream, path, executable)
 
 
 def write_json(path, value):
@@ -377,6 +402,52 @@ def collect_inventory(destination, config, report):
         report["warnings"].append("APT package inventory incomplete; code and configuration capture continues.")
 
 
+def copy_large_selection(source, destination, info, report, executable):
+    """Copy a large configuration file with bounded memory."""
+    if info.st_size > MAX_FILE:
+        report["warnings"].append(
+            f"Skipped oversized file (>{MAX_FILE // (1024 * 1024)} MiB): {source}")
+        report.setdefault("oversized_files", []).append(str(source))
+        return
+    mkdir(destination.parent)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".config-write-", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                total = 0
+                while True:
+                    block = stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > MAX_FILE:
+                        temporary.unlink(missing_ok=True)
+                        report["warnings"].append(
+                            f"Skipped file that grew past the {MAX_FILE // (1024 * 1024)} MiB limit: {source}")
+                        report.setdefault("oversized_files", []).append(str(source))
+                        return
+                    output.write(block)
+                after = os.fstat(stream.fileno())
+            output.flush()
+            os.fchmod(output.fileno(), 0o700 if executable else 0o600)
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    if report["bytes_captured"] + total > MAX_TOTAL:
+        temporary.unlink(missing_ok=True)
+        raise ConfigError(
+            f"Selected configurations exceed the {MAX_TOTAL // (1024 ** 3)} GiB safety limit; "
+            "review excluded application data.")
+    os.replace(temporary, destination)
+    report["bytes_captured"] += total
+    report.setdefault("large_files", []).append(str(source))
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        report["warnings"].append(f"Large configuration changed while being read: {source}")
+
+
 def copy_selection(source, destination, relative, config, report, system=False, skip_kit=False, root_device=None):
     if skip_kit and (source == KIT or KIT in source.parents):
         return
@@ -408,6 +479,10 @@ def copy_selection(source, destination, relative, config, report, system=False, 
                 "Omitted from configuration backup because it exceeds the "
                 f"{MAX_FILE // (1024 * 1024)} MiB per-file limit: {source}")
             report.setdefault("oversized_files", []).append(str(source))
+            return
+        if info.st_size > MAX_IN_MEMORY:
+            copy_large_selection(source, destination, info, report,
+                                 executable=bool(info.st_mode & 0o111))
             return
         fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
@@ -1360,7 +1435,7 @@ def create_dated_snapshot(stage, directory):
                 shared += 1
             else:
                 source = checked_path(stage, name)
-                write(target, source.read_bytes(), bool(record['executable']))
+                write_path(source, target, bool(record['executable']))
         write(destination / 'manifest.json', (stage / 'manifest.json').read_bytes())
         verify_tree(destination)
         for parent, _, _ in os.walk(destination, topdown=False):
@@ -1932,6 +2007,11 @@ def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
     return str(plan["mount_point"])
 
 
+def _stop_mount_retry():
+    """Stop polling once the drive is mounted; the timer re-arms at next login."""
+    subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
+
+
 def mount_saved(check=False, quiet=False):
     """Mount what /etc/fstab declares, then verify the on-disk marker.
 
@@ -1944,6 +2024,8 @@ def mount_saved(check=False, quiet=False):
         return "unset"
     mounted = mounted_backup_drives()
     if mounted:
+        if not check:
+            _stop_mount_retry()
         if not quiet:
             print("Mounted: " + str(mounted[0]["directory"]))
         return "mounted"
@@ -1969,6 +2051,7 @@ def mount_saved(check=False, quiet=False):
             for _attempt in range(6):
                 mounted = mounted_backup_drives()
                 if mounted:
+                    _stop_mount_retry()
                     if not quiet:
                         print("Mounted: " + str(mounted[0]["directory"]))
                     return "mounted"
@@ -2014,6 +2097,7 @@ def mount_saved(check=False, quiet=False):
     if not mounted:
         print("A mount command ran, but no mounted filesystem carries the backup marker.")
         return "failed"
+    _stop_mount_retry()
     if not quiet:
         print("Mounted: " + str(mounted[0]["directory"]))
     return "mounted"
@@ -2444,8 +2528,8 @@ def restore(path=None):
                 sources = regular_files(path)
             for source in sources:
                 name = source.relative_to(path).as_posix()
-                write(checked_path(destination, name), source.read_bytes(),
-                      executable=records.get(name, {}).get("executable", False))
+                write_path(source, checked_path(destination, name),
+                           executable=records.get(name, {}).get("executable", False))
             if manifest.get("storage") == LINKED_STORAGE:
                 write_json(destination / "manifest.json", dict(manifest, storage="local-snapshot"))
         else:
@@ -2453,8 +2537,8 @@ def restore(path=None):
                 for member in archive.getmembers():
                     executable = records.get(member.name, {}).get("executable", False)
                     with archive.extractfile(member) as stream:
-                        write(checked_path(destination, member.name), stream.read(),
-                              executable=executable)
+                        write_stream(stream, checked_path(destination, member.name),
+                                     executable=executable)
         verify_tree(destination)
     except BaseException:
         shutil.rmtree(destination, ignore_errors=True)
@@ -2678,9 +2762,9 @@ def deploy(args):
     for relative in ordered_changed:
         target = checked_path(HOME, relative)
         if target.exists():
-            write(rollback / "home" / relative, target.read_bytes(), bool(target.stat().st_mode & 0o111))
+            write_path(target, rollback / "home" / relative, bool(target.stat().st_mode & 0o111))
         record = next(item for item in records if item["path"] == "home/" + relative)
-        write(target, (source / record["path"]).read_bytes(), record["executable"])
+        write_path(source / record["path"], target, record["executable"])
         if relative in development_paths:
             print(f"Reapplied development: {relative}")
     if ordered_changed:
@@ -5259,6 +5343,7 @@ def native_home_command(source_home, directory, run_id, owner_uid, owner_gid,
                         identity, excluded):
     command = [str(native_core_path()), "scan",
                "--source", str(source_home),
+               "--stage", str(KIT / "staging"),
                "--objects", str(directory / "baseline/home/objects"),
                "--entries", str(KIT / "native-home-entries.ndjson"),
                "--report", str(KIT / "native-home-report.json"),

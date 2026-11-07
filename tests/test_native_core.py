@@ -223,6 +223,54 @@ class NativeCoreTests(unittest.TestCase):
             self.assertEqual(restore_report["special_skipped"], 1)
             self.assertFalse((destination / "pipe").exists())
 
+    def test_stage_refuses_an_unrelated_directory(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "source"
+            source.mkdir()
+            (source / "file.txt").write_text("x\n")
+            stage = base / "stage"
+            stage.mkdir()
+            important = stage / "important.txt"
+            important.write_text("keep\n")
+            result = subprocess.run([
+                str(BINARY), "scan", "--source", str(source),
+                "--stage", str(stage),
+                "--objects", str(base / "objects"),
+                "--entries", str(base / "entries.ndjson"),
+                "--report", str(base / "report.json"),
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("unrecognized stage", result.stderr)
+            self.assertTrue(important.is_file())
+
+    def test_stage_mode_removes_local_stage_and_publishes_timeline(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "source"
+            source.mkdir()
+            for index in range(20):
+                (source / f"file-{index}.txt").write_text(f"data {index}\n")
+            root = base / "root"
+            timeline_parent = root / "timeline/home"
+            timeline_parent.mkdir(parents=True)
+            stage = base / "stage"
+            report = base / "report.json"
+            result = subprocess.run([
+                str(BINARY), "scan", "--source", str(source),
+                "--stage", str(stage),
+                "--objects", str(root / "baseline/home/objects"),
+                "--entries", str(base / "entries.ndjson"),
+                "--report", str(report),
+                "--timeline", str(timeline_parent),
+                "--run-id", "20261107T120000.000000Z",
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(stage.exists())
+            parsed = json.loads(report.read_text())
+            self.assertEqual(parsed["objects_created"], 20)
+            self.reference.verify_home_timeline(Path(parsed["timeline"]))
+
     def test_timeline_is_accepted_by_the_python_verifier(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             base = Path(directory)

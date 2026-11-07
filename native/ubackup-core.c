@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <getopt.h>
+#include <grp.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <openssl/evp.h>
@@ -33,6 +34,7 @@
 #define IO_BUFFER (1024 * 1024)
 #define MAX_DEPTH 4096
 #define HL_BUCKETS 65536
+#define SYNC_INTERVAL 1024
 
 static const unsigned char zero_block[64 * 1024];
 
@@ -41,6 +43,7 @@ typedef struct {
     const char *objects;
     const char *entries_path;
     const char *report_path;
+    const char *stage;
     const char *timeline;
     const char *run_id;
     const char *identity_json;
@@ -96,6 +99,8 @@ static Options options;
 static int source_fd = -1;
 static dev_t source_dev;
 static char *published_timeline = NULL;
+static int objects_sync_fd = -1;
+static uint64_t objects_since_sync;
 static FILE *entries_file;
 static uint64_t entry_count;
 static uint64_t file_count;
@@ -111,6 +116,8 @@ static Omission *omissions;
 static size_t omission_count;
 static size_t omission_capacity;
 static HardLink *hardlinks[HL_BUCKETS];
+
+static void fatal(const char *format, ...) __attribute__((noreturn));
 
 static void fatal(const char *format, ...) {
     va_list args;
@@ -136,6 +143,7 @@ static void usage(void) {
             "  --owner-uid N             chown created files (requires root)\n"
             "  --owner-gid N             chown created files (requires root)\n"
             "  --no-xattrs               Do not capture extended attributes or ACLs\n"
+            "  --stage DIR               Stage objects locally before bulk copy\n"
             "  --timeline DIR            Publish timeline/home/home-full-RUNID\n"
             "  --identity-json JSON      Identity object for the manifest\n"
             "  --exclusions-json JSON    Exclusion list for the manifest\n"
@@ -691,59 +699,112 @@ static void ensure_object_dir(const char *objects) {
     free(incoming);
 }
 
+static void sync_objects(void) {
+    if (objects_sync_fd < 0) {
+        objects_sync_fd = open(options.objects,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (objects_sync_fd < 0) {
+            fatal("cannot open object store for sync: %s", strerror(errno));
+        }
+    }
+    if (syncfs(objects_sync_fd) != 0) {
+        fatal("cannot sync object store: %s", strerror(errno));
+    }
+    objects_since_sync = 0;
+}
+
 static void object_paths(const char *objects, const char *sha256, char **shard, char **path) {
     *shard = xasprintf("%s/%c%c", objects, sha256[0], sha256[1]);
     *path = xasprintf("%s/%s", *shard, sha256);
 }
 
-static void publish_object(int fd, char *temporary, const char *sha256, uint64_t size) {
-    char *shard = NULL;
-    char *destination = NULL;
-    object_paths(options.objects, sha256, &shard, &destination);
+static void verify_existing_object(const char *path, uint64_t size) {
     struct stat info;
-    if (lstat(destination, &info) == 0) {
-        if (S_ISLNK(info.st_mode) || !S_ISREG(info.st_mode) || (uint64_t)info.st_size != size) {
-            close(fd);
+    if (lstat(path, &info) != 0 || S_ISLNK(info.st_mode) ||
+        !S_ISREG(info.st_mode) || (uint64_t)info.st_size != size) {
+        fatal("existing object has the wrong size or type: %s", path);
+    }
+}
+
+static bool publish_with_rename(const char *temporary, const char *destination) {
+    if (renameat2(AT_FDCWD, temporary, AT_FDCWD, destination, RENAME_NOREPLACE) == 0) {
+        return true;
+    }
+    if (errno == EEXIST) {
+        return false;
+    }
+    if (errno == EINVAL || errno == ENOSYS) {
+        if (link(temporary, destination) == 0) {
             unlink(temporary);
-            fatal("existing object has the wrong size or type: %s", destination);
+            return true;
         }
+        if (errno == EEXIST) {
+            return false;
+        }
+    }
+    fatal("cannot publish object %s: %s", destination, strerror(errno));
+}
+
+static void publish_object(int fd, char *temporary, const char *sha256, uint64_t size) {
+    const char *write_root = options.stage ? options.stage : options.objects;
+    char *final_shard = NULL;
+    char *final_destination = NULL;
+    object_paths(options.objects, sha256, &final_shard, &final_destination);
+    if (lstat(final_destination, &(struct stat){0}) == 0) {
+        verify_existing_object(final_destination, size);
         close(fd);
         unlink(temporary);
         objects_reused++;
-    } else if (errno != ENOENT) {
+        free(final_shard);
+        free(final_destination);
+        free(temporary);
+        return;
+    }
+    if (errno != ENOENT) {
         int error = errno;
         close(fd);
         unlink(temporary);
-        fatal("cannot inspect object %s: %s", destination, strerror(error));
-    } else {
-        if (fchmod(fd, 0400) != 0 || fsync(fd) != 0) {
-            int error = errno;
-            close(fd);
-            unlink(temporary);
-            fatal("cannot finalize object %s: %s", temporary, strerror(error));
-        }
+        fatal("cannot inspect object %s: %s", final_destination, strerror(error));
+    }
+    free(final_shard);
+    free(final_destination);
+
+    char *shard = NULL;
+    char *destination = NULL;
+    object_paths(write_root, sha256, &shard, &destination);
+    struct stat shard_info;
+    bool shard_existed = lstat(shard, &shard_info) == 0;
+    if (!shard_existed && errno != ENOENT) {
+        int error = errno;
         close(fd);
-        ensure_dir(shard, 0700);
+        unlink(temporary);
+        fatal("cannot inspect object shard %s: %s", shard, strerror(error));
+    }
+    if (fchmod(fd, 0400) != 0) {
+        int error = errno;
+        close(fd);
+        unlink(temporary);
+        fatal("cannot finalize object %s: %s", temporary, strerror(error));
+    }
+    close(fd);
+    ensure_dir(shard, 0700);
+    if (!options.stage && !shard_existed) {
         maybe_chown_path(shard);
-        if (link(temporary, destination) != 0) {
-            if (errno != EEXIST) {
-                int error = errno;
-                unlink(temporary);
-                fatal("cannot publish object %s: %s", destination, strerror(error));
-            }
-            if (lstat(destination, &info) != 0 || S_ISLNK(info.st_mode) ||
-                !S_ISREG(info.st_mode) || (uint64_t)info.st_size != size) {
-                unlink(temporary);
-                fatal("existing object has the wrong size or type: %s", destination);
-            }
-            unlink(temporary);
-            objects_reused++;
-        } else {
-            unlink(temporary);
+    }
+    bool created = publish_with_rename(temporary, destination);
+    if (!created) {
+        verify_existing_object(destination, size);
+        unlink(temporary);
+        objects_reused++;
+    } else {
+        if (!options.stage) {
             maybe_chown_path(destination);
-            fsync_directory(shard);
-            objects_created++;
+            objects_since_sync++;
+            if (objects_since_sync >= SYNC_INTERVAL) {
+                sync_objects();
+            }
         }
+        objects_created++;
     }
     free(shard);
     free(destination);
@@ -751,7 +812,8 @@ static void publish_object(int fd, char *temporary, const char *sha256, uint64_t
 }
 
 static int make_temporary(char **path) {
-    char *template = xasprintf("%s/%s/obj-XXXXXX", options.objects, INCOMING);
+    const char *write_root = options.stage ? options.stage : options.objects;
+    char *template = xasprintf("%s/%s/obj-XXXXXX", write_root, INCOMING);
     int fd = mkstemp(template);
     if (fd < 0) {
         free(template);
@@ -2661,6 +2723,253 @@ static void publish_timeline(void) {
     free(run_id);
 }
 
+static int remove_tree_callback(const char *path, const struct stat *info,
+                                int flag, struct FTW *walk) {
+    (void)info;
+    (void)flag;
+    (void)walk;
+    if (remove(path) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void remove_tree(const char *path) {
+    struct stat info;
+    if (lstat(path, &info) != 0) {
+        if (errno == ENOENT) return;
+        fatal("cannot inspect %s: %s", path, strerror(errno));
+    }
+    if (nftw(path, remove_tree_callback, 64, FTW_DEPTH | FTW_PHYS) != 0) {
+        fatal("cannot remove %s: %s", path, strerror(errno));
+    }
+}
+
+static void copy_sparse_file_c(int source_fd, int target_fd, uint64_t size) {
+    Segments segments = {0};
+    bool sparse = false;
+    if (size > 0) {
+        if (collect_sparse(source_fd, size, &segments) == 0) {
+            if (!(segments.count == 1 && segments.items[0].offset == 0 &&
+                  segments.items[0].length == size)) {
+                sparse = true;
+            }
+        } else if (errno != EINVAL && errno != ENOTSUP) {
+            int error = errno;
+            free_segments(&segments);
+            fatal("cannot map staged object: %s", strerror(error));
+        }
+    }
+    unsigned char *buffer = xmalloc(IO_BUFFER);
+    if (sparse) {
+        for (size_t index = 0; index < segments.count; index++) {
+            uint64_t offset = segments.items[index].offset;
+            uint64_t remaining = segments.items[index].length;
+            while (remaining) {
+                size_t chunk = remaining > IO_BUFFER ? IO_BUFFER : (size_t)remaining;
+                ssize_t got = pread(source_fd, buffer, chunk, (off_t)offset);
+                if (got <= 0) {
+                    free(buffer);
+                    free_segments(&segments);
+                    fatal("short read from staged object: %s",
+                          strerror(got < 0 ? errno : EIO));
+                }
+                if (write_all(target_fd, buffer, (size_t)got, (off_t)offset, true) != 0) {
+                    free(buffer);
+                    free_segments(&segments);
+                    fatal("cannot copy staged object: %s", strerror(errno));
+                }
+                offset += (uint64_t)got;
+                remaining -= (uint64_t)got;
+            }
+        }
+        if (ftruncate(target_fd, (off_t)size) != 0) {
+            free(buffer);
+            free_segments(&segments);
+            fatal("cannot size copied object: %s", strerror(errno));
+        }
+    } else {
+        if (lseek(source_fd, 0, SEEK_SET) < 0) {
+            free(buffer);
+            fatal("cannot seek staged object: %s", strerror(errno));
+        }
+        uint64_t total = 0;
+        while (total < size) {
+            size_t chunk = size - total > IO_BUFFER ? IO_BUFFER : (size_t)(size - total);
+            ssize_t got = read(source_fd, buffer, chunk);
+            if (got <= 0) {
+                free(buffer);
+                fatal("short read from staged object: %s",
+                      strerror(got < 0 ? errno : EIO));
+            }
+            if (write_all(target_fd, buffer, (size_t)got, (off_t)total, true) != 0) {
+                free(buffer);
+                fatal("cannot copy staged object: %s", strerror(errno));
+            }
+            total += (uint64_t)got;
+        }
+        if (ftruncate(target_fd, (off_t)size) != 0) {
+            free(buffer);
+            fatal("cannot size copied object: %s", strerror(errno));
+        }
+    }
+    free(buffer);
+    free_segments(&segments);
+}
+
+static void bulk_copy_stage(void) {
+    if (!options.stage || strcmp(options.stage, options.objects) == 0) {
+        return;
+    }
+    char *stage_objects = xstrdup(options.stage);
+    DIR *stage_directory = opendir(stage_objects);
+    if (!stage_directory) {
+        fatal("cannot open staged object store %s: %s",
+              stage_objects, strerror(errno));
+    }
+    struct dirent *shard_entry;
+    while ((shard_entry = readdir(stage_directory)) != NULL) {
+        if (strcmp(shard_entry->d_name, ".") == 0 ||
+            strcmp(shard_entry->d_name, "..") == 0 ||
+            strcmp(shard_entry->d_name, INCOMING) == 0) {
+            continue;
+        }
+        if (strlen(shard_entry->d_name) != 2) {
+            continue;
+        }
+        char *stage_shard = xasprintf("%s/%s", stage_objects, shard_entry->d_name);
+        DIR *shard_directory = opendir(stage_shard);
+        if (!shard_directory) {
+            fatal("cannot open staged shard %s: %s", stage_shard, strerror(errno));
+        }
+        struct dirent *object_entry;
+        while ((object_entry = readdir(shard_directory)) != NULL) {
+            if (strcmp(object_entry->d_name, ".") == 0 ||
+                strcmp(object_entry->d_name, "..") == 0) {
+                continue;
+            }
+            if (!valid_sha256(object_entry->d_name)) {
+                fatal("unexpected staged object name: %s", object_entry->d_name);
+            }
+            char *source = xasprintf("%s/%s", stage_shard, object_entry->d_name);
+            struct stat source_info;
+            if (lstat(source, &source_info) != 0 || !S_ISREG(source_info.st_mode) ||
+                S_ISLNK(source_info.st_mode)) {
+                fatal("unexpected staged object: %s", source);
+            }
+            char *target_shard = xasprintf("%s/%s", options.objects, shard_entry->d_name);
+            char *target = xasprintf("%s/%s", target_shard, object_entry->d_name);
+            struct stat target_info;
+            if (lstat(target, &target_info) == 0) {
+                if (!S_ISREG(target_info.st_mode) || S_ISLNK(target_info.st_mode) ||
+                    target_info.st_size != source_info.st_size) {
+                    fatal("existing object has the wrong size or type: %s", target);
+                }
+                free(target);
+                free(target_shard);
+                free(source);
+                continue;
+            }
+            if (errno != ENOENT) {
+                fatal("cannot inspect target object %s: %s", target, strerror(errno));
+            }
+            ensure_dir(target_shard, 0700);
+            char *template = xasprintf("%s/.copy-XXXXXX", target_shard);
+            int target_fd = mkstemp(template);
+            if (target_fd < 0) {
+                fatal("cannot create copy temporary in %s: %s",
+                      target_shard, strerror(errno));
+            }
+            int source_fd = open(source, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (source_fd < 0) {
+                int error = errno;
+                close(target_fd);
+                unlink(template);
+                fatal("cannot open staged object %s: %s", source, strerror(error));
+            }
+            copy_sparse_file_c(source_fd, target_fd, (uint64_t)source_info.st_size);
+            close(source_fd);
+            if (fchmod(target_fd, 0400) != 0) {
+                fatal("cannot protect copied object %s: %s", target, strerror(errno));
+            }
+            close(target_fd);
+            if (!publish_with_rename(template, target)) {
+                struct stat copied;
+                if (lstat(target, &copied) != 0 || !S_ISREG(copied.st_mode) ||
+                    S_ISLNK(copied.st_mode) ||
+                    copied.st_size != source_info.st_size) {
+                    unlink(template);
+                    fatal("existing object has the wrong size or type: %s", target);
+                }
+                unlink(template);
+            }
+            free(template);
+            free(target);
+            free(target_shard);
+            free(source);
+        }
+        closedir(shard_directory);
+        free(stage_shard);
+    }
+    closedir(stage_directory);
+    free(stage_objects);
+}
+
+static void drop_to_owner(void) {
+    if (!options.have_owner || geteuid() != 0) {
+        return;
+    }
+    if (options.owner_uid < 0 || options.owner_gid < 0) {
+        fatal("staged root capture requires both owner uid and gid");
+    }
+    if (options.stage) {
+        maybe_chown_tree(options.stage);
+    }
+    if (setgroups(0, NULL) != 0 ||
+        setgid((gid_t)options.owner_gid) != 0 ||
+        setuid((uid_t)options.owner_uid) != 0) {
+        fatal("cannot drop to backup owner: %s", strerror(errno));
+    }
+    options.have_owner = false;
+}
+
+static bool is_hex_component(const char *name) {
+    if (strlen(name) != 2) return false;
+    return isxdigit((unsigned char)name[0]) && isxdigit((unsigned char)name[1]);
+}
+
+static void prepare_stage_directory(const char *stage) {
+    struct stat info;
+    if (lstat(stage, &info) != 0) {
+        if (errno == ENOENT) {
+            return;
+        }
+        fatal("cannot inspect stage %s: %s", stage, strerror(errno));
+    }
+    if (S_ISLNK(info.st_mode) || !S_ISDIR(info.st_mode)) {
+        fatal("stage is not a real directory: %s", stage);
+    }
+    DIR *directory = opendir(stage);
+    if (!directory) {
+        fatal("cannot open stage %s: %s", stage, strerror(errno));
+    }
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0 ||
+            strcmp(entry->d_name, ".incoming") == 0 ||
+            strcmp(entry->d_name, "objects") == 0 ||
+            strcmp(entry->d_name, "incoming") == 0 ||
+            is_hex_component(entry->d_name)) {
+            continue;
+        }
+        closedir(directory);
+        fatal("refusing to remove unrecognized stage directory: %s", stage);
+    }
+    closedir(directory);
+    remove_tree(stage);
+}
+
 static int scan_main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "scan") != 0) {
         usage();
@@ -2680,6 +2989,7 @@ static int scan_main(int argc, char **argv) {
         {"owner-uid", required_argument, NULL, 'u'},
         {"owner-gid", required_argument, NULL, 'g'},
         {"no-xattrs", no_argument, NULL, 'q'},
+        {"stage", required_argument, NULL, 'S'},
         {"timeline", required_argument, NULL, 't'},
         {"identity-json", required_argument, NULL, 'd'},
         {"exclusions-json", required_argument, NULL, 'j'},
@@ -2702,6 +3012,7 @@ static int scan_main(int argc, char **argv) {
         case 'u': parse_id(optarg, &options.owner_uid, "owner uid"); break;
         case 'g': parse_id(optarg, &options.owner_gid, "owner gid"); break;
         case 'q': options.no_xattrs = true; break;
+        case 'S': options.stage = optarg; break;
         case 't': options.timeline = optarg; break;
         case 'd': options.identity_json = optarg; break;
         case 'j': options.exclusions_json = optarg; break;
@@ -2735,10 +3046,33 @@ static int scan_main(int argc, char **argv) {
     }
     source_dev = source_info.st_dev;
 
+    if (options.stage && strcmp(options.stage, options.objects) == 0) {
+        options.stage = NULL;
+    }
+    if (options.stage) {
+        size_t stage_length = strlen(options.stage);
+        if (strcmp(options.stage, "/") == 0 ||
+            strcmp(options.stage, options.source) == 0 ||
+            strcmp(options.stage, options.objects) == 0 ||
+            (strncmp(options.source, options.stage, stage_length) == 0 &&
+             options.source[stage_length] == '/')) {
+            fatal("stage must not be the source, object store, filesystem root, or a parent of the source");
+        }
+        prepare_stage_directory(options.stage);
+        ensure_object_dir(options.stage);
+    }
     ensure_object_dir(options.objects);
     open_entries();
     scan_directory(source_fd, "", 0);
     close_entries();
+    if (options.stage) {
+        drop_to_owner();
+        bulk_copy_stage();
+        sync_objects();
+        remove_tree(options.stage);
+    } else {
+        sync_objects();
+    }
     publish_timeline();
     write_report();
 

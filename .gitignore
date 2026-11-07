@@ -12,6 +12,7 @@
 !tests/*.py
 !native/
 !native/*.c
+!native/*.py
 !native/Makefile
 !native/*.md
 !extension/

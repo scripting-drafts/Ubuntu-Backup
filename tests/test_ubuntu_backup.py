@@ -418,6 +418,26 @@ class UnreadableHomeTests(unittest.TestCase):
             backup.verify_tree(destination)
 
 
+class LargeConfigurationTests(unittest.TestCase):
+    def test_large_file_uses_bounded_memory_copy(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "large.bin"
+            source.write_bytes(b"large configuration\n" * 3)
+            destination = base / "snapshot" / "large.bin"
+            report = {"warnings": [], "symlinks_not_followed": [], "bytes_captured": 0}
+            saved = backup.MAX_IN_MEMORY, backup.MAX_FILE, backup.MAX_TOTAL
+            backup.MAX_IN_MEMORY, backup.MAX_FILE, backup.MAX_TOTAL = 10, 1024, 4096
+            try:
+                backup.copy_selection(source, destination, "large.bin",
+                                      {"exclude": []}, report)
+            finally:
+                backup.MAX_IN_MEMORY, backup.MAX_FILE, backup.MAX_TOTAL = saved
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(report["bytes_captured"], source.stat().st_size)
+            self.assertEqual(report["large_files"], [str(source)])
+
+
 class DevelopmentCaptureTests(unittest.TestCase):
     def test_detected_checkout_is_captured_without_artifact_trees(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -935,6 +955,8 @@ class NativeCaptureFlagTests(unittest.TestCase):
             self.assertIn("--timeline", command)
             self.assertEqual(command[command.index("--timeline") + 1],
                              "/media/backup/timeline/home")
+            self.assertEqual(command[command.index("--stage") + 1],
+                             str(backup.KIT / "staging"))
             self.assertEqual(command[command.index("--owner-uid") + 1], "1000")
             self.assertIn("--exclude-prefix", command)
             self.assertEqual(command[command.index("--identity-json") + 1],
