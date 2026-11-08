@@ -1,6 +1,7 @@
 """Regression tests for the safety-critical helpers in ubuntu-backup.py."""
 
 import argparse
+import base64
 from collections import namedtuple
 from contextlib import redirect_stderr, redirect_stdout
 import gzip
@@ -781,7 +782,23 @@ class PackageIntegrityTests(unittest.TestCase):
             self.assertEqual(len(rollback), 1)
             self.assertEqual(rollback[0].read_bytes(), current)
 
-    def test_restore_worker_refuses_a_changed_destination(self):
+    def test_package_integrity_captures_xattrs(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            modified = base / "modified.bin"
+            modified.write_bytes(b"patched")
+            try:
+                os.setxattr(modified, "user.demo", b"value")
+            except OSError:
+                self.skipTest("user xattrs are unavailable")
+            manifest = backup.package_integrity(
+                base / "inventory", {}, verify_output=f"??5?????? {modified}\n",
+                owners={str(modified): "demo"}, conffiles=set())
+            record = manifest["records"][0]
+            self.assertEqual(record["xattrs"]["user.demo"],
+                             base64.b64encode(b"value").decode("ascii"))
+
+    def test_restore_worker_restores_xattrs(self):
         from unittest import mock
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             base = Path(directory)
@@ -798,6 +815,41 @@ class PackageIntegrityTests(unittest.TestCase):
                 "force": False, "records": [{
                     "package": "demo", "destination": str(destination),
                     "source": str(snapshot / "inventory/package-files" / sha256),
+                    "sha256": sha256,
+                    "current_sha": hashlib.sha256(b"current").hexdigest(),
+                    "mode": 0o640, "uid": os.getuid(), "gid": os.getgid(),
+                    "xattrs": {"user.demo": base64.b64encode(b"cap").decode("ascii")},
+                }],
+            }
+            plan_path = workspace / "plans/restore.json"
+            plan_path.write_text(json.dumps(plan))
+            with mock.patch.object(backup.os, "geteuid", return_value=0), \
+                 mock.patch.object(backup.os, "chown"), \
+                 mock.patch.object(backup.os, "fchown"), \
+                 mock.patch.object(backup, "_dpkg_owner", return_value={"demo"}):
+                backup.restore_package_files_worker(plan_path, workspace)
+            try:
+                self.assertEqual(os.getxattr(destination, "user.demo"), b"cap")
+            except OSError:
+                self.skipTest("user xattrs are unavailable")
+
+    def test_restore_worker_refuses_a_changed_destination(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            workspace, snapshot = base / "workspace", base / "snapshot"
+            (workspace / "plans").mkdir(parents=True)
+            (snapshot / "inventory/package-files").mkdir(parents=True)
+            content = b"restored content"
+            sha256 = hashlib.sha256(content).hexdigest()
+            (snapshot / "inventory/package-files" / sha256).write_bytes(content)
+            destination = base / "target.bin"
+            destination.write_bytes(b"current")
+            plan = {
+                "format": "ubuntu-package-restore-plan-v1", "snapshot": str(snapshot),
+                "force": True, "records": [{
+                    "package": "demo", "destination": str(destination),
+                    "source": str(snapshot / "inventory/package-files" / sha256),
                     "sha256": sha256, "current_sha": "different",
                     "mode": 0o640, "uid": os.getuid(), "gid": os.getgid(),
                 }],
@@ -810,6 +862,88 @@ class PackageIntegrityTests(unittest.TestCase):
                 with self.assertRaises(backup.ConfigError):
                     backup.restore_package_files_worker(plan_path, workspace)
             self.assertEqual(destination.read_bytes(), b"current")
+
+    def test_capture_worker_publishes_privileged_cache(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+
+            def fake_integrity(destination, report):
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / "package-integrity.json").write_text("{}")
+                return {"counts": {"total": 2, "captured": 1}, "captured_bytes": 10}
+
+            with mock.patch.object(backup.os, "geteuid", return_value=0), \
+                 mock.patch.object(backup.os, "chown"), \
+                 mock.patch.object(backup, "package_integrity", side_effect=fake_integrity), \
+                 mock.patch.object(backup, "conffile_drift", return_value={
+                     "checked": 1, "modified": [], "unreadable": [],
+                     "missing": [], "obsolete": 0}):
+                backup.capture_package_files_worker(workspace)
+            cache = workspace / "privileged-package-scan"
+            self.assertTrue((cache / "package-integrity.json").is_file())
+            self.assertTrue((cache / "package-conffiles.json").is_file())
+
+    def test_merge_privileged_scan_adds_root_only_and_replaces_unreadable(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            workspace, cache = base / "workspace", base / "workspace/privileged-package-scan"
+            (cache / "package-files").mkdir(parents=True)
+            root_content, user_content = b"root only", b"user file"
+            root_sha = hashlib.sha256(root_content).hexdigest()
+            user_sha = hashlib.sha256(user_content).hexdigest()
+            (cache / "package-files" / root_sha).write_bytes(root_content)
+            (cache / "package-files" / user_sha).write_bytes(user_content)
+            now = backup.dt.datetime.now(backup.dt.timezone.utc).isoformat()
+            (cache / "package-integrity.json").write_text(json.dumps({
+                "format": "ubuntu-package-integrity-v1", "captured_at": now,
+                "records": [
+                    {"path": "/usr/bin/rootonly", "package": "demo", "captured": True,
+                     "sha256": root_sha, "size": len(root_content), "mode": 0o755,
+                     "uid": 0, "gid": 0, "flags": "??5??????", "conffile": False},
+                    {"path": "/usr/bin/userfile", "package": "demo", "captured": True,
+                     "sha256": user_sha, "size": len(user_content), "mode": 0o755,
+                     "uid": 0, "gid": 0, "flags": "??5??????", "conffile": False},
+                ], "counts": {}}))
+            (cache / "package-conffiles.json").write_text(json.dumps({
+                "checked": 2, "modified": [{"package": "gdm3", "path": "/etc/gdm3/custom.conf"}],
+                "modified_packages": ["gdm3"], "unreadable": [], "missing": [], "obsolete": 0}))
+            inventory = base / "snapshot/inventory"
+            inventory.mkdir(parents=True)
+            unreadable = {"path": "/usr/bin/userfile", "package": "demo", "captured": False,
+                          "flags": "??5??????", "conffile": False,
+                          "note": "Permission denied", "reason": "unreadable without root"}
+            (inventory / "package-integrity.json").write_text(json.dumps({
+                "format": "ubuntu-package-integrity-v1", "records": [unreadable],
+                "counts": backup.package_integrity_counts([unreadable])}))
+            (inventory / "package-conffiles.json").write_text(json.dumps({
+                "checked": 1, "modified": [], "modified_packages": [],
+                "unreadable": [{"package": "gdm3", "path": "/etc/gdm3/custom.conf"}],
+                "missing": [], "obsolete": 0}))
+            (inventory / "package-delta.json").write_text(json.dumps({
+                "modified": {"conffiles": 0}, "counts": {"modified_conffiles": 0}}))
+            saved = backup.KIT
+            backup.KIT = workspace
+            try:
+                report = {"warnings": []}
+                self.assertTrue(backup.merge_privileged_package_scan(base / "snapshot", report))
+            finally:
+                backup.KIT = saved
+            merged = json.loads((inventory / "package-integrity.json").read_text())
+            by_path = {record["path"]: record for record in merged["records"]}
+            self.assertTrue(by_path["/usr/bin/rootonly"]["captured"])
+            self.assertTrue(by_path["/usr/bin/userfile"]["captured"])
+            self.assertEqual(by_path["/usr/bin/userfile"]["source"], "privileged-scan")
+            self.assertEqual((inventory / "package-files" / root_sha).read_bytes(), root_content)
+            self.assertEqual(merged["counts"]["captured"], 2)
+            conffiles = json.loads((inventory / "package-conffiles.json").read_text())
+            self.assertEqual(conffiles["modified"],
+                             [{"package": "gdm3", "path": "/etc/gdm3/custom.conf"}])
+            self.assertEqual(conffiles["unreadable"], [])
+            delta = json.loads((inventory / "package-delta.json").read_text())
+            self.assertEqual(delta["counts"]["modified_package_files"], 2)
+            self.assertEqual(delta["counts"]["modified_conffiles"], 1)
 
     def test_package_file_plan_detects_already_conflict_and_force(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:

@@ -4,6 +4,7 @@
 """Capture and redeploy a private, upgrade-conscious Ubuntu configuration kit."""
 
 import argparse
+import base64
 from contextlib import contextmanager
 import datetime as dt
 import fcntl
@@ -39,6 +40,9 @@ ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
 PACKAGE_FILE_MAX = 64 * 1024 * 1024
 PACKAGE_FILE_TOTAL = 256 * 1024 * 1024
+XATTR_MAX = 64 * 1024
+XATTR_PREFIXES = ("user.", "system.posix_acl_")
+XATTR_EXACT = {"security.capability"}
 MAX_IN_MEMORY = 64 * 1024 * 1024
 MAX_FILE = 2 * 1024 * 1024 * 1024
 MAX_TOTAL = 8 * 1024 * 1024 * 1024
@@ -602,9 +606,82 @@ def conffile_drift(status_path=Path("/var/lib/dpkg/status")):
             "unreadable": unreadable, "missing": missing, "obsolete": obsolete}
 
 
+def read_xattrs(path):
+    """Capture file xattrs as base64 with a bounded total size."""
+    values = {}
+    try:
+        names = os.listxattr(path, follow_symlinks=False)
+    except OSError as error:
+        return values, f"xattrs unavailable: {error}"
+    total = 0
+    for name in names:
+        try:
+            value = os.getxattr(path, name, follow_symlinks=False)
+        except OSError as error:
+            return values, f"xattr {name}: {error}"
+        total += len(value)
+        if total > XATTR_MAX:
+            return values, "xattr size limit reached"
+        values[name] = base64.b64encode(value).decode("ascii")
+    return values, ""
+
+
+def xattr_allowed(name):
+    return name in XATTR_EXACT or any(name.startswith(prefix) for prefix in XATTR_PREFIXES)
+
+
+def apply_xattrs(path, mapping):
+    """Apply supported xattrs; capabilities and POSIX ACLs require root."""
+    errors = []
+    for name, encoded in sorted((mapping or {}).items()):
+        if not isinstance(name, str) or not isinstance(encoded, str) or not xattr_allowed(name):
+            errors.append(f"unsupported xattr {name}")
+            continue
+        try:
+            os.setxattr(path, name, base64.b64decode(encoded), follow_symlinks=False)
+        except (OSError, ValueError) as error:
+            errors.append(f"{name}: {error}")
+    return errors
+
+
+def package_integrity_counts(records):
+    count = {"total": 0, "modified_files": 0, "modified_packages": 0,
+             "conffiles": 0, "captured": 0, "unverified": 0,
+             "unreadable": 0, "missing": 0, "metadata_changes": 0}
+    packages = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        flags, note = str(record.get("flags", "")), str(record.get("note", ""))
+        package, conffile = record.get("package"), bool(record.get("conffile"))
+        count["total"] += 1
+        if not package:
+            continue
+        if conffile:
+            count["conffiles"] += 1
+        elif "Permission denied" in note:
+            count["unreadable"] += 1
+        elif flags == "?????????":
+            count["unverified"] += 1
+        elif flags == "missing":
+            count["missing"] += 1
+            count["modified_files"] += 1
+            packages.add(package)
+        elif any(flag in flags for flag in "5S"):
+            count["modified_files"] += 1
+            packages.add(package)
+        else:
+            count["metadata_changes"] += 1
+        if record.get("captured"):
+            count["captured"] += 1
+    count["modified_packages"] = len(packages)
+    return count
+
+
 def package_integrity(destination, report, verify_output=None, owners=None, conffiles=None):
     """Scan package files, capture modified non-conffile contents, and report."""
     manifest = {"format": "ubuntu-package-integrity-v1", "available": False,
+                "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "caution": "Captured bytes are the modified files at scan time, not vendor originals.",
                 "max_file_bytes": PACKAGE_FILE_MAX, "max_total_bytes": PACKAGE_FILE_TOTAL,
                 "records": [], "warnings": []}
@@ -627,10 +704,7 @@ def package_integrity(destination, report, verify_output=None, owners=None, conf
             manifest["warnings"].append(f"dpkg verify exited with {result.returncode}")
     owners = dpkg_owners() if owners is None else owners
     conffiles = dpkg_conffiles() if conffiles is None else conffiles
-    count = {"total": 0, "modified_files": 0, "modified_packages": 0,
-             "conffiles": 0, "captured": 0, "unverified": 0,
-             "unreadable": 0, "missing": 0, "metadata_changes": 0}
-    packages, captured_total, seen = set(), 0, set()
+    captured_total, seen = 0, set()
     for item in parse_dpkg_verify(verify_output):
         path = item["path"]
         if path in seen:
@@ -640,20 +714,15 @@ def package_integrity(destination, report, verify_output=None, owners=None, conf
         record = {"path": path, "package": package, "flags": item["flags"],
                   "conffile": bool(item["conffile"] or path in conffiles),
                   "note": item["note"], "captured": False}
-        count["total"] += 1
         if not package:
             record["reason"] = "not owned by an installed package"
         elif record["conffile"]:
-            count["conffiles"] += 1
             record["reason"] = "conffile; captured by the configuration backup"
         elif "Permission denied" in item["note"]:
-            count["unreadable"] += 1
             record["reason"] = "unreadable without root"
         elif item["flags"] == "?????????":
-            count["unverified"] += 1
             record["reason"] = "verification unavailable"
         elif item["flags"] == "missing":
-            count["missing"] += 1
             record["reason"] = "missing; reinstall the package"
         elif not any(flag in item["flags"] for flag in "5S"):
             record["reason"] = "metadata-only change"
@@ -679,19 +748,15 @@ def package_integrity(destination, report, verify_output=None, owners=None, conf
                 sha256 = hashlib.sha256(data).hexdigest()
                 write(destination / "package-files" / sha256, data)
                 captured_total += len(data)
+                xattrs, xattr_warning = read_xattrs(path)
                 record.update({"captured": True, "sha256": sha256,
                                "size": len(data), "mode": stat.S_IMODE(before.st_mode),
-                               "uid": before.st_uid, "gid": before.st_gid})
-        if package and not record["conffile"] and "Permission denied" not in item["note"]:
-            if item["flags"] == "missing" or any(flag in item["flags"] for flag in "5S"):
-                count["modified_files"] += 1
-                packages.add(package)
-            elif item["flags"] != "?????????":
-                count["metadata_changes"] += 1
-        if record["captured"]:
-            count["captured"] += 1
+                               "uid": before.st_uid, "gid": before.st_gid,
+                               "xattrs": xattrs})
+                if xattr_warning:
+                    record["xattr_warning"] = xattr_warning
         manifest["records"].append(record)
-    count["modified_packages"] = len(packages)
+    count = package_integrity_counts(manifest["records"])
     manifest.update({"available": True, "captured_bytes": captured_total,
                      "counts": count})
     if count["unreadable"]:
@@ -767,6 +832,12 @@ def restore_package_files(snapshot=None, apply=False, packages=None, paths=None,
     records = data.get("records", []) if isinstance(data, dict) else []
     if isinstance(data, dict) and data.get("counts", {}).get("conffiles"):
         print("Conffiles are reported separately; restore them through the configuration snapshot.")
+    missing_packages = sorted({record.get("package") for record in records
+                               if isinstance(record, dict) and record.get("flags") == "missing"
+                               and record.get("package")})
+    if missing_packages:
+        print("Missing package files require reinstall: " + ", ".join(missing_packages))
+        print("Vendor files: sudo apt-get install --reinstall " + " ".join(missing_packages))
     plan = package_file_plan(source, records, packages, paths, force)
     if not plan:
         print("No captured modified package files matched.")
@@ -870,13 +941,15 @@ def restore_package_files_worker(plan_path, workspace):
             if info is not None and (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)):
                 raise ConfigError("destination is not a regular file")
             current_sha = digest(destination) if info is not None else None
-            if current_sha != record.get("current_sha") and not plan.get("force"):
+            if current_sha != record.get("current_sha"):
                 raise ConfigError("destination changed after review; re-run the restore")
             if info is not None:
                 rollback = rollback_root / destination.relative_to("/")
                 mkdir(rollback.parent)
+                current_xattrs, _ = read_xattrs(destination)
                 shutil.copy2(destination, rollback)
                 os.chown(rollback, owner_uid, owner_gid)
+                apply_xattrs(rollback, current_xattrs)
             with tempfile.NamedTemporaryFile(dir=destination.parent,
                                              prefix=".package-restore-", delete=False) as output:
                 temporary = Path(output.name)
@@ -897,12 +970,16 @@ def restore_package_files_worker(plan_path, workspace):
                 temporary.unlink(missing_ok=True)
             if digest(destination) != sha256:
                 raise ConfigError("restored content failed verification")
+            xattr_errors = apply_xattrs(destination, record.get("xattrs"))
+            if xattr_errors:
+                print(f"Warning: xattrs not fully restored for {destination}: "
+                      + "; ".join(xattr_errors), file=sys.stderr)
         except (ConfigError, OSError, ValueError) as error:
             failed.append({"package": package, "path": str(destination),
                            "reason": str(error)})
         else:
             restored.append({"package": package, "path": str(destination),
-                             "sha256": sha256})
+                             "sha256": sha256, "xattr_errors": xattr_errors})
     for directory, _, _ in os.walk(rollback_root, topdown=False):
         try:
             os.chown(directory, owner_uid, owner_gid)
@@ -923,6 +1000,193 @@ def restore_package_files_worker(plan_path, workspace):
               file=sys.stderr)
     if failed:
         raise ConfigError(f"{len(failed)} package file(s) failed to restore.")
+
+
+def capture_package_files_worker(workspace):
+    """Root-only worker: scan every package file and cache modified contents."""
+    if os.geteuid() != 0:
+        raise ConfigError("The package-file capture worker must run as root.")
+    workspace = Path(workspace)
+    if workspace.is_symlink() or not workspace.is_dir():
+        raise ConfigError("Invalid workspace for package-file capture.")
+    owner_uid, owner_gid = workspace.stat().st_uid, workspace.stat().st_gid
+    if owner_uid == 0:
+        raise ConfigError("Refusing a root-owned workspace.")
+    staging = workspace / (".privileged-package-scan-" + uuid.uuid4().hex)
+    cache = workspace / "privileged-package-scan"
+    report = {"warnings": []}
+    try:
+        manifest = package_integrity(staging, report)
+        write_json(staging / "package-conffiles.json", conffile_drift())
+        for warning in report["warnings"]:
+            print("Warning: " + warning, file=sys.stderr)
+        for directory, _, files in os.walk(staging):
+            os.chown(directory, owner_uid, owner_gid)
+            for name in files:
+                os.chown(Path(directory) / name, owner_uid, owner_gid)
+        previous = workspace / (".privileged-package-scan-old-" + uuid.uuid4().hex)
+        if cache.exists():
+            if cache.is_symlink() or not cache.is_dir():
+                raise ConfigError("Refusing an invalid package-scan cache.")
+            cache.rename(previous)
+        published = False
+        try:
+            staging.rename(cache)
+            published = True
+        except BaseException:
+            if previous.exists() and not cache.exists():
+                previous.rename(cache)
+            raise
+        finally:
+            if published:
+                shutil.rmtree(previous, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    counts = manifest.get("counts", {})
+    print(f"Privately scanned {counts.get('total', 0)} package paths; "
+          f"captured {counts.get('captured', 0)} modified file(s), "
+          f"{manifest.get('captured_bytes', 0)} bytes.")
+
+
+def merge_privileged_package_scan(destination, report):
+    """Merge the last root package scan into the snapshot inventory."""
+    cache = KIT / "privileged-package-scan"
+    manifest_path = cache / "package-integrity.json"
+    if not manifest_path.is_file():
+        report["warnings"].append(
+            "No privileged package scan cache; root-only package files are not captured. "
+            "Run capture-package-files.")
+        return False
+    try:
+        privileged = json.loads(manifest_path.read_text())
+    except (OSError, ValueError) as error:
+        report["warnings"].append(f"Privileged package scan is unreadable: {error}")
+        return False
+    if not isinstance(privileged, dict):
+        return False
+    captured_at = privileged.get("captured_at")
+    age = None
+    if captured_at:
+        try:
+            age = round((dt.datetime.now(dt.timezone.utc)
+                         - dt.datetime.fromisoformat(captured_at)).total_seconds() / 3600, 1)
+        except ValueError:
+            age = None
+    if age is not None and age > 26:
+        report["warnings"].append(
+            f"Privileged package scan cache is {age} hours old; run capture-package-files.")
+    inventory = destination / "inventory"
+    user_path = inventory / "package-integrity.json"
+    try:
+        user = json.loads(user_path.read_text()) if user_path.is_file() else {}
+    except (OSError, ValueError):
+        user = {}
+    records = user.get("records", []) if isinstance(user, dict) else []
+    records = [record for record in records if isinstance(record, dict)]
+    by_path = {record.get("path"): index for index, record in enumerate(records)}
+    content_dir = inventory / "package-files"
+    for record in privileged.get("records", []):
+        if not isinstance(record, dict) or not record.get("path"):
+            continue
+        if record.get("captured") and record.get("sha256"):
+            source = cache / "package-files" / record["sha256"]
+            target = content_dir / record["sha256"]
+            if source.is_file() and not target.exists():
+                write_path(source, target)
+        path = record["path"]
+        if path not in by_path:
+            merged = dict(record, source="privileged-scan")
+            by_path[path] = len(records)
+            records.append(merged)
+        elif not records[by_path[path]].get("captured") and record.get("captured"):
+            merged = dict(records[by_path[path]])
+            for key in ("captured", "sha256", "size", "mode", "uid", "gid", "xattrs",
+                        "flags", "note", "package", "conffile", "reason", "xattr_warning"):
+                if key in record:
+                    merged[key] = record[key]
+            if record.get("captured"):
+                merged["note"] = record.get("note", "")
+                merged.pop("reason", None)
+            merged["source"] = "privileged-scan"
+            records[by_path[path]] = merged
+        elif record.get("captured") and record.get("xattrs") is not None:
+            existing = records[by_path[path]]
+            if existing.get("sha256") == record.get("sha256"):
+                merged = dict(existing, xattrs=record["xattrs"],
+                              source="privileged-scan")
+                merged.pop("xattr_warning", None)
+                records[by_path[path]] = merged
+    counts = package_integrity_counts(records)
+    user.update({"format": "ubuntu-package-integrity-v1", "available": True,
+                 "records": records, "counts": counts,
+                 "privileged_scan_age_hours": age})
+    write_json(user_path, user)
+    conf_path = cache / "package-conffiles.json"
+    if conf_path.is_file():
+        try:
+            root_conf = json.loads(conf_path.read_text())
+            user_conf_path = inventory / "package-conffiles.json"
+            user_conf = json.loads(user_conf_path.read_text()) if user_conf_path.is_file() else {}
+            modified = {(item.get("package"), item.get("path")): item
+                        for item in user_conf.get("modified", []) if isinstance(item, dict)}
+            for item in root_conf.get("modified", []):
+                if isinstance(item, dict):
+                    modified[(item.get("package"), item.get("path"))] = item
+            user_conf["modified"] = sorted(modified.values(),
+                                           key=lambda item: (item.get("package") or "", item.get("path") or ""))
+            user_conf["modified_packages"] = sorted({item.get("package") for item in user_conf["modified"]
+                                                     if item.get("package")})
+            user_conf["unreadable"] = root_conf.get("unreadable", [])
+            user_conf["missing"] = root_conf.get("missing", [])
+            user_conf["obsolete"] = root_conf.get("obsolete", 0)
+            user_conf["checked"] = max(user_conf.get("checked", 0), root_conf.get("checked", 0))
+            user_conf["source"] = "privileged-scan"
+            write_json(user_conf_path, user_conf)
+        except (OSError, ValueError, TypeError) as error:
+            report["warnings"].append(f"Privileged conffile scan merge failed: {error}")
+    delta_path = inventory / "package-delta.json"
+    if delta_path.is_file():
+        try:
+            delta = json.loads(delta_path.read_text())
+            delta.setdefault("modified", {})
+            delta["modified"].update({
+                "package_files": counts["modified_files"],
+                "package_file_packages": counts["modified_packages"],
+                "package_files_captured": counts["captured"],
+            })
+            delta.setdefault("counts", {})
+            delta["counts"]["modified_package_files"] = counts["modified_files"]
+            conf_path = inventory / "package-conffiles.json"
+            if conf_path.is_file():
+                conf = json.loads(conf_path.read_text())
+                delta["modified"]["conffiles"] = len(conf.get("modified", []))
+                delta["modified"]["conffile_packages"] = conf.get("modified_packages", [])
+                delta["modified"]["conffiles_unreadable"] = len(conf.get("unreadable", []))
+                delta["counts"]["modified_conffiles"] = len(conf.get("modified", []))
+            write_json(delta_path, delta)
+        except (OSError, ValueError) as error:
+            report["warnings"].append(f"Package delta merge failed: {error}")
+    report["privileged_package_scan"] = {"captured_at": captured_at, "age_hours": age}
+    return True
+
+
+def capture_root_package_scan(non_interactive=False):
+    """Run the privileged package-file scan through sudo."""
+    command = ["sudo"] + (["-n"] if non_interactive else [])
+    command += ["/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
+                "_capture-package-files-worker"]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    for line in result.stdout.splitlines():
+        print(line)
+    for line in result.stderr.splitlines():
+        print(line, file=sys.stderr)
+    if result.returncode:
+        print("Warning: privileged package-file scan failed; "
+              "run capture-package-files with sudo.", file=sys.stderr)
+        return False
+    return True
 
 
 def collect_inventory(destination, config, report):
@@ -1854,6 +2118,7 @@ def build_snapshot(destination, config):
     report = {"warnings": [], "unavailable_commands": [], "symlinks_not_followed": [],
               "unreadable_files": [], "bytes_captured": 0}
     collect_inventory(destination / "inventory", config, report)
+    merge_privileged_package_scan(destination, report)
     for section, folder in (("home_include", "home"), ("home_reference_only", "reference-home")):
         for pattern in config[section]:
             if not safe_name(pattern) or "**" in pattern:
@@ -3545,8 +3810,8 @@ def private_workspace(path):
             raise ConfigError("Workspace must be an owned, real directory.")
         entries = {entry.name for entry in path.iterdir()}
         known = {"backups", "snapshot", ".previous-snapshot", "restored", "rollback",
-                 "plans", "profiles", "privileged-system", "system-integration-recovery",
-                 "staging", "config", "logs", "status.json", "history.txt", ".tray.lock",
+                 "plans", "profiles", "privileged-system", "privileged-package-scan",
+                 "system-integration-recovery", "staging", "config", "logs", "status.json", "history.txt", ".tray.lock",
                  ".maintenance.lock", ".home.lock", ".status.lock", ".home-snapshot"}
         if entries and not (path / "config/settings.json").is_file():
             # A recovered archive's kit/ is also a valid starting workspace.
@@ -3773,6 +4038,8 @@ def capture_root(non_interactive=False, install=False, replace_user_timer=False,
         print(line)
     for line in result.stderr.splitlines():
         print(line, file=sys.stderr)
+    if result.returncode in (0, 3):
+        capture_root_package_scan(non_interactive)
     if result.returncode == 3:
         print("System-wide capture completed with warnings; inspect unreadable-files.json.",
               file=sys.stderr)
@@ -4490,6 +4757,7 @@ def main():
         "prepare-drive": "Format a drive as ext4 and select it; internal disks need --allow-internal",
         "mount-saved": "Mount the fstab-declared backup drive and verify its on-disk marker",
         "unmount-saved": "Unmount the marked backup drive; keeps the boot entry",
+        "capture-package-files": "Capture modified package files using sudo",
     }
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
@@ -4510,13 +4778,16 @@ def main():
     worker.add_argument("--native-capture", action="store_true")
     worker = commands.add_parser("_restore-package-files-worker")
     worker.add_argument("--plan", required=True, type=Path)
+    worker = commands.add_parser("_capture-package-files-worker")
     sub = commands.add_parser("restore-package-files",
                               help="Review or restore captured modified non-conffile package files in place")
     sub.add_argument("snapshot", nargs="?", type=Path)
     sub.add_argument("--apply", action="store_true", help="Write in place using sudo; default is a dry run")
     sub.add_argument("--package", action="append", default=[], help="Restore only this package (repeatable)")
     sub.add_argument("--path", action="append", default=[], help="Restore only this destination path (repeatable)")
-    sub.add_argument("--force", action="store_true", help="Overwrite files that changed after review")
+    sub.add_argument("--force", action="store_true",
+                     help="Allow files that differ from the capture at review time; "
+                          "changes after review are always refused")
     sub = commands.add_parser("restore-home", help="Stage a full /home linked snapshot into a private folder; no live changes")
     sub.add_argument("timeline", nargs="?", type=Path)
     sub = commands.add_parser("install-timer", help="Enable daily/weekly unattended backups")
@@ -4556,6 +4827,9 @@ def main():
         return
     if args.command == "_restore-package-files-worker":
         restore_package_files_worker(args.plan, workspace.absolute())
+        return
+    if args.command == "_capture-package-files-worker":
+        capture_package_files_worker(workspace.absolute())
         return
     if os.geteuid() == 0:
         raise ConfigError("Run normally, not with sudo. The root-capture action invokes sudo separately.")
@@ -4598,6 +4872,8 @@ def main():
         show_status()
     elif command == "restore-package-files":
         restore_package_files(args.snapshot, args.apply, args.package, args.path, args.force)
+    elif command == "capture-package-files":
+        capture_root_package_scan(non_interactive=not interactive)
     elif command == "tray":
         return run_tray()
     elif command == "backup-now":
@@ -6458,8 +6734,8 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
         raise
     relative = KIT.relative_to("/home").as_posix()
     excluded = [relative + "/" + name for name in (
-        "backups", ".previous-snapshot", "privileged-system", "restored",
-        "rollback", "profiles", "snapshot", "staging", ".home-snapshot")]
+        "backups", ".previous-snapshot", "privileged-system", "privileged-package-scan",
+        "restored", "rollback", "profiles", "snapshot", "staging", ".home-snapshot")]
     if native_capture:
         try:
             if marker_record(Path(directory)) is None:
