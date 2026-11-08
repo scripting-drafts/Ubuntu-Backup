@@ -683,6 +683,43 @@ class PackageDeltaTests(unittest.TestCase):
         self.assertEqual(history["events"], 1)
 
 
+class FrontendPackageTests(unittest.TestCase):
+    def test_latest_config_snapshot_prefers_a_snapshot_with_package_scan(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            snapshot = kit / "snapshot"
+            (snapshot / "inventory").mkdir(parents=True)
+            (snapshot / "manifest.json").write_text("{}")
+            (snapshot / "inventory/package-integrity.json").write_text("{}")
+            saved = backup.KIT
+            backup.KIT = kit
+            try:
+                with mock.patch.object(backup, "settings",
+                                       return_value={"external_backup": None}):
+                    self.assertEqual(backup.latest_config_snapshot(), snapshot)
+            finally:
+                backup.KIT = saved
+
+    def test_package_scan_summary_reads_the_privileged_cache(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            cache = kit / "privileged-package-scan"
+            cache.mkdir()
+            (cache / "package-integrity.json").write_text(json.dumps({
+                "captured_at": backup.dt.datetime.now(backup.dt.timezone.utc).isoformat(),
+                "counts": {"captured": 2, "modified_files": 3},
+            }))
+            saved = backup.KIT
+            backup.KIT = kit
+            try:
+                summary = backup.package_scan_summary()
+            finally:
+                backup.KIT = saved
+        self.assertIn("2 captured", summary)
+        self.assertIn("3 modified", summary)
+
+
 class ReleaseCompatibilityTests(unittest.TestCase):
     def test_release_tuple_handles_point_releases(self):
         self.assertEqual(backup.release_tuple("26.10"), (26, 10))

@@ -874,9 +874,54 @@ def package_file_plan(source, records, packages=None, paths=None, force=False):
     return plan
 
 
+def latest_config_snapshot():
+    """Pick the newest configuration snapshot that contains a package-file scan."""
+    candidates = []
+    local = KIT / "snapshot"
+    if (local / "manifest.json").is_file():
+        candidates.append(local)
+    config = settings()
+    if config.get("external_backup"):
+        try:
+            directory = external_directory(config)
+            candidates.extend((directory / "timeline/config").glob("ubuntu-config-*"))
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+            pass
+    usable = [path for path in candidates
+              if (path / "inventory/package-integrity.json").is_file()]
+    pool = usable or candidates
+    if not pool:
+        raise ConfigError("No configuration snapshot with a package-file scan was found.")
+    return max(pool, key=lambda path: path.stat().st_mtime)
+
+
+def wizard_restore_package_files():
+    """Interactive frontend for the package-file restore review."""
+    source = latest_config_snapshot()
+    print("Package-file restore source: " + str(source))
+    packages = [item.strip() for item in ask(
+        "Limit to packages (comma-separated; blank for all)", "").split(",") if item.strip()]
+    paths = [item.strip() for item in ask(
+        "Limit to paths (comma-separated; blank for all)", "").split(",") if item.strip()]
+    plan = restore_package_files(source, apply=False, packages=packages, paths=paths)
+    restorable = [item for item in plan if item["action"] == "restore"]
+    conflicts = [item for item in plan if item["action"] == "conflict"]
+    if not restorable:
+        print("No package files can be restored from this snapshot.")
+        return
+    force = False
+    if conflicts:
+        force = confirm(f"{len(conflicts)} file(s) differ from the capture; "
+                        "allow replacing them?", False)
+    if not confirm(f"Restore {len(restorable)} package file(s) in place with sudo?", False):
+        print("Restore cancelled; no changes.")
+        return
+    restore_package_files(source, apply=True, packages=packages, paths=paths, force=force)
+
+
 def restore_package_files(snapshot=None, apply=False, packages=None, paths=None, force=False):
     """Review or restore captured modified package files in place."""
-    source = Path(snapshot).expanduser().resolve() if snapshot else default_snapshot()
+    source = Path(snapshot).expanduser().resolve() if snapshot else latest_config_snapshot()
     verify_path(source)
     manifest_path = source / "inventory/package-integrity.json"
     if not manifest_path.is_file():
@@ -1249,6 +1294,20 @@ def privileged_package_scan_age():
     except (OSError, ValueError, KeyError, TypeError):
         return None
     return (dt.datetime.now(dt.timezone.utc) - captured).total_seconds() / 3600
+
+
+def package_scan_summary():
+    """Short tray/status summary of the privileged package scan cache."""
+    path = KIT / "privileged-package-scan/package-integrity.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return "Package scan: no privileged cache"
+    counts = data.get("counts", {}) if isinstance(data, dict) else {}
+    age = privileged_package_scan_age()
+    age_text = f"{age:.1f}h" if age is not None else "unknown"
+    return (f"Package scan: {counts.get('captured', 0)} captured, "
+            f"{counts.get('modified_files', 0)} modified, cache {age_text}")
 
 
 def capture_root_package_scan(non_interactive=False, force=False):
@@ -4802,6 +4861,8 @@ def menu():
         print("4. Choose backup drive (or leave unset)")
         print("5. Automatic backup and privileged-capture schedule")
         print("6. Format a new backup drive (ERASES ALL DATA)")
+        print("7. Restore modified package files (in place)")
+        print("8. Refresh privileged package scan (sudo)")
         print("u. Undo restore")
         print("s. Status")
         print("0. Exit")
@@ -4821,6 +4882,10 @@ def menu():
                 wizard_schedule()
             elif choice == "6":
                 wizard_prepare_drive()
+            elif choice == "7":
+                wizard_restore_package_files()
+            elif choice == "8":
+                capture_root_package_scan(non_interactive=False, force=True)
             elif choice == "u":
                 wizard_undo_restore()
             elif choice == "s":
@@ -4892,6 +4957,8 @@ def main():
     sub.add_argument("--force", action="store_true",
                      help="Allow files that differ from the capture at review time; "
                           "changes after review are always refused")
+    sub.add_argument("--wizard", action="store_true",
+                     help="Review interactively in a terminal before applying")
     sub = commands.add_parser("capture-package-files",
                               help="Capture modified package files using sudo")
     sub.add_argument("--force", action="store_true",
@@ -4979,7 +5046,12 @@ def main():
     elif command == "status":
         show_status()
     elif command == "restore-package-files":
-        restore_package_files(args.snapshot, args.apply, args.package, args.path, args.force)
+        if args.wizard:
+            if not interactive:
+                raise ConfigError("The package-file restore wizard needs an interactive terminal.")
+            wizard_restore_package_files()
+        else:
+            restore_package_files(args.snapshot, args.apply, args.package, args.path, args.force)
     elif command == "capture-package-files":
         capture_root_package_scan(non_interactive=not interactive, force=args.force)
     elif command == "tray":
@@ -6980,10 +7052,18 @@ def run_tray():
     backup_item = Gtk.MenuItem(label="Run backup now")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
+    package_status_item = Gtk.MenuItem(label="Package scan: checking…")
+    package_status_item.set_sensitive(False)
+    package_capture_item = Gtk.MenuItem(label="Refresh package scan…")
+    package_restore_item = Gtk.MenuItem(label="Restore modified package files…")
     restore_option = Gtk.MenuItem(label="Restore…")
     drive_option = Gtk.MenuItem(label="Choose backup drive")
     purge_item = Gtk.MenuItem(label="Purge all data")
     options_menu = Gtk.Menu()
+    options_menu.append(package_status_item)
+    options_menu.append(package_capture_item)
+    options_menu.append(package_restore_item)
+    options_menu.append(Gtk.SeparatorMenuItem())
     options_menu.append(restore_option)
     options_menu.append(drive_option)
     options_menu.append(purge_item)
@@ -7018,7 +7098,8 @@ def run_tray():
             progress.set_fraction(0.0)
         status_text.set_text(f"State: {data.get('state', 'idle')}\n"
                              f"Phase: {data.get('phase', '')}\n"
-                             f"Updated: {data.get('updated', '')}\n\n"
+                             f"Updated: {data.get('updated', '')}\n"
+                             f"{package_scan_summary()}\n\n"
                              f"{data.get('message', '')}")
         return True
 
@@ -7077,7 +7158,8 @@ def run_tray():
 
     def launch_terminal(action):
         import shlex
-        command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT), action]
+        command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
+                   *shlex.split(action)]
         terminal = next((shutil.which(name) for name in
                          ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
                          if shutil.which(name)), None)
@@ -7412,6 +7494,8 @@ def run_tray():
         return False
 
     backup_item.connect("activate", backup_action)
+    package_capture_item.connect("activate", lambda _item: launch_terminal("capture-package-files --force"))
+    package_restore_item.connect("activate", lambda _item: launch_terminal("restore-package-files --wizard"))
     restore_option.connect("activate", lambda _item: launch_terminal("recover"))
     drive_option.connect("activate", show_drive_chooser)
     purge_item.connect("activate", show_purge_dialog)
@@ -7537,6 +7621,9 @@ def run_tray():
                    "Run backup now" if drive_ready() else "Select a backup drive first")
         if backup_item.get_label() != desired:
             backup_item.set_label(desired)
+        package_label = package_scan_summary()
+        if package_status_item.get_label() != package_label:
+            package_status_item.set_label(package_label)
         if running:
             toggle[0] = not toggle[0]
             set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
