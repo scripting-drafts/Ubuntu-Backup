@@ -863,6 +863,41 @@ class PackageIntegrityTests(unittest.TestCase):
                     backup.restore_package_files_worker(plan_path, workspace)
             self.assertEqual(destination.read_bytes(), b"current")
 
+    def test_fresh_privileged_scan_is_reused(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            cache = kit / "privileged-package-scan"
+            cache.mkdir()
+            (cache / "package-integrity.json").write_text(json.dumps({
+                "captured_at": backup.dt.datetime.now(backup.dt.timezone.utc).isoformat()}))
+            saved = backup.KIT
+            backup.KIT = kit
+            try:
+                with mock.patch.object(backup.subprocess, "run") as run:
+                    self.assertTrue(backup.capture_root_package_scan())
+                    run.assert_not_called()
+            finally:
+                backup.KIT = saved
+
+    def test_forced_privileged_scan_runs_again(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory)
+            cache = kit / "privileged-package-scan"
+            cache.mkdir()
+            (cache / "package-integrity.json").write_text(json.dumps({
+                "captured_at": backup.dt.datetime.now(backup.dt.timezone.utc).isoformat()}))
+            saved = backup.KIT
+            backup.KIT = kit
+            try:
+                with mock.patch.object(backup.subprocess, "run",
+                                       return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                    self.assertTrue(backup.capture_root_package_scan(force=True))
+                    run.assert_called_once()
+            finally:
+                backup.KIT = saved
+
     def test_capture_worker_publishes_privileged_cache(self):
         from unittest import mock
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -1594,7 +1629,8 @@ class AtomicFailureTests(unittest.TestCase):
             saved = backup.KIT, backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS
             backup.KIT = kit
             try:
-                with mock.patch.object(backup, "build_snapshot",
+                with mock.patch.object(backup, "capture_root_package_scan"), \
+                     mock.patch.object(backup, "build_snapshot",
                                        side_effect=backup.ConfigError("capture failed")):
                     with self.assertRaises(backup.ConfigError):
                         backup._backup_impl()

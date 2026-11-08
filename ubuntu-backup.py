@@ -832,9 +832,17 @@ def restore_package_files(snapshot=None, apply=False, packages=None, paths=None,
     records = data.get("records", []) if isinstance(data, dict) else []
     if isinstance(data, dict) and data.get("counts", {}).get("conffiles"):
         print("Conffiles are reported separately; restore them through the configuration snapshot.")
+    unreadable_packages = sorted({record.get("package") for record in records
+                                  if isinstance(record, dict) and record.get("package")
+                                  and "Permission denied" in str(record.get("note", ""))})
     missing_packages = sorted({record.get("package") for record in records
-                               if isinstance(record, dict) and record.get("flags") == "missing"
-                               and record.get("package")})
+                               if isinstance(record, dict) and record.get("package")
+                               and record.get("flags") == "missing"
+                               and not record.get("conffile")
+                               and "Permission denied" not in str(record.get("note", ""))})
+    if unreadable_packages:
+        print("Unreadable without root: " + ", ".join(unreadable_packages)
+              + "; run capture-package-files.")
     if missing_packages:
         print("Missing package files require reinstall: " + ", ".join(missing_packages))
         print("Vendor files: sudo apt-get install --reinstall " + " ".join(missing_packages))
@@ -1171,8 +1179,23 @@ def merge_privileged_package_scan(destination, report):
     return True
 
 
-def capture_root_package_scan(non_interactive=False):
+def privileged_package_scan_age():
+    """Return the age in hours of the last successful privileged package scan."""
+    path = KIT / "privileged-package-scan/package-integrity.json"
+    try:
+        data = json.loads(path.read_text())
+        captured = dt.datetime.fromisoformat(data["captured_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return (dt.datetime.now(dt.timezone.utc) - captured).total_seconds() / 3600
+
+
+def capture_root_package_scan(non_interactive=False, force=False):
     """Run the privileged package-file scan through sudo."""
+    age = privileged_package_scan_age()
+    if not force and age is not None and age <= (10 / 60):
+        print("Using the privileged package scan from the last 10 minutes.")
+        return True
     command = ["sudo"] + (["-n"] if non_interactive else [])
     command += ["/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
                 "_capture-package-files-worker"]
@@ -3340,6 +3363,7 @@ def _backup_impl(skip_external=False):
     lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        capture_root_package_scan(non_interactive=True)
         previous = KIT / ".previous-snapshot"
         current = KIT / "snapshot"
         if previous.exists():
@@ -4757,7 +4781,6 @@ def main():
         "prepare-drive": "Format a drive as ext4 and select it; internal disks need --allow-internal",
         "mount-saved": "Mount the fstab-declared backup drive and verify its on-disk marker",
         "unmount-saved": "Unmount the marked backup drive; keeps the boot entry",
-        "capture-package-files": "Capture modified package files using sudo",
     }
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
@@ -4788,6 +4811,10 @@ def main():
     sub.add_argument("--force", action="store_true",
                      help="Allow files that differ from the capture at review time; "
                           "changes after review are always refused")
+    sub = commands.add_parser("capture-package-files",
+                              help="Capture modified package files using sudo")
+    sub.add_argument("--force", action="store_true",
+                     help="Run a fresh scan even if a recent cache exists")
     sub = commands.add_parser("restore-home", help="Stage a full /home linked snapshot into a private folder; no live changes")
     sub.add_argument("timeline", nargs="?", type=Path)
     sub = commands.add_parser("install-timer", help="Enable daily/weekly unattended backups")
@@ -4873,7 +4900,7 @@ def main():
     elif command == "restore-package-files":
         restore_package_files(args.snapshot, args.apply, args.package, args.path, args.force)
     elif command == "capture-package-files":
-        capture_root_package_scan(non_interactive=not interactive)
+        capture_root_package_scan(non_interactive=not interactive, force=args.force)
     elif command == "tray":
         return run_tray()
     elif command == "backup-now":
