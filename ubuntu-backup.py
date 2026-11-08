@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import datetime as dt
 import fcntl
 import fnmatch
+import gzip
 import hashlib
 import importlib.metadata
 import json
@@ -41,6 +42,9 @@ MAX_FILE = 2 * 1024 * 1024 * 1024
 MAX_TOTAL = 8 * 1024 * 1024 * 1024
 STAGING_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 SYSTEM_CONFIG_ROOTS = ("/etc", "/usr/local/etc")
+DISTRO_METAPACKAGES = ("ubuntu-desktop", "ubuntu-desktop-minimal", "ubuntu-minimal",
+                       "ubuntu-standard", "ubuntu-restricted-addons")
+APT_HISTORY_GLOB = "/var/log/apt/history.log*"
 CONFIG_DATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",
                     "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",
                     "indexeddb", "local storage", "session storage", "service worker", "blob_storage"}
@@ -333,6 +337,154 @@ def vscode_extensions(report):
     return "".join(name + "\n" for name in sorted(found))
 
 
+def package_name(value):
+    """Normalize an APT package name by dropping an architecture suffix."""
+    return value.strip().partition(":")[0]
+
+
+def split_apt_items(value):
+    """Split apt history lists on commas that are outside version parentheses."""
+    items, current, depth = [], [], 0
+    for character in value:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth = max(0, depth - 1)
+        if character == "," and depth == 0:
+            items.append("".join(current).strip())
+            current = []
+        else:
+            current.append(character)
+    if current:
+        items.append("".join(current).strip())
+    return [item for item in items if item]
+
+
+def parse_apt_history(paths):
+    """Read apt's rotated history logs; newest entries win for upgrades."""
+    installed, removed, purged, upgraded = set(), set(), set(), {}
+    events = 0
+    ordered = []
+    for path in paths:
+        try:
+            ordered.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    for _, path in sorted(ordered):
+        opener = gzip.open if path.suffix == ".gz" else open
+        try:
+            with opener(path, "rt", errors="replace") as stream:
+                for line in stream:
+                    line = line.rstrip("\n")
+                    if line.startswith("Start-Date:"):
+                        events += 1
+                        continue
+                    for label in ("Install", "Upgrade", "Remove", "Purge"):
+                        prefix = label + ":"
+                        if not line.startswith(prefix):
+                            continue
+                        for item in split_apt_items(line[len(prefix):]):
+                            item = item.strip()
+                            if not item:
+                                continue
+                            name = package_name(item.split(" (", 1)[0])
+                            if not name or not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", name):
+                                continue
+                            if label == "Install":
+                                installed.add(name)
+                            elif label == "Remove":
+                                removed.add(name)
+                            elif label == "Purge":
+                                purged.add(name)
+                            else:
+                                detail = item.split("(", 1)[1].rstrip(")") if "(" in item else ""
+                                parts = [part.strip() for part in detail.split(",")]
+                                entry = {"package": name}
+                                if len(parts) >= 2:
+                                    entry["from"], entry["to"] = parts[0], parts[1]
+                                upgraded[name] = entry
+        except OSError:
+            continue
+    return {"events": events, "installed": sorted(installed),
+            "upgraded": [upgraded[name] for name in sorted(upgraded)],
+            "removed": sorted(removed), "purged": sorted(purged),
+            "removed_all": sorted(removed | purged)}
+
+
+def distro_package_closure(installed, report):
+    """Approximate a stock install from the distro metapackages' dependency closure."""
+    metapackages = [name for name in DISTRO_METAPACKAGES if name in installed]
+    if not metapackages:
+        report["warnings"].append(
+            "No Ubuntu metapackage found; the package delta cannot separate default packages.")
+        return set(), []
+    names = set(metapackages)
+    command = ["apt-cache", "depends", "--recurse", "--no-recommends", "--no-suggests",
+               "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances"]
+    for meta in metapackages:
+        try:
+            result = subprocess.run(command + [meta], capture_output=True, text=True,
+                                    timeout=60, errors="replace")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            report["warnings"].append(f"Default-package closure incomplete for {meta}: {error}")
+            continue
+        if result.returncode:
+            report["warnings"].append(f"Default-package closure failed for {meta}")
+            continue
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(("Depends:", "PreDepends:")):
+                continue
+            name = stripped.split(":", 1)[1].strip()
+            if name.startswith("<") and name.endswith(">"):
+                continue
+            name = name.split()[0]
+            if re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?", name):
+                names.add(package_name(name))
+    return names, metapackages
+
+
+def package_delta(installed, manual, statuses, closure, metapackages, held, history, removed):
+    """Classify current packages against the distro baseline and apt history."""
+    installed, manual, closure = set(installed), set(manual), set(closure)
+    default_installed = installed & closure
+    added_manual = manual - closure
+    default_manual = manual & closure
+    added_dependencies = installed - manual - closure
+    held_installed = held & installed
+    removed_current = set(removed) - installed
+    return {
+        "format": "ubuntu-package-delta-v1",
+        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "baseline": {
+            "method": "installed distro metapackage dependency closure",
+            "metapackages": metapackages,
+            "packages_in_closure": len(closure),
+            "note": "Heuristic. 'added' means manually installed outside the metapackage closure; "
+                    "'removed' comes from dpkg traces and rotated apt history, so purged packages "
+                    "older than the retained logs may be absent.",
+        },
+        "counts": {
+            "installed": len(installed), "manual": len(manual),
+            "default_installed": len(default_installed),
+            "added_manual": len(added_manual), "default_manual": len(default_manual),
+            "added_dependencies": len(added_dependencies),
+            "held_installed": len(held_installed),
+            "held_not_installed": len(held - installed),
+            "removed": len(removed_current),
+        },
+        "added_manual": sorted(added_manual),
+        "default_manual": sorted(default_manual),
+        "added_dependencies": sorted(added_dependencies),
+        "held_installed": sorted(held_installed),
+        "removed": sorted(removed_current),
+        "removed_from_default": sorted(removed_current & closure),
+        "apt_history": history,
+        "removed_traces": sorted(name for name, status in statuses.items()
+                                 if status[:2] in ("rc", "hc")),
+    }
+
+
 def collect_inventory(destination, config, report):
     mkdir(destination)
     write_json(destination / "hardware.json", hardware_inventory())
@@ -341,6 +493,7 @@ def collect_inventory(destination, config, report):
         "apt-manual.txt": ["apt-mark", "showmanual"],
         "apt-held.txt": ["apt-mark", "showhold"],
         "dpkg-packages.tsv": ["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Architecture}\t${db:Status-Abbrev}\n"],
+        "dpkg-selections.txt": ["dpkg", "--get-selections"],
         "apt-policy.txt": ["apt-cache", "policy"],
         "snap-list.txt": ["snap", "list"],
         "flatpak-apps.tsv": ["flatpak", "list", "--app", "--columns=application,origin,branch,installation"],
@@ -360,11 +513,17 @@ def collect_inventory(destination, config, report):
     write(destination / "vscode-extensions.txt", vscode_extensions(report))
     write(destination / "user-crontab.txt", capture_command(["crontab", "-l"], report, empty_codes=(1,)))
     installed = {}
+    statuses = {}
     for line in outputs["dpkg-packages.tsv"].splitlines():
         columns = line.split("\t")
-        if len(columns) == 4 and columns[3][1:2] == "i":
-            installed[columns[0]] = columns[1]
+        if len(columns) == 4:
+            statuses[package_name(columns[0])] = columns[3].strip()
+            if columns[3][1:2] == "i":
+                installed[columns[0]] = columns[1]
     manual = set(outputs["apt-manual.txt"].splitlines())
+    installed_names = {package_name(name) for name in installed}
+    manual_names = {package_name(name) for name in manual}
+    held_names = {package_name(name) for name in outputs["apt-held.txt"].splitlines() if name.strip()}
     portable, review = [], []
     for name in sorted(installed):
         if name not in manual and name.split(":")[0] not in manual:
@@ -375,6 +534,35 @@ def collect_inventory(destination, config, report):
     write(destination / "apt-portable.txt", "\n".join(portable) + "\n")
     write(destination / "apt-review-only.txt", "\n".join(review) + "\n")
     package_baseline(destination, installed, portable + review, native_arch)
+    history_paths = list(Path("/var/log/apt").glob("history.log*"))
+    if history_paths:
+        history = parse_apt_history(history_paths)
+    else:
+        history = {"events": 0, "installed": [], "upgraded": [], "removed": [],
+                   "purged": [], "removed_all": []}
+        report["warnings"].append("APT history is unavailable; removal history is incomplete.")
+    pending_removals = set()
+    for line in outputs["dpkg-selections.txt"].splitlines():
+        columns = line.split()
+        if len(columns) >= 2 and columns[1] in ("deinstall", "purge"):
+            pending_removals.add(package_name(columns[0]))
+    removed = set(history["removed_all"]) | pending_removals | {
+        name for name, status in statuses.items() if status[:2] in ("rc", "hc")}
+    closure, metapackages = distro_package_closure(installed_names, report)
+    delta = package_delta(installed_names, manual_names, statuses, closure, metapackages,
+                          held_names, history, removed)
+    held_installed = sorted(held_names & installed_names)
+    write(destination / "apt-held-installed.txt",
+          "\n".join(held_installed) + ("\n" if held_installed else ""))
+    write(destination / "apt-removed.txt",
+          "\n".join(sorted(removed)) + ("\n" if removed else ""))
+    write_json(destination / "apt-history.json", history)
+    write_json(destination / "package-delta.json", delta)
+    phantom = len(held_names - installed_names)
+    if phantom > 100:
+        report["warnings"].append(
+            f"{len(held_names)} package holds are recorded but only "
+            f"{len(held_names & installed_names)} are installed; audit apt-mark showhold.")
     snaps = []
     for line in outputs["snap-list.txt"].splitlines()[1:]:
         fields = line.split()
@@ -2637,6 +2825,13 @@ def deploy(args):
     supported = package_status["supported"] if package_status else []
     unavailable = package_status["unavailable"] if package_status else []
     drift = package_drift(source, package_status) if package_status else []
+    delta_counts = {}
+    delta_path = source / "inventory/package-delta.json"
+    if delta_path.is_file():
+        try:
+            delta_counts = json.loads(delta_path.read_text()).get("counts", {})
+        except (OSError, ValueError, AttributeError):
+            delta_counts = {}
     developments = load_developments(source) or {}
     changed, unchanged, conflicts = [], [], []
     for record in records:
@@ -2658,6 +2853,7 @@ def deploy(args):
     plan = {"source": str(source), "home_files_to_write": ordered_changed, "unchanged": unchanged,
             "conflicts_skipped": conflicts, "apt_available": supported, "apt_unavailable": unavailable,
             "package_versions_pinned": False, "package_drift": drift,
+            "package_delta_counts": delta_counts,
             "development_cycles": developments.get("cycles", []),
             "development_changes": developments.get("changes", []),
             "development_references": developments.get("references", {}),
@@ -2691,6 +2887,13 @@ def deploy(args):
               "Package names are resolved again; versions are not pinned.")
         if drift:
             print(f"APT: {len(drift)} saved version(s) differ from current candidates; newer versions are accepted.")
+    if delta_counts:
+        print("Packages vs distro baseline: "
+              f"{delta_counts.get('added_manual', 0)} added, "
+              f"{delta_counts.get('default_manual', 0)} default/manual, "
+              f"{delta_counts.get('removed', 0)} removed, "
+              f"{delta_counts.get('held_installed', 0)} held, "
+              f"{delta_counts.get('added_dependencies', 0)} added dependencies.")
     if args.snaps or args.flatpaks or args.desktop_settings:
         print(f"Optional actions: snaps={args.snaps}, flatpaks={args.flatpaks}, desktop settings={args.desktop_settings}")
     print(f"Full plan: {KIT / 'plans/last-deploy.json'}")

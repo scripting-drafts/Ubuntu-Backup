@@ -3,6 +3,7 @@
 import argparse
 from collections import namedtuple
 from contextlib import redirect_stderr, redirect_stdout
+import gzip
 import importlib.util
 import io
 import hashlib
@@ -622,6 +623,63 @@ class PackageDriftTests(unittest.TestCase):
                 "packages": [{"name": "pkg", "version": "1.0"}, {"name": "other", "version": "2.0"}],
             }))
             self.assertEqual(backup.saved_package_names(snapshot), ["other", "pkg"])
+
+
+class PackageDeltaTests(unittest.TestCase):
+    def test_delta_separates_additions_defaults_and_removals(self):
+        installed = {"ubuntu-desktop", "gnome-shell", "docker-ce", "curl", "zlib1g"}
+        manual = {"ubuntu-desktop", "docker-ce", "curl"}
+        statuses = {
+            "ubuntu-desktop": "ii", "gnome-shell": "ii", "docker-ce": "ii",
+            "curl": "ii", "zlib1g": "ii", "old-default": "rc",
+        }
+        closure = {"ubuntu-desktop", "gnome-shell", "curl", "old-default"}
+        held = {"docker-ce", "phantom-hold"}
+        history = {
+            "events": 2, "installed": ["docker-ce"],
+            "upgraded": [{"package": "curl", "from": "1.0", "to": "2.0"}],
+            "removed": ["old-default"], "purged": [], "removed_all": ["old-default"],
+        }
+        delta = backup.package_delta(installed, manual, statuses, closure,
+                                     ["ubuntu-desktop"], held, history, {"old-default"})
+        self.assertEqual(delta["added_manual"], ["docker-ce"])
+        self.assertEqual(delta["default_manual"], ["curl", "ubuntu-desktop"])
+        self.assertEqual(delta["added_dependencies"], ["zlib1g"])
+        self.assertEqual(delta["held_installed"], ["docker-ce"])
+        self.assertEqual(delta["counts"]["held_not_installed"], 1)
+        self.assertEqual(delta["removed"], ["old-default"])
+        self.assertEqual(delta["removed_from_default"], ["old-default"])
+        self.assertEqual(delta["removed_traces"], ["old-default"])
+        self.assertEqual(delta["apt_history"]["upgraded"][0]["to"], "2.0")
+
+    def test_apt_history_parsing_reads_installs_upgrades_and_removals(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            path = Path(directory) / "history.log"
+            path.write_text(
+                "Start-Date: 2026-11-01  09:38:39\n"
+                "Install: docker-ce:amd64 (5:27, automatic), curl (1.0)\n"
+                "Upgrade: curl:amd64 (1.0, 1.1, automatic)\n"
+                "Remove: old-default:amd64 (2.0)\n"
+                "Purge: gone:amd64 (3.0)\n"
+                "End-Date: 2026-11-01  09:39:00\n")
+            history = backup.parse_apt_history([path])
+        self.assertEqual(history["events"], 1)
+        self.assertEqual(history["installed"], ["curl", "docker-ce"])
+        self.assertEqual(history["removed"], ["old-default"])
+        self.assertEqual(history["purged"], ["gone"])
+        self.assertEqual(history["removed_all"], ["gone", "old-default"])
+        self.assertEqual(history["upgraded"], [{"package": "curl", "from": "1.0", "to": "1.1"}])
+
+    def test_apt_history_reads_rotated_gzip_logs(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            path = Path(directory) / "history.log.1.gz"
+            with gzip.open(path, "wt") as stream:
+                stream.write("Start-Date: 2026-10-01  09:00:00\n"
+                             "Remove: old-default:amd64 (2.0)\n"
+                             "End-Date: 2026-10-01  09:01:00\n")
+            history = backup.parse_apt_history([path])
+        self.assertEqual(history["removed_all"], ["old-default"])
+        self.assertEqual(history["events"], 1)
 
 
 class SavedDriveMountTests(unittest.TestCase):
