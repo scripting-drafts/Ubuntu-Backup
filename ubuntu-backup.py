@@ -37,6 +37,8 @@ MARKER = "# Managed by ubuntu-configuration v1"
 WORKSPACE_README = '# Ubuntu configuration and backup\n\n- Live tool: `~/ubuntu-backup.py` (private, self-contained, not encrypted).\n- Workspace: keep its settings, snapshots/timelines and rollback journals.\n- Run `./ubuntu-backup.py` for the menu; `./ubuntu-backup.py --help` shows full docs.\n- One backup action captures configuration, development code and full `/home`; identical files are stored once.\n- Each development change records its time, content version and package/library references; reapply follows dependency order and never pins versions.\n- Full recovery stages configuration or full `/home`; live `/home` is never overwritten.\n- External copies use dated symlink timelines over shared baselines.\n- Full `/home` capture is manual, external-drive only, requires sudo approval, and is not auto-pruned.\n- Snapshots contain secrets and are not encrypted. Do not publish them.\n'
 ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
+PACKAGE_FILE_MAX = 64 * 1024 * 1024
+PACKAGE_FILE_TOTAL = 256 * 1024 * 1024
 MAX_IN_MEMORY = 64 * 1024 * 1024
 MAX_FILE = 2 * 1024 * 1024 * 1024
 MAX_TOTAL = 8 * 1024 * 1024 * 1024
@@ -485,6 +487,444 @@ def package_delta(installed, manual, statuses, closure, metapackages, held, hist
     }
 
 
+def parse_dpkg_verify(text):
+    """Parse `dpkg --verify --verify-format=rpm` output."""
+    records = []
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        if line.startswith("missing"):
+            flags, rest = "missing", line[len("missing"):].lstrip()
+        else:
+            match = re.match(r"^([?.A-Za-z0-9]{9})\s+(.*)$", line)
+            if not match:
+                continue
+            flags, rest = match.group(1), match.group(2)
+        conffile = rest.startswith("c ")
+        if conffile:
+            rest = rest[2:].lstrip()
+        note = ""
+        if rest.endswith(")") and " (" in rest:
+            rest, note = rest.rsplit(" (", 1)
+            note = note[:-1]
+        path = rest.strip()
+        if path.startswith("/"):
+            records.append({"path": path, "flags": flags,
+                            "conffile": conffile, "note": note})
+    return records
+
+
+def dpkg_owners(info_dir=Path("/var/lib/dpkg/info")):
+    """Map absolute package-owned paths to their package names."""
+    owners = {}
+    try:
+        lists = sorted(info_dir.glob("*.list"))
+    except OSError:
+        return owners
+    for path in lists:
+        package = path.name[:-5].partition(":")[0]
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if line.startswith("/"):
+                    owners.setdefault(line, package)
+        except OSError:
+            continue
+    return owners
+
+
+def dpkg_conffiles(status_path=Path("/var/lib/dpkg/status")):
+    """Return the set of conffile paths from dpkg's status database."""
+    paths = set()
+    try:
+        text = status_path.read_text(errors="replace")
+    except OSError:
+        return paths
+    in_conffiles = False
+    for line in text.splitlines():
+        if line.startswith("Conffiles:"):
+            in_conffiles = True
+        elif in_conffiles and line.startswith(" "):
+            parts = line.split()
+            if parts:
+                paths.add(parts[0])
+        elif in_conffiles:
+            in_conffiles = False
+    return paths
+
+
+def conffile_drift(status_path=Path("/var/lib/dpkg/status")):
+    """Compare installed conffiles with the MD5 values recorded by dpkg."""
+    try:
+        text = status_path.read_text(errors="replace")
+    except OSError as error:
+        return {"checked": 0, "modified": [], "modified_packages": [],
+                "unreadable": [{"path": str(status_path), "reason": str(error)}],
+                "missing": [], "obsolete": 0}
+    package, installed, in_conffiles = None, False, False
+    entries = []
+    for line in text.splitlines():
+        if line.startswith("Package: "):
+            package, installed, in_conffiles = line.split(":", 1)[1].strip(), False, False
+        elif line.startswith("Status: "):
+            fields = line.split()
+            installed = len(fields) >= 4 and fields[3] == "installed"
+        elif line.startswith("Conffiles:"):
+            in_conffiles = True
+        elif in_conffiles and line.startswith(" "):
+            parts = line.split()
+            if package and installed and len(parts) >= 2:
+                entries.append((package, parts[0], parts[1],
+                                len(parts) > 2 and parts[2] == "obsolete"))
+        elif in_conffiles:
+            in_conffiles = False
+    checked, obsolete = 0, 0
+    modified, unreadable, missing = [], [], []
+    for package, path, expected, is_obsolete in entries:
+        if is_obsolete:
+            obsolete += 1
+            continue
+        try:
+            with open(path, "rb") as stream:
+                data = stream.read()
+        except FileNotFoundError:
+            missing.append({"package": package, "path": path})
+            continue
+        except OSError as error:
+            unreadable.append({"package": package, "path": path,
+                               "reason": str(error)})
+            continue
+        checked += 1
+        if hashlib.md5(data).hexdigest() != expected:
+            modified.append({"package": package, "path": path})
+    return {"checked": checked, "modified": modified,
+            "modified_packages": sorted({item["package"] for item in modified}),
+            "unreadable": unreadable, "missing": missing, "obsolete": obsolete}
+
+
+def package_integrity(destination, report, verify_output=None, owners=None, conffiles=None):
+    """Scan package files, capture modified non-conffile contents, and report."""
+    manifest = {"format": "ubuntu-package-integrity-v1", "available": False,
+                "caution": "Captured bytes are the modified files at scan time, not vendor originals.",
+                "max_file_bytes": PACKAGE_FILE_MAX, "max_total_bytes": PACKAGE_FILE_TOTAL,
+                "records": [], "warnings": []}
+    if verify_output is None:
+        dpkg = shutil.which("dpkg")
+        if not dpkg:
+            manifest["warnings"].append("dpkg is unavailable")
+            write_json(destination / "package-integrity.json", manifest)
+            return manifest
+        try:
+            result = subprocess.run([dpkg, "--verify", "--verify-format=rpm"],
+                                    capture_output=True, text=True, errors="replace",
+                                    timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            manifest["warnings"].append(f"dpkg verify failed: {error}")
+            write_json(destination / "package-integrity.json", manifest)
+            return manifest
+        verify_output = result.stdout
+        if result.returncode not in (0, 1):
+            manifest["warnings"].append(f"dpkg verify exited with {result.returncode}")
+    owners = dpkg_owners() if owners is None else owners
+    conffiles = dpkg_conffiles() if conffiles is None else conffiles
+    count = {"total": 0, "modified_files": 0, "modified_packages": 0,
+             "conffiles": 0, "captured": 0, "unverified": 0,
+             "unreadable": 0, "missing": 0, "metadata_changes": 0}
+    packages, captured_total, seen = set(), 0, set()
+    for item in parse_dpkg_verify(verify_output):
+        path = item["path"]
+        if path in seen:
+            continue
+        seen.add(path)
+        package = owners.get(path)
+        record = {"path": path, "package": package, "flags": item["flags"],
+                  "conffile": bool(item["conffile"] or path in conffiles),
+                  "note": item["note"], "captured": False}
+        count["total"] += 1
+        if not package:
+            record["reason"] = "not owned by an installed package"
+        elif record["conffile"]:
+            count["conffiles"] += 1
+            record["reason"] = "conffile; captured by the configuration backup"
+        elif "Permission denied" in item["note"]:
+            count["unreadable"] += 1
+            record["reason"] = "unreadable without root"
+        elif item["flags"] == "?????????":
+            count["unverified"] += 1
+            record["reason"] = "verification unavailable"
+        elif item["flags"] == "missing":
+            count["missing"] += 1
+            record["reason"] = "missing; reinstall the package"
+        elif not any(flag in item["flags"] for flag in "5S"):
+            record["reason"] = "metadata-only change"
+        else:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as stream:
+                    before = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(before.st_mode):
+                        raise OSError("not a regular file")
+                    if before.st_size > PACKAGE_FILE_MAX:
+                        raise OSError("larger than the per-file capture limit")
+                    if captured_total + before.st_size > PACKAGE_FILE_TOTAL:
+                        raise OSError("package-file capture limit reached")
+                    data = stream.read(PACKAGE_FILE_MAX + 1)
+                    after = os.fstat(stream.fileno())
+                if (len(data) > PACKAGE_FILE_MAX or before.st_size != after.st_size
+                        or before.st_mtime_ns != after.st_mtime_ns):
+                    raise OSError("file changed during capture")
+            except OSError as error:
+                record["reason"] = str(error)
+            else:
+                sha256 = hashlib.sha256(data).hexdigest()
+                write(destination / "package-files" / sha256, data)
+                captured_total += len(data)
+                record.update({"captured": True, "sha256": sha256,
+                               "size": len(data), "mode": stat.S_IMODE(before.st_mode),
+                               "uid": before.st_uid, "gid": before.st_gid})
+        if package and not record["conffile"] and "Permission denied" not in item["note"]:
+            if item["flags"] == "missing" or any(flag in item["flags"] for flag in "5S"):
+                count["modified_files"] += 1
+                packages.add(package)
+            elif item["flags"] != "?????????":
+                count["metadata_changes"] += 1
+        if record["captured"]:
+            count["captured"] += 1
+        manifest["records"].append(record)
+    count["modified_packages"] = len(packages)
+    manifest.update({"available": True, "captured_bytes": captured_total,
+                     "counts": count})
+    if count["unreadable"]:
+        manifest["warnings"].append(
+            f"{count['unreadable']} package paths could not be read without root.")
+    report["package_files"] = count
+    write_json(destination / "package-integrity.json", manifest)
+    return manifest
+
+
+def package_file_plan(source, records, packages=None, paths=None, force=False):
+    """Decide which captured modified package files can be restored in place."""
+    packages = {value.partition(":")[0] for value in (packages or [])}
+    paths = {str(Path(value).expanduser()) for value in (paths or [])}
+    plan = []
+    for record in records:
+        if not isinstance(record, dict) or not record.get("captured"):
+            continue
+        if record.get("conffile"):
+            continue
+        package = record.get("package")
+        destination = Path(record.get("path", "")).expanduser()
+        if packages and package not in packages:
+            continue
+        if paths and str(destination) not in paths:
+            continue
+        if not destination.is_absolute() or ".." in destination.parts:
+            plan.append({"package": package, "destination": destination,
+                         "action": "conflict", "reason": "unsafe destination path"})
+            continue
+        sha256 = record.get("sha256")
+        source_file = source / "inventory/package-files" / str(sha256)
+        item = {"package": package, "destination": destination,
+                "source": source_file, "sha256": sha256,
+                "size": record.get("size"), "mode": record.get("mode"),
+                "uid": record.get("uid"), "gid": record.get("gid"),
+                "current_sha": None, "action": "conflict", "reason": ""}
+        if not sha256 or not source_file.is_file() or digest(source_file) != sha256:
+            item["reason"] = "captured content is missing or corrupt"
+            plan.append(item)
+            continue
+        try:
+            info = destination.lstat()
+        except FileNotFoundError:
+            item["action"] = "restore"
+        else:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                item["reason"] = "destination is not a regular file"
+            else:
+                current = digest(destination)
+                item["current_sha"] = current
+                if current == sha256:
+                    item["action"] = "already"
+                elif force:
+                    item["action"] = "restore"
+                else:
+                    item["reason"] = "destination changed since capture; use --force"
+        plan.append(item)
+    return plan
+
+
+def restore_package_files(snapshot=None, apply=False, packages=None, paths=None, force=False):
+    """Review or restore captured modified package files in place."""
+    source = Path(snapshot).expanduser().resolve() if snapshot else default_snapshot()
+    verify_path(source)
+    manifest_path = source / "inventory/package-integrity.json"
+    if not manifest_path.is_file():
+        raise ConfigError("This snapshot has no package-file scan. Run a configuration backup first.")
+    try:
+        data = json.loads(manifest_path.read_text())
+    except (OSError, ValueError) as error:
+        raise ConfigError(f"Unreadable package-file inventory: {error}") from error
+    records = data.get("records", []) if isinstance(data, dict) else []
+    if isinstance(data, dict) and data.get("counts", {}).get("conffiles"):
+        print("Conffiles are reported separately; restore them through the configuration snapshot.")
+    plan = package_file_plan(source, records, packages, paths, force)
+    if not plan:
+        print("No captured modified package files matched.")
+        return plan
+    for item in plan:
+        if item["action"] == "already":
+            continue
+        label = item["action"].upper()
+        detail = f" ({item['reason']})" if item.get("reason") else ""
+        print(f"{label:8} {item.get('package') or '?':20} {item['destination']}{detail}")
+    already = sum(1 for item in plan if item["action"] == "already")
+    if already:
+        print(f"Already current: {already} file(s).")
+    restorable = [item for item in plan if item["action"] == "restore"]
+    if not apply:
+        print(f"Dry run: {len(restorable)} file(s) can be restored in place. "
+              "Re-run with --apply to write them.")
+        return plan
+    if not restorable:
+        print("Nothing to restore.")
+        return plan
+    plan_path = KIT / "plans/package-files-restore.json"
+    write_json(plan_path, {
+        "format": "ubuntu-package-restore-plan-v1", "created_at": timestamp(),
+        "snapshot": str(source), "force": bool(force),
+        "records": [{key: (str(value) if key in ("source", "destination") else value)
+                     for key, value in item.items() if key != "action"}
+                    for item in restorable],
+    })
+    command = ["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
+               "_restore-package-files-worker", "--plan", str(plan_path)]
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        raise ConfigError("Package-file restore worker failed; inspect the result file.")
+    return plan
+
+
+def _dpkg_owner(path):
+    result = subprocess.run(["/usr/bin/dpkg-query", "-S", str(path)],
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        return set()
+    owners = set()
+    for line in result.stdout.splitlines():
+        if ": " not in line:
+            continue
+        for name in line.split(": ", 1)[0].split(","):
+            owners.add(name.strip().partition(":")[0])
+    return owners
+
+
+def restore_package_files_worker(plan_path, workspace):
+    """Root-only worker: restore reviewed package files with rollback copies."""
+    if os.geteuid() != 0:
+        raise ConfigError("The package-file restore worker must run as root.")
+    workspace = Path(workspace)
+    if workspace.is_symlink() or not workspace.is_dir():
+        raise ConfigError("Invalid workspace for package-file restore.")
+    owner_uid, owner_gid = workspace.stat().st_uid, workspace.stat().st_gid
+    if owner_uid == 0:
+        raise ConfigError("Refusing a root-owned workspace.")
+    plan_path = Path(plan_path).resolve()
+    plans_dir = (workspace / "plans").resolve()
+    if plan_path.parent != plans_dir or plan_path.is_symlink() or not plan_path.is_file():
+        raise ConfigError("Refusing an unmanaged restore plan.")
+    try:
+        plan = json.loads(plan_path.read_text())
+    except (OSError, ValueError) as error:
+        raise ConfigError(f"Unreadable restore plan: {error}") from error
+    if plan.get("format") != "ubuntu-package-restore-plan-v1":
+        raise ConfigError("Unrecognized package-file restore plan.")
+    records = plan.get("records", [])
+    if not isinstance(records, list):
+        raise ConfigError("Invalid package-file restore records.")
+    source_root = Path(plan.get("snapshot", "")).expanduser()
+    if not source_root.is_absolute() or not source_root.is_dir():
+        raise ConfigError("Invalid snapshot path in the restore plan.")
+    rollback_root = workspace / "rollback" / ("package-files-" + timestamp())
+    restored, skipped, failed = [], [], []
+    for record in records:
+        if not isinstance(record, dict):
+            failed.append({"reason": "invalid record"}); continue
+        package = record.get("package")
+        destination = Path(record.get("destination", ""))
+        source = Path(record.get("source", ""))
+        sha256 = record.get("sha256")
+        try:
+            if not destination.is_absolute() or ".." in destination.parts:
+                raise ConfigError("unsafe destination path")
+            if not package or package not in _dpkg_owner(destination):
+                raise ConfigError("destination is no longer package-owned")
+            source_dir = (source_root / "inventory/package-files").absolute()
+            if not str(source.absolute()).startswith(str(source_dir) + "/"):
+                raise ConfigError("source is outside the snapshot")
+            if not sha256 or not source.is_file() or digest(source) != sha256:
+                raise ConfigError("source content is missing or corrupt")
+            try:
+                info = destination.lstat()
+            except FileNotFoundError:
+                info = None
+            if info is not None and (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)):
+                raise ConfigError("destination is not a regular file")
+            current_sha = digest(destination) if info is not None else None
+            if current_sha != record.get("current_sha") and not plan.get("force"):
+                raise ConfigError("destination changed after review; re-run the restore")
+            if info is not None:
+                rollback = rollback_root / destination.relative_to("/")
+                mkdir(rollback.parent)
+                shutil.copy2(destination, rollback)
+                os.chown(rollback, owner_uid, owner_gid)
+            with tempfile.NamedTemporaryFile(dir=destination.parent,
+                                             prefix=".package-restore-", delete=False) as output:
+                temporary = Path(output.name)
+                try:
+                    with source.open("rb") as stream:
+                        shutil.copyfileobj(stream, output, length=1024 * 1024)
+                    output.flush()
+                    os.fchmod(output.fileno(), int(record.get("mode") or 0o644) & 0o7777)
+                    os.fchown(output.fileno(), int(record.get("uid", 0)),
+                              int(record.get("gid", 0)))
+                    os.fsync(output.fileno())
+                except BaseException:
+                    temporary.unlink(missing_ok=True)
+                    raise
+            try:
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            if digest(destination) != sha256:
+                raise ConfigError("restored content failed verification")
+        except (ConfigError, OSError, ValueError) as error:
+            failed.append({"package": package, "path": str(destination),
+                           "reason": str(error)})
+        else:
+            restored.append({"package": package, "path": str(destination),
+                             "sha256": sha256})
+    for directory, _, _ in os.walk(rollback_root, topdown=False):
+        try:
+            os.chown(directory, owner_uid, owner_gid)
+        except OSError:
+            pass
+    result = {"format": "ubuntu-package-restore-result-v1", "created_at": timestamp(),
+              "rollback": str(rollback_root) if rollback_root.exists() else None,
+              "restored": restored, "skipped": skipped, "failed": failed,
+              "note": "File capabilities, ACLs and xattrs are not restored."}
+    result_path = workspace / "plans/package-files-restore-result.json"
+    write_json(result_path, result)
+    os.chown(result_path, owner_uid, owner_gid)
+    print(f"Package files restored: {len(restored)}; failed: {len(failed)}.")
+    if result["rollback"]:
+        print("Rollback copies: " + result["rollback"])
+    for item in failed:
+        print(f"FAILED {item.get('package') or '?'} {item.get('path')}: {item.get('reason')}",
+              file=sys.stderr)
+    if failed:
+        raise ConfigError(f"{len(failed)} package file(s) failed to restore.")
+
+
 def collect_inventory(destination, config, report):
     mkdir(destination)
     write_json(destination / "hardware.json", hardware_inventory())
@@ -551,6 +991,26 @@ def collect_inventory(destination, config, report):
     closure, metapackages = distro_package_closure(installed_names, report)
     delta = package_delta(installed_names, manual_names, statuses, closure, metapackages,
                           held_names, history, removed)
+    conffiles = conffile_drift()
+    write_json(destination / "package-conffiles.json", conffiles)
+    if conffiles["unreadable"]:
+        report["warnings"].append(
+            f"{len(conffiles['unreadable'])} conffiles could not be read; "
+            "package modification coverage is partial.")
+    integrity = package_integrity(destination, report)
+    for warning in integrity.get("warnings", []):
+        report["warnings"].append(warning)
+    counts = integrity.get("counts", {})
+    delta["modified"] = {
+        "conffiles": len(conffiles["modified"]),
+        "conffile_packages": conffiles["modified_packages"],
+        "conffiles_unreadable": len(conffiles["unreadable"]),
+        "package_files": counts.get("modified_files", 0),
+        "package_file_packages": counts.get("modified_packages", 0),
+        "package_files_captured": counts.get("captured", 0),
+    }
+    delta["counts"]["modified_conffiles"] = len(conffiles["modified"])
+    delta["counts"]["modified_package_files"] = counts.get("modified_files", 0)
     held_installed = sorted(held_names & installed_names)
     write(destination / "apt-held-installed.txt",
           "\n".join(held_installed) + ("\n" if held_installed else ""))
@@ -2893,7 +3353,9 @@ def deploy(args):
               f"{delta_counts.get('default_manual', 0)} default/manual, "
               f"{delta_counts.get('removed', 0)} removed, "
               f"{delta_counts.get('held_installed', 0)} held, "
-              f"{delta_counts.get('added_dependencies', 0)} added dependencies.")
+              f"{delta_counts.get('added_dependencies', 0)} added dependencies, "
+              f"{delta_counts.get('modified_conffiles', 0)} modified conffiles, "
+              f"{delta_counts.get('modified_package_files', 0)} modified package files.")
     if args.snaps or args.flatpaks or args.desktop_settings:
         print(f"Optional actions: snaps={args.snaps}, flatpaks={args.flatpaks}, desktop settings={args.desktop_settings}")
     print(f"Full plan: {KIT / 'plans/last-deploy.json'}")
@@ -4046,6 +4508,15 @@ def main():
     worker = commands.add_parser("_backup-home-worker")
     worker.add_argument("--run-id")
     worker.add_argument("--native-capture", action="store_true")
+    worker = commands.add_parser("_restore-package-files-worker")
+    worker.add_argument("--plan", required=True, type=Path)
+    sub = commands.add_parser("restore-package-files",
+                              help="Review or restore captured modified non-conffile package files in place")
+    sub.add_argument("snapshot", nargs="?", type=Path)
+    sub.add_argument("--apply", action="store_true", help="Write in place using sudo; default is a dry run")
+    sub.add_argument("--package", action="append", default=[], help="Restore only this package (repeatable)")
+    sub.add_argument("--path", action="append", default=[], help="Restore only this destination path (repeatable)")
+    sub.add_argument("--force", action="store_true", help="Overwrite files that changed after review")
     sub = commands.add_parser("restore-home", help="Stage a full /home linked snapshot into a private folder; no live changes")
     sub.add_argument("timeline", nargs="?", type=Path)
     sub = commands.add_parser("install-timer", help="Enable daily/weekly unattended backups")
@@ -4082,6 +4553,9 @@ def main():
         return
     if args.command == "_backup-home-worker":
         root_home_backup(workspace, args.run_id, args.native_capture)
+        return
+    if args.command == "_restore-package-files-worker":
+        restore_package_files_worker(args.plan, workspace.absolute())
         return
     if os.geteuid() == 0:
         raise ConfigError("Run normally, not with sudo. The root-capture action invokes sudo separately.")
@@ -4122,6 +4596,8 @@ def main():
             restore_home(args.timeline)
     elif command == "status":
         show_status()
+    elif command == "restore-package-files":
+        restore_package_files(args.snapshot, args.apply, args.package, args.path, args.force)
     elif command == "tray":
         return run_tray()
     elif command == "backup-now":

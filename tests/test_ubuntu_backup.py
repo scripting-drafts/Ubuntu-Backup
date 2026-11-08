@@ -682,6 +682,165 @@ class PackageDeltaTests(unittest.TestCase):
         self.assertEqual(history["events"], 1)
 
 
+class PackageIntegrityTests(unittest.TestCase):
+    def test_parse_dpkg_verify_reads_flags_notes_and_conffiles(self):
+        records = backup.parse_dpkg_verify(
+            "??5?????? /usr/bin/demo\n"
+            "missing   c /etc/demo.conf\n"
+            "missing   /var/lib/demo/state (Permission denied)\n"
+            "????????? /boot/vmlinuz\n"
+            "??5?????? c /etc/gdm3/custom.conf\n")
+        self.assertEqual(records[0], {"path": "/usr/bin/demo", "flags": "??5??????",
+                                      "conffile": False, "note": ""})
+        self.assertTrue(records[1]["conffile"])
+        self.assertEqual(records[2]["note"], "Permission denied")
+        self.assertEqual(records[3]["flags"], "?????????")
+        self.assertTrue(records[4]["conffile"])
+
+    def test_conffile_drift_detects_modified_missing_and_obsolete(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            same, changed, missing, obsolete = (base / "same.conf", base / "changed.conf",
+                                                base / "missing.conf", base / "old.conf")
+            same.write_text("same")
+            changed.write_text("changed")
+            obsolete.write_text("old")
+            status = base / "status"
+            status.write_text(
+                "Package: demo\nStatus: install ok installed\nConffiles:\n"
+                f" {same} {hashlib.md5(same.read_bytes()).hexdigest()}\n"
+                f" {changed} {'0' * 32}\n"
+                f" {missing} {'0' * 32}\n"
+                f" {obsolete} {'0' * 32} obsolete\n"
+                "Description: demo\n\n"
+                "Package: old\nStatus: deinstall ok config-files\nConffiles:\n"
+                f" {changed} {'0' * 32}\nDescription: old\n")
+            result = backup.conffile_drift(status)
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(result["modified"], [{"package": "demo", "path": str(changed)}])
+        self.assertEqual(result["modified_packages"], ["demo"])
+        self.assertEqual(result["missing"], [{"package": "demo", "path": str(missing)}])
+        self.assertEqual(result["obsolete"], 1)
+
+    def test_package_integrity_captures_modified_content(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            modified, conffile = base / "modified.bin", base / "demo.conf"
+            modified.write_bytes(b"patched content")
+            conffile.write_bytes(b"config")
+            destination = base / "inventory"
+            manifest = backup.package_integrity(
+                destination, {}, verify_output=(
+                    f"??5?????? {modified}\n"
+                    f"??5?????? c {conffile}\n"),
+                owners={str(modified): "demo", str(conffile): "demo"},
+                conffiles={str(conffile)})
+            self.assertEqual(manifest["counts"]["modified_files"], 1)
+            self.assertEqual(manifest["counts"]["conffiles"], 1)
+            self.assertEqual(manifest["counts"]["captured"], 1)
+            record = manifest["records"][0]
+            self.assertTrue(record["captured"])
+            stored = destination / "package-files" / record["sha256"]
+            self.assertEqual(stored.read_bytes(), b"patched content")
+            self.assertEqual(manifest["records"][1]["captured"], False)
+
+    def test_restore_worker_writes_with_rollback(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            workspace, snapshot = base / "workspace", base / "snapshot"
+            (workspace / "plans").mkdir(parents=True)
+            (snapshot / "inventory/package-files").mkdir(parents=True)
+            content, current = b"restored content", b"current"
+            sha256 = hashlib.sha256(content).hexdigest()
+            (snapshot / "inventory/package-files" / sha256).write_bytes(content)
+            destination = base / "target.bin"
+            destination.write_bytes(current)
+            plan = {
+                "format": "ubuntu-package-restore-plan-v1", "snapshot": str(snapshot),
+                "force": False, "records": [{
+                    "package": "demo", "destination": str(destination),
+                    "source": str(snapshot / "inventory/package-files" / sha256),
+                    "sha256": sha256,
+                    "current_sha": hashlib.sha256(current).hexdigest(),
+                    "mode": 0o640, "uid": os.getuid(), "gid": os.getgid(),
+                }],
+            }
+            plan_path = workspace / "plans/restore.json"
+            plan_path.write_text(json.dumps(plan))
+            with mock.patch.object(backup.os, "geteuid", return_value=0), \
+                 mock.patch.object(backup.os, "chown"), \
+                 mock.patch.object(backup.os, "fchown"), \
+                 mock.patch.object(backup, "_dpkg_owner", return_value={"demo"}):
+                backup.restore_package_files_worker(plan_path, workspace)
+            self.assertEqual(destination.read_bytes(), content)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o640)
+            result = json.loads((workspace / "plans/package-files-restore-result.json").read_text())
+            self.assertEqual(result["restored"][0]["path"], str(destination))
+            rollback = [path for path in (workspace / "rollback").rglob("*") if path.is_file()]
+            self.assertEqual(len(rollback), 1)
+            self.assertEqual(rollback[0].read_bytes(), current)
+
+    def test_restore_worker_refuses_a_changed_destination(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            workspace, snapshot = base / "workspace", base / "snapshot"
+            (workspace / "plans").mkdir(parents=True)
+            (snapshot / "inventory/package-files").mkdir(parents=True)
+            content = b"restored content"
+            sha256 = hashlib.sha256(content).hexdigest()
+            (snapshot / "inventory/package-files" / sha256).write_bytes(content)
+            destination = base / "target.bin"
+            destination.write_bytes(b"current")
+            plan = {
+                "format": "ubuntu-package-restore-plan-v1", "snapshot": str(snapshot),
+                "force": False, "records": [{
+                    "package": "demo", "destination": str(destination),
+                    "source": str(snapshot / "inventory/package-files" / sha256),
+                    "sha256": sha256, "current_sha": "different",
+                    "mode": 0o640, "uid": os.getuid(), "gid": os.getgid(),
+                }],
+            }
+            plan_path = workspace / "plans/restore.json"
+            plan_path.write_text(json.dumps(plan))
+            with mock.patch.object(backup.os, "geteuid", return_value=0), \
+                 mock.patch.object(backup, "_dpkg_owner", return_value={"demo"}), \
+                 redirect_stderr(io.StringIO()):
+                with self.assertRaises(backup.ConfigError):
+                    backup.restore_package_files_worker(plan_path, workspace)
+            self.assertEqual(destination.read_bytes(), b"current")
+
+    def test_package_file_plan_detects_already_conflict_and_force(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            snapshot = base / "snapshot"
+            records = []
+            destinations = []
+            for name, current in (("already", b"new"), ("conflict", b"old"), ("missing", None)):
+                destination = base / name
+                destinations.append(destination)
+                if current is not None:
+                    destination.write_bytes(current)
+                content = b"new"
+                digest = hashlib.sha256(content).hexdigest()
+                stored = snapshot / "inventory/package-files" / digest
+                stored.parent.mkdir(parents=True, exist_ok=True)
+                stored.write_bytes(content)
+                records.append({"path": str(destination), "package": "demo",
+                                "captured": True, "conffile": False,
+                                "sha256": digest, "size": len(content),
+                                "mode": 0o644, "uid": 0, "gid": 0})
+            plan = backup.package_file_plan(snapshot, records)
+            self.assertEqual([item["action"] for item in plan],
+                             ["already", "conflict", "restore"])
+            forced = backup.package_file_plan(snapshot, records, force=True)
+            self.assertEqual([item["action"] for item in forced],
+                             ["already", "restore", "restore"])
+            self.assertEqual(forced[1]["current_sha"],
+                             hashlib.sha256(b"old").hexdigest())
+
+
 class SavedDriveMountTests(unittest.TestCase):
     """Mounting follows /etc/fstab and the on-disk marker, never stored paths."""
 
