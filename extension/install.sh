@@ -35,7 +35,7 @@ icon_path = root / "indicatorStatusIcon.js"
 patched = False
 if app_path.is_file():
     app = app_path.read_text()
-    marker = re.search(r"^([ \t]*)secondaryActivate\([^\n]*\)[ \t]*\{",
+    marker = re.search(r"^([ \t]*)(?:async[ \t]+)?secondaryActivate\([^\n]*\)[ \t]*\{",
                        app, re.MULTILINE)
     if marker:
         indent = marker.group(1)
@@ -142,7 +142,8 @@ case ":$CURRENT:" in
     *":$DATA_ROOT:"*) DATA_DIRS="$CURRENT" ;;
     *) DATA_DIRS="$DATA_ROOT:$CURRENT" ;;
 esac
-for unit in org.gnome.Shell@x11.service org.gnome.Shell@wayland.service; do
+for unit in org.gnome.Shell@x11.service org.gnome.Shell@wayland.service \
+            org.gnome.Shell@ubuntu.service org.gnome.Shell@.service; do
     directory="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit.d"
     mkdir -p "$directory"
     cat > "$directory/90-ubuntu-backup.conf" <<EOF

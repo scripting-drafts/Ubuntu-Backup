@@ -848,6 +848,7 @@ def package_file_plan(source, records, packages=None, paths=None, force=False):
                 "source": source_file, "sha256": sha256,
                 "size": record.get("size"), "mode": record.get("mode"),
                 "uid": record.get("uid"), "gid": record.get("gid"),
+                "xattrs": record.get("xattrs"),
                 "current_sha": None, "action": "conflict", "reason": ""}
         if not sha256 or not source_file.is_file() or digest(source_file) != sha256:
             item["reason"] = "captured content is missing or corrupt"
@@ -1147,11 +1148,16 @@ def merge_privileged_package_scan(destination, report):
         user = {}
     records = user.get("records", []) if isinstance(user, dict) else []
     records = [record for record in records if isinstance(record, dict)]
+    privileged_records = [record for record in privileged.get("records", [])
+                          if isinstance(record, dict) and record.get("path")]
+    privileged_paths = {record["path"] for record in privileged_records}
+    if age is None or age <= 26:
+        records = [record for record in records
+                   if not ("Permission denied" in str(record.get("note", ""))
+                           and record.get("path") not in privileged_paths)]
     by_path = {record.get("path"): index for index, record in enumerate(records)}
     content_dir = inventory / "package-files"
-    for record in privileged.get("records", []):
-        if not isinstance(record, dict) or not record.get("path"):
-            continue
+    for record in privileged_records:
         if record.get("captured") and record.get("sha256"):
             source = cache / "package-files" / record["sha256"]
             target = content_dir / record["sha256"]
@@ -1162,7 +1168,7 @@ def merge_privileged_package_scan(destination, report):
             merged = dict(record, source="privileged-scan")
             by_path[path] = len(records)
             records.append(merged)
-        elif not records[by_path[path]].get("captured") and record.get("captured"):
+        elif not records[by_path[path]].get("captured"):
             merged = dict(records[by_path[path]])
             for key in ("captured", "sha256", "size", "mode", "uid", "gid", "xattrs",
                         "flags", "note", "package", "conffile", "reason", "xattr_warning"):

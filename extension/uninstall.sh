@@ -5,7 +5,8 @@ SYSTEM_UUID="ubuntu-appindicators@ubuntu.com"
 OLD_FORK_UUID="ubuntu-backup-appindicators@local"
 DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/ubuntu-backup-system"
 OLD_FORK_DEST="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$OLD_FORK_UUID"
-for unit in org.gnome.Shell@x11.service org.gnome.Shell@wayland.service; do
+for unit in org.gnome.Shell@x11.service org.gnome.Shell@wayland.service \
+            org.gnome.Shell@ubuntu.service org.gnome.Shell@.service; do
     directory="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit.d"
     rm -f "$directory/90-ubuntu-backup.conf"
     rmdir "$directory" 2>/dev/null || true

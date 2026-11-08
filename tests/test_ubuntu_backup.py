@@ -972,9 +972,12 @@ class PackageIntegrityTests(unittest.TestCase):
             unreadable = {"path": "/usr/bin/userfile", "package": "demo", "captured": False,
                           "flags": "??5??????", "conffile": False,
                           "note": "Permission denied", "reason": "unreadable without root"}
+            stale = {"path": "/usr/bin/stale", "package": "demo", "captured": False,
+                     "flags": "missing", "conffile": False,
+                     "note": "Permission denied", "reason": "unreadable without root"}
             (inventory / "package-integrity.json").write_text(json.dumps({
-                "format": "ubuntu-package-integrity-v1", "records": [unreadable],
-                "counts": backup.package_integrity_counts([unreadable])}))
+                "format": "ubuntu-package-integrity-v1", "records": [unreadable, stale],
+                "counts": backup.package_integrity_counts([unreadable, stale])}))
             (inventory / "package-conffiles.json").write_text(json.dumps({
                 "checked": 1, "modified": [], "modified_packages": [],
                 "unreadable": [{"package": "gdm3", "path": "/etc/gdm3/custom.conf"}],
@@ -993,6 +996,7 @@ class PackageIntegrityTests(unittest.TestCase):
             self.assertTrue(by_path["/usr/bin/rootonly"]["captured"])
             self.assertTrue(by_path["/usr/bin/userfile"]["captured"])
             self.assertEqual(by_path["/usr/bin/userfile"]["source"], "privileged-scan")
+            self.assertNotIn("/usr/bin/stale", by_path)
             self.assertEqual((inventory / "package-files" / root_sha).read_bytes(), root_content)
             self.assertEqual(merged["counts"]["captured"], 2)
             conffiles = json.loads((inventory / "package-conffiles.json").read_text())
@@ -1022,8 +1026,10 @@ class PackageIntegrityTests(unittest.TestCase):
                 records.append({"path": str(destination), "package": "demo",
                                 "captured": True, "conffile": False,
                                 "sha256": digest, "size": len(content),
-                                "mode": 0o644, "uid": 0, "gid": 0})
+                                "mode": 0o644, "uid": 0, "gid": 0,
+                                "xattrs": {"user.demo": "dmFsdWU="}})
             plan = backup.package_file_plan(snapshot, records)
+            self.assertEqual(plan[0]["xattrs"], {"user.demo": "dmFsdWU="})
             self.assertEqual([item["action"] for item in plan],
                              ["already", "conflict", "restore"])
             forced = backup.package_file_plan(snapshot, records, force=True)
