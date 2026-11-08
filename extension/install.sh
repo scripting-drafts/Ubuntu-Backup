@@ -28,53 +28,77 @@ metadata.update({
 })
 metadata_path.write_text(json.dumps(metadata, indent=4) + "\n")
 
+import re
+
 app_path = root / "appIndicator.js"
-app = app_path.read_text()
-marker = "    secondaryActivate(timestamp, x, y) {"
-method = """    showQuitMenu(x, y) {
-        Gio.DBus.session.call(
-            'org.ubuntu.Backup', '/org/ubuntu/Backup', 'org.ubuntu.Backup',
-            'ShowQuitMenu', null, null, Gio.DBusCallFlags.NONE, 1000,
-            this._cancellable, (_connection, result) => {
-                try {
-                    Gio.DBus.session.call_finish(result);
-                } catch (e) {
-                    if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                        return;
-                    this.open(x, y);
-                }
-            });
-    }
-
-"""
-if app.count(marker) != 1:
-    raise SystemExit("appIndicator.js marker changed; refusing to patch")
-app_path.write_text(app.replace(marker, method + marker, 1))
-
 icon_path = root / "indicatorStatusIcon.js"
-icon = icon_path.read_text()
-press_marker = "    vfunc_button_press_event(buttonEvent) {\n"
-press = """    vfunc_event(event) {
-        if (event.type() === Clutter.EventType.BUTTON_PRESS &&
-            event.get_button() === 3 && this._indicator.id === 'ubuntu-backup') {
-            let [x, y] = event.get_coords();
-            if (Main.panel.menuManager.activeMenu)
-                Main.panel.menuManager._closeMenu(true, Main.panel.menuManager.activeMenu);
-            this._indicator.showQuitMenu(x, y);
-            return Clutter.EVENT_STOP;
-        }
-        return super.vfunc_event(event);
-    }
+patched = False
+if app_path.is_file():
+    app = app_path.read_text()
+    marker = re.search(r"^([ \t]*)secondaryActivate\([^\n]*\)[ \t]*\{",
+                       app, re.MULTILINE)
+    if marker:
+        indent = marker.group(1)
+        method = """showQuitMenu(x, y) {
+    Gio.DBus.session.call(
+        'org.ubuntu.Backup', '/org/ubuntu/Backup', 'org.ubuntu.Backup',
+        'ShowQuitMenu', null, null, Gio.DBusCallFlags.NONE, 1000,
+        null, (_connection, result) => {
+            try {
+                Gio.DBus.session.call_finish(result);
+            } catch (e) {
+                if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+                this.open(x, y);
+            }
+        });
+}
 
 """
-if icon.count(press_marker) != 1:
-    raise SystemExit("indicatorStatusIcon.js markers changed; refusing to patch")
-icon = icon.replace(press_marker, press + press_marker, 1)
-icon_path.write_text(icon)
+        method = "".join(indent + line if line.strip() else line
+                         for line in method.splitlines(True))
+        app = app[:marker.start()] + method + app[marker.start():]
+        app_path.write_text(app)
+        patched = True
+    else:
+        print("Warning: appIndicator.js has no secondaryActivate marker; "
+              "installing the stock copy.", file=sys.stderr)
+
+if patched and icon_path.is_file():
+    icon = icon_path.read_text()
+    marker = re.search(r"^([ \t]*)vfunc_button_press_event\([^\n]*\)[ \t]*\{",
+                       icon, re.MULTILINE)
+    if marker:
+        indent = marker.group(1)
+        press = """vfunc_event(event) {
+    if (event.type() === Clutter.EventType.BUTTON_PRESS &&
+        event.get_button() === 3 && this._indicator.id === 'ubuntu-backup') {
+        let [x, y] = event.get_coords();
+        if (Main.panel.menuManager.activeMenu && Main.panel.menuManager._closeMenu)
+            Main.panel.menuManager._closeMenu(true, Main.panel.menuManager.activeMenu);
+        this._indicator.showQuitMenu(x, y);
+        return Clutter.EVENT_STOP;
+    }
+    return super.vfunc_event(event);
+}
+
+"""
+        press = "".join(indent + line if line.strip() else line
+                        for line in press.splitlines(True))
+        icon = icon[:marker.start()] + press + icon[marker.start():]
+        icon_path.write_text(icon)
+    else:
+        print("Warning: indicatorStatusIcon.js has no button-press marker; "
+              "right-click quit is disabled.", file=sys.stderr)
+elif not patched:
+    print("Warning: installing the stock AppIndicator extension; "
+          "backup-specific right-click is unavailable.", file=sys.stderr)
 PY
 if command -v node >/dev/null; then
-    node --check "$TMP/appIndicator.js" >/dev/null
-    node --check "$TMP/indicatorStatusIcon.js" >/dev/null
+    node --check "$TMP/appIndicator.js" >/dev/null 2>&1 || \
+        echo "Warning: appIndicator.js syntax check failed; verify the extension manually." >&2
+    node --check "$TMP/indicatorStatusIcon.js" >/dev/null 2>&1 || \
+        echo "Warning: indicatorStatusIcon.js syntax check failed; verify the extension manually." >&2
 fi
 if [[ -d "$DEST" ]]; then
     existing="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("uuid",""))' "$DEST/metadata.json" 2>/dev/null || true)"
@@ -127,4 +151,8 @@ Environment=XDG_DATA_DIRS=$DATA_DIRS
 EOF
 done
 systemctl --user daemon-reload
-echo "Installed the patched AppIndicator copy. Restart GNOME Shell after the first install or a system extension update."
+if grep -q 'showQuitMenu' "$DEST/appIndicator.js"; then
+    echo "Installed the patched AppIndicator copy. Restart GNOME Shell after the first install or a system extension update."
+else
+    echo "Installed the stock AppIndicator copy; backup-specific right-click is unavailable."
+fi

@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -g -Wall -Wextra -Werror -std=c11
+CFLAGS ?= -O2 -g -Wall -Wextra -std=c11
 LDLIBS ?= -lcrypto
 
 all: ubackup-core

@@ -5,3 +5,4 @@
 - The copy keeps the stock UUID, so there is only one StatusNotifierWatcher.
 - Left-click opens the native menu; right-click opens the quit-only popup.
 - `uninstall.sh` removes the copy and drop-in; restart GNOME Shell to restore stock.
+- If a future GNOME Shell/extension changes the patch markers, the stock copy is installed with a warning instead of failing.

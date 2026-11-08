@@ -51,6 +51,24 @@ SYSTEM_CONFIG_ROOTS = ("/etc", "/usr/local/etc")
 DISTRO_METAPACKAGES = ("ubuntu-desktop", "ubuntu-desktop-minimal", "ubuntu-minimal",
                        "ubuntu-standard", "ubuntu-restricted-addons")
 APT_HISTORY_GLOB = "/var/log/apt/history.log*"
+SUPPORTED_RELEASES = {
+    "22.04": {"codename": "jammy", "name": "Jammy Jellyfish",
+              "standard_support": "2027-06", "eol": "2037-04"},
+    "24.04": {"codename": "noble", "name": "Noble Numbat",
+              "standard_support": "2029-06", "eol": "2039-04"},
+    "24.10": {"codename": "oracular", "name": "Oracular Oriole",
+              "standard_support": "2025-07", "eol": "2025-07"},
+    "25.04": {"codename": "plucky", "name": "Plucky Puffin",
+              "standard_support": "2026-01", "eol": "2026-01"},
+    "25.10": {"codename": "questing", "name": "Questing Quokka",
+              "standard_support": "2026-07", "eol": "2026-07"},
+    "26.04": {"codename": "resolute", "name": "Resolute Raccoon",
+              "standard_support": "2031-05", "eol": "2041-04"},
+    "26.10": {"codename": "stonking", "name": "Stonking Stingray",
+              "standard_support": "2027-07", "eol": "2027-07"},
+}
+MIN_SUPPORTED_RELEASE = "22.04"
+MAX_SUPPORTED_RELEASE = "26.10"
 CONFIG_DATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",
                     "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",
                     "indexeddb", "local storage", "session storage", "service worker", "blob_storage"}
@@ -251,6 +269,36 @@ def read_os_release():
     return result
 
 
+def release_tuple(value):
+    """Return a comparable (major, minor) tuple for an Ubuntu release string."""
+    match = re.match(r"^(\d+)\.(\d+)", str(value or ""))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def release_support(os_release=None):
+    """Report whether the running Ubuntu release is in the tested range."""
+    data = read_os_release() if os_release is None else os_release
+    version = str(data.get("VERSION_ID") or "")
+    key = release_tuple(version)
+    minimum, maximum = release_tuple(MIN_SUPPORTED_RELEASE), release_tuple(MAX_SUPPORTED_RELEASE)
+    supported = bool(key and minimum <= key <= maximum)
+    release = SUPPORTED_RELEASES.get(version, {})
+    return {
+        "version": version,
+        "codename": data.get("UBUNTU_CODENAME") or data.get("VERSION_CODENAME") or release.get("codename"),
+        "name": release.get("name"),
+        "supported": supported,
+        "tested_from": MIN_SUPPORTED_RELEASE,
+        "tested_through": MAX_SUPPORTED_RELEASE,
+        "standard_support": release.get("standard_support"),
+        "eol": release.get("eol"),
+        "note": ("Release is inside the tested Ubuntu range."
+                 if supported else
+                 f"Release {version or 'unknown'} is outside the tested range "
+                 f"{MIN_SUPPORTED_RELEASE}-{MAX_SUPPORTED_RELEASE}; review results manually."),
+    }
+
+
 def hardware_inventory():
     """Read-only hardware identity; no device probing, mounting, or driver execution."""
     def text(path):
@@ -431,6 +479,10 @@ def distro_package_closure(installed, report):
         try:
             result = subprocess.run(command + [meta], capture_output=True, text=True,
                                     timeout=60, errors="replace")
+            if result.returncode:
+                result = subprocess.run(["apt-cache", "depends", "--recurse", meta],
+                                        capture_output=True, text=True, timeout=60,
+                                        errors="replace")
         except (OSError, subprocess.TimeoutExpired) as error:
             report["warnings"].append(f"Default-package closure incomplete for {meta}: {error}")
             continue
@@ -695,6 +747,9 @@ def package_integrity(destination, report, verify_output=None, owners=None, conf
             result = subprocess.run([dpkg, "--verify", "--verify-format=rpm"],
                                     capture_output=True, text=True, errors="replace",
                                     timeout=300)
+            if result.returncode not in (0, 1):
+                result = subprocess.run([dpkg, "--verify"], capture_output=True, text=True,
+                                        errors="replace", timeout=300)
         except (OSError, subprocess.TimeoutExpired) as error:
             manifest["warnings"].append(f"dpkg verify failed: {error}")
             write_json(destination / "package-integrity.json", manifest)
@@ -1316,7 +1371,8 @@ def collect_inventory(destination, config, report):
         if len(fields) < 6:
             continue
         name, _, _, channel, _, notes = fields[:6]
-        if name in ("bare", "snapd", "gtk-common-themes") or re.match(r"^(core\d*|gnome-.*|mesa-.*)$", name):
+        if name in ("bare", "snapd", "gtk-common-themes") or re.match(
+                r"^(core\d*|gnome-.*|mesa-.*|kf[56]-.*)$", name):
             continue
         channel = channel.removesuffix("/…").removesuffix("/...")
         snaps.append({"name": name, "channel": channel, "classic": "classic" in notes.split(",")})
@@ -1328,8 +1384,13 @@ def collect_inventory(destination, config, report):
         if (HOME / name).is_file():
             paths["home/" + name] = str(HOME / name)
     write_json(destination / "tool-paths.json", paths)
+    os_info = read_os_release()
+    support = release_support(os_info)
+    if not support["supported"]:
+        report["warnings"].append(support["note"])
     write_json(destination / "source-system.json", {
-        "os": read_os_release(), "hostname": socket.gethostname(), "home": str(HOME),
+        "os": os_info, "release_support": support,
+        "hostname": socket.gethostname(), "home": str(HOME),
         "desktop": os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
         "architecture": native_arch,
     })
@@ -3693,24 +3754,34 @@ def deploy(args):
         except OSError:
             print("Warning: Flatpak inventory is unavailable; no Flatpaks installed.")
             flatpak_lines = []
-        remotes = []
-        if flatpak_lines:
-            try:
-                remotes = subprocess.run(
-                    ["flatpak", "remotes", "--user", "--columns=name"],
-                    capture_output=True, text=True, check=True).stdout.splitlines()
-            except (OSError, subprocess.SubprocessError):
-                print("Warning: Flatpak remotes are unavailable; no Flatpaks installed.")
-                flatpak_lines = []
+        remote_cache = {}
+
+        def remotes_for(scope):
+            if scope not in remote_cache:
+                try:
+                    remote_cache[scope] = set(subprocess.run(
+                        ["flatpak", "remotes", scope, "--columns=name"],
+                        capture_output=True, text=True, check=True).stdout.splitlines())
+                except (OSError, subprocess.SubprocessError):
+                    remote_cache[scope] = set()
+            return remote_cache[scope]
+
         for line in flatpak_lines:
             columns = line.split("\t")
-            if len(columns) < 3 or columns[1] not in remotes:
-                print("Skipping Flatpak app: configure its trusted user remote first.")
+            if len(columns) < 3:
                 continue
             app, remote, branch = columns[:3]
+            installation = columns[3] if len(columns) >= 4 and columns[3] in ("user", "system") else "user"
+            scope = "--" + installation
+            if remote not in remotes_for(scope):
+                print(f"Skipping Flatpak app: configure its trusted {installation} remote first.")
+                continue
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", app) or not re.fullmatch(r"[A-Za-z0-9_.-]+", branch):
                 raise ConfigError("Invalid Flatpak inventory.")
-            subprocess.run(["flatpak", "install", "--user", "--noninteractive", "--", remote, app + "//" + branch], check=True)
+            command = ["flatpak", "install", scope, "--noninteractive", "--", remote, app + "//" + branch]
+            if installation == "system":
+                command = ["sudo"] + command
+            subprocess.run(command, check=True)
     rollback = KIT / "rollback" / timestamp()
     development_paths = {item.get("path") for item in developments.get("files", [])}
     for relative in ordered_changed:
@@ -3751,7 +3822,7 @@ UMask=0077
 Nice=10
 IOSchedulingClass=idle
 NoNewPrivileges=true
-TimeoutStartSec=10min
+TimeoutStartSec=20min
 """
     timer = f"""{MARKER}
 [Unit]
@@ -3782,7 +3853,7 @@ def install_timer():
     print("Daily user backup timer enabled. Missed runs catch up when your user manager next starts.")
 
 
-EMBEDDED_DEFAULT_SETTINGS = {'coverage': 'system-wide-configuration', 'keep_snapshots': 30, 'exclude_cpus': [2, 8], 'external_backup': None, 'keep_local_backups': False, 'development_include': [], 'home_include': ['.bashrc', '.bash_logout', '.bash_aliases', '.profile', '.inputrc', '.gitconfig', '.Xresources', '.xprofile', '.xsessionrc', '.config/autostart', '.config/systemd/user', '.config/mimeapps.list', '.config/user-dirs.dirs', '.config/user-dirs.locale', '.config/fontconfig', '.config/gtk-3.0/settings.ini', '.config/gtk-3.0/gtk.css', '.config/gtk-4.0/settings.ini', '.config/gtk-4.0/gtk.css', '.config/Code/User/settings.json', '.config/Code/User/keybindings.json', '.config/Code/User/snippets', '.config/sublime-text/Packages/User', '.config/libreoffice/4/user/registrymodifications.xcu', '.local/share/applications', '.local/share/fonts', '.local/share/gnome-shell/extensions', '.local/share/themes', '.local/share/icons', '.fonts', '.themes', '.icons', 'bin', '*.sh', '*.py'], 'home_reference_only': ['.local/bin', '.nvidia-settings-rc', '.config/monitors.xml'], 'system_reference_only': ['/etc/default/keyboard', '/etc/default/locale', '/etc/environment', '/etc/locale.gen', '/etc/timezone', '/etc/apt/sources.list', '/etc/apt/sources.list.d', '/etc/apt/preferences.d', '/etc/apt/keyrings', '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/modprobe.d', '/etc/modules-load.d', '/etc/udev/rules.d', '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/systemd/system', '/etc/systemd/journald.conf', '/etc/systemd/journald.conf.d', '/etc/systemd/logind.conf', '/etc/systemd/logind.conf.d', '/etc/docker/daemon.json', '/etc/containerd/config.toml', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/etc/cron.d'], 'exclude': ['**/__pycache__', '**/__pycache__/*', '**/*.pyc', '**/.git', '**/.git/*', '.ssh', '.ssh/*', '.gnupg', '.gnupg/*', '.kube', '.kube/*', '.git-credentials', '.config/gh/*', '.docker/config.json', '.config/systemd/user/ubuntu-configuration-backup.*', '.config/systemd/user/timers.target.wants/ubuntu-configuration-backup.timer', 'etc/systemd/system/snap*', 'etc/apt/auth.conf', 'etc/apt/auth.conf.d/*'], 'apt_review_only': ['linux-*', 'grub*', 'shim*', 'nvidia-*', 'libnvidia-*', 'cuda*', 'nsight*', 'firmware-*', 'oem-*', 'efibootmgr', 'os-prober', 'mokutil']}
+EMBEDDED_DEFAULT_SETTINGS = {'coverage': 'system-wide-configuration', 'keep_snapshots': 30, 'exclude_cpus': [2, 8], 'external_backup': None, 'keep_local_backups': False, 'development_include': [], 'home_include': ['.bashrc', '.bash_logout', '.bash_aliases', '.profile', '.inputrc', '.gitconfig', '.Xresources', '.xprofile', '.xsessionrc', '.config/autostart', '.config/systemd/user', '.config/mimeapps.list', '.config/user-dirs.dirs', '.config/user-dirs.locale', '.config/fontconfig', '.config/gtk-3.0', '.config/gtk-4.0', '.config/environment.d', '.config/gnome-shell', '.config/gnome-session', '.config/libadwaita-1', '.config/pipewire', '.config/xdg-desktop-portal', '.local/share/nautilus', '.local/share/gnome-shell', '.config/Code/User/settings.json', '.config/Code/User/keybindings.json', '.config/Code/User/snippets', '.config/sublime-text/Packages/User', '.config/libreoffice/4/user/registrymodifications.xcu', '.local/share/applications', '.local/share/fonts', '.local/share/gnome-shell/extensions', '.local/share/themes', '.local/share/icons', '.fonts', '.themes', '.icons', 'bin', '*.sh', '*.py'], 'home_reference_only': ['.local/bin', '.nvidia-settings-rc', '.config/monitors.xml'], 'system_reference_only': ['/etc/default/keyboard', '/etc/default/locale', '/etc/environment', '/etc/locale.gen', '/etc/timezone', '/etc/apt/sources.list', '/etc/apt/sources.list.d', '/etc/apt/preferences.d', '/etc/apt/keyrings', '/etc/apt/apt.conf.d', '/etc/dconf', '/etc/environment.d', '/etc/netplan', '/etc/ubuntu-advantage', '/etc/xdg', '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/modprobe.d', '/etc/modules-load.d', '/etc/udev/rules.d', '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/systemd/system', '/etc/systemd/journald.conf', '/etc/systemd/journald.conf.d', '/etc/systemd/logind.conf', '/etc/systemd/logind.conf.d', '/etc/docker/daemon.json', '/etc/containerd/config.toml', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/etc/cron.d'], 'exclude': ['**/__pycache__', '**/__pycache__/*', '**/*.pyc', '**/.git', '**/.git/*', '.ssh', '.ssh/*', '.gnupg', '.gnupg/*', '.kube', '.kube/*', '.git-credentials', '.config/gh/*', '.docker/config.json', '.config/systemd/user/ubuntu-configuration-backup.*', '.config/systemd/user/timers.target.wants/ubuntu-configuration-backup.timer', 'etc/systemd/system/snap*', 'etc/apt/auth.conf', 'etc/apt/auth.conf.d/*'], 'apt_review_only': ['linux-*', 'grub*', 'shim*', 'nvidia-*', 'libnvidia-*', 'cuda*', 'nsight*', 'firmware-*', 'oem-*', 'efibootmgr', 'os-prober', 'mokutil']}
 EMBEDDED_README = 'Ubuntu Backup: self-contained interactive configuration backup and restore.\nNo personal configuration snapshot or backup data is bundled in this repository.\nGenerated snapshots and exports contain secrets and are NOT encrypted.\nOne backup action captures configuration, development code and full /home; identical files are stored once.\nEach development change records its time, content version and package/library references; reapply follows dependency order and never pins package versions.\nFull recovery stages configuration or full /home; live /home is never overwritten.\n'
 EMBEDDED_GITIGNORE = '*\n!ubuntu-backup.py\n!README.md\n!.gitignore\n'
 EMBEDDED_ROOT_EXPORTER = '#!/usr/bin/python3 -I\n"""System-wide CONFIGURATION capture; root reads, owner writes. Never a disk image."""\n# Managed by ubuntu-configuration system capture v1\nimport argparse\nimport datetime as dt\nimport hashlib\nimport io\nimport json\nimport os\nfrom pathlib import Path\nimport pwd\nimport stat\nimport subprocess\nimport sys\nimport tarfile\nimport tempfile\n\nMARKER = "# Managed by ubuntu-configuration system capture v1"\nUNIT = "ubuntu-configuration-system"\nHELPER = Path("/usr/local/libexec/ubuntu-configuration-system-capture.py")\nROOTS = ("/etc", "/usr/local/etc", "/usr/local/libexec/ubuntu-configuration-system-capture.py")\nMAX_FILE, MAX_TOTAL = 64 * 1024 * 1024, 1024 * 1024 * 1024\nDATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",\n             "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",\n             "indexeddb", "local storage", "session storage", "service worker", "blob_storage", "__pycache__"}\nHOME_PATHS = (".config", ".local/share/applications", ".local/share/fonts", ".local/share/themes", ".local/share/icons",\n              ".local/share/gnome-shell/extensions", ".fonts", ".themes", ".icons", ".ssh/config", ".kube/config",\n              ".gnupg/gpg.conf", ".gnupg/gpg-agent.conf", ".docker/config.json", ".aws/config")\nHISTORIES = {".bash_history", ".python_history", ".scala_history", ".dotty_history", ".lesshst", ".wget-hsts",\n             ".sudo_as_admin_successful", ".Xauthority", ".ICEauthority", ".DS_Store"}\n\n\ndef collect(owner_uid, accounts=None, system_roots=ROOTS):\n    """Pinned descriptors, unlimited depth, no symlinks or nested mounts followed."""\n    files, metadata, links, omissions, excluded = {}, {}, [], [], []\n    total = 0\n\n    def scan(parent_fd, name, prefix, device=None):\n        nonlocal total\n        if name.lower() in DATA_DIRS:\n            excluded.append(prefix)\n            return\n        try:\n            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)\n            if stat.S_ISLNK(info.st_mode):\n                links.append({"path": prefix, "target": os.readlink(name, dir_fd=parent_fd)})\n                return\n            if stat.S_ISDIR(info.st_mode):\n                if device is not None and info.st_dev != device:\n                    excluded.append(prefix + " (nested mount)")\n                    return\n                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)\n                try:\n                    with os.scandir(fd) as entries:\n                        names = sorted(entry.name for entry in entries)\n                    for child in names:\n                        scan(fd, child, prefix + "/" + child, info.st_dev)\n                finally:\n                    os.close(fd)\n                return\n            if not stat.S_ISREG(info.st_mode):\n                excluded.append(prefix + " (runtime/special file)")\n                return\n            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)\n            with os.fdopen(fd, "rb") as source:\n                before = os.fstat(source.fileno())\n                if not stat.S_ISREG(before.st_mode):\n                    raise RuntimeError("Configuration changed type: " + prefix)\n                data = source.read(MAX_FILE + 1)\n                after = os.fstat(source.fileno())\n            if len(data) > MAX_FILE:\n                raise RuntimeError("Configuration exceeds 64 MiB; capture aborted: " + prefix)\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise RuntimeError("Configuration changed during read; retry capture: " + prefix)\n            total += len(data)\n            if total > MAX_TOTAL:\n                raise RuntimeError("Configuration exceeds 1 GiB; review excluded application data before retrying.")\n            files[prefix] = data\n            metadata[prefix] = {"mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid, "gid": before.st_gid}\n        except FileNotFoundError:\n            return\n        except PermissionError:\n            omissions.append(prefix + " (unreadable even with current privileges)")\n\n    for root in system_roots:\n        path = Path(root)\n        try:\n            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        except FileNotFoundError:\n            continue\n        try:\n            scan(parent, path.name, "system/" + path.as_posix().lstrip("/"))\n        finally:\n            os.close(parent)\n    chosen = []\n    for account in accounts if accounts is not None else pwd.getpwall():\n        if account.pw_uid not in (0, owner_uid) and not (1000 <= account.pw_uid < 65534 and account.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin")):\n            continue\n        home = Path(account.pw_dir)\n        if not home.is_dir() or home.is_symlink():\n            omissions.append(f"Account {account.pw_uid}: home missing or symlinked")\n            continue\n        chosen.append({"uid": account.pw_uid, "name": account.pw_name, "home": str(home)})\n        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            prefix = "home" if account.pw_uid == owner_uid else f"accounts/{account.pw_uid}/home"\n            paths = set(HOME_PATHS)\n            with os.scandir(fd) as entries:\n                paths.update(entry.name for entry in entries if entry.name.startswith(".") and entry.is_file(follow_symlinks=False)\n                             and entry.name not in HISTORIES and not entry.name.endswith((".swp", ".swo", "~"))\n                             and not entry.name.startswith(".xsession-errors"))\n            for relative in sorted(paths):\n                parent = os.dup(fd)\n                try:\n                    parts = Path(relative).parts\n                    for part in parts[:-1]:\n                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)\n                        os.close(parent)\n                        parent = child\n                    scan(parent, parts[-1], prefix + "/" + relative)\n                except FileNotFoundError:\n                    pass\n                except OSError as exc:\n                    omissions.append(prefix + "/" + relative + " (ancestor unavailable: " + exc.strerror + ")")\n                finally:\n                    os.close(parent)\n        finally:\n            os.close(fd)\n    files["inventory/privileged-links.json"] = (json.dumps(links, indent=2) + "\\n").encode()\n    files["inventory/privileged-source-metadata.json"] = (json.dumps(metadata, indent=2) + "\\n").encode()\n    files["inventory/privileged-exclusions.json"] = (json.dumps(excluded, indent=2) + "\\n").encode()\n    return files, {"accounts": chosen, "roots": list(system_roots), "omissions": omissions}\n\n\ndef units(owner_uid, kit):\n    def quote(value):\n        value = str(value)\n        if "\\n" in value or "\\r" in value:\n            raise RuntimeError("Newlines are not allowed in a scheduler path.")\n        return \'"\' + value.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\').replace("%", "%%") + \'"\'\n    service = f"""{MARKER}\n[Unit]\nDescription=System-wide configuration capture and private user backup\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 -I {HELPER} --owner {owner_uid} --workspace {quote(kit)} --run-backup\nUMask=0077\nNice=10\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths={quote(kit)}\nSuccessExitStatus=3\nTimeoutStartSec=20min\n"""\n    timer = f"""{MARKER}\n[Unit]\nDescription=Daily system-wide configuration backup\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=10m\n[Install]\nWantedBy=timers.target\n"""\n    return service, timer\n\n\ndef install_scheduler(owner_uid, kit):\n    root = Path("/etc/systemd/system")\n    service, timer = units(owner_uid, kit)\n    targets = [(HELPER, globals().get("SELF_SOURCE") or Path(__file__).read_text(), 0o700),\n               (root / (UNIT + ".service"), service, 0o644), (root / (UNIT + ".timer"), timer, 0o644)]\n    HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)\n    for directory in (HELPER.parent, root):\n        info = directory.lstat()\n        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:\n            raise RuntimeError("Scheduler directories must be protected and root-owned.")\n    for path, _, _ in targets:\n        if path.is_symlink() or (path.exists() and MARKER not in path.read_text()):\n            raise RuntimeError("Refusing unmanaged scheduler file: " + str(path))\n        if path.suffix == ".service" and path.exists() and f"--owner {owner_uid} " not in path.read_text():\n            raise RuntimeError("System-wide scheduler belongs to another account.")\n    for path, text, mode in targets:\n        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".system-config-", delete=False) as output:\n            temporary = Path(output.name)\n            try:\n                output.write(text.encode())\n                os.fchmod(output.fileno(), mode)\n                os.fchown(output.fileno(), 0, 0)\n                output.flush()\n                os.fsync(output.fileno())\n                os.replace(temporary, path)\n            finally:\n                temporary.unlink(missing_ok=True)\n    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)\n    subprocess.run(["/usr/bin/systemctl", "enable", "--now", UNIT + ".timer"], check=True)\n\n\ndef main(install=False, owner_uid=None, workspace=None, run_backup=False, replace_user_timer=False):\n    os.umask(0o077)\n    if os.geteuid() != 0:\n        raise RuntimeError("Run the confirmed sudo capture action, or sudo ./capture-root-configs.sh")\n    identity = owner_uid if owner_uid is not None else os.environ.get("SUDO_UID")\n    if identity is None:\n        raise RuntimeError("A non-root sudo caller or explicit scheduler owner is required.")\n    owner = pwd.getpwuid(int(identity))\n    if owner.pw_uid == 0:\n        raise RuntimeError("A non-root backup owner is required.")\n    kit = Path(workspace).expanduser().absolute() if workspace else Path(__file__).resolve().parents[1]\n    if Path(owner.pw_dir) not in kit.parents or ".." in kit.parts or kit.is_symlink():\n        raise RuntimeError("The private workspace must be inside the backup owner\'s real home directory.")\n    files, details = collect(owner.pw_uid)\n    captured = dt.datetime.now(dt.timezone.utc).isoformat()\n    manifest = {"format": "ubuntu-configuration-v1", "kind": "system-wide-configuration-cache", "created_at": captured,\n                "captured_at": captured, **details,\n                "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),\n                           "executable": False} for name, data in sorted(files.items())]}\n    if sum(len(data) for data in files.values()) > MAX_TOTAL or len(json.dumps(manifest).encode()) > MAX_FILE:\n        raise RuntimeError("Complete configuration/metadata exceeds safety limits; old cache preserved.")\n    if install:\n        install_scheduler(owner.pw_uid, kit)\n    os.setgroups([])\n    os.setgid(owner.pw_gid)\n    os.setuid(owner.pw_uid)\n    os.environ.update(HOME=owner.pw_dir, XDG_RUNTIME_DIR=f"/run/user/{owner.pw_uid}",\n                      DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{owner.pw_uid}/bus")\n    destination = kit / "privileged-system"\n    if destination.is_symlink():\n        raise RuntimeError("Refusing a symlinked capture directory.")\n    destination.mkdir(mode=0o700, exist_ok=True)\n    destination.chmod(0o700)\n    temporary = None\n    try:\n        with tempfile.NamedTemporaryFile(dir=destination, prefix=".system-wide-", delete=False) as output:\n            temporary = Path(output.name)\n            with tarfile.open(fileobj=output, mode="w:gz") as archive:\n                payload = dict(files)\n                payload["manifest.json"] = (json.dumps(manifest, indent=2) + "\\n").encode()\n                for name, data in sorted(payload.items()):\n                    info = tarfile.TarInfo(name)\n                    info.size, info.mode = len(data), 0o600\n                    archive.addfile(info, io.BytesIO(data))\n            output.flush()\n            os.fsync(output.fileno())\n        with tarfile.open(temporary, "r:gz") as archive:\n            for record in manifest["files"]:\n                if hashlib.sha256(archive.extractfile(record["path"]).read()).hexdigest() != record["sha256"]:\n                    raise RuntimeError("Privileged cache verification failed; old cache preserved.")\n        os.replace(temporary, destination / "system-wide.tar.gz")\n        temporary = None\n        fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n    finally:\n        if temporary is not None:\n            temporary.unlink(missing_ok=True)\n    print(f"Privately captured {len(files)} configuration files across {len(details[\'accounts\'])} accounts (root plus local users); omissions: {len(details[\'omissions\'])}.")\n    if replace_user_timer:\n        old = Path(owner.pw_dir) / ".config/systemd/user/ubuntu-configuration-backup.timer"\n        if old.is_file() and not old.is_symlink() and "# Managed by ubuntu-configuration v1" in old.read_text():\n            subprocess.run(["systemctl", "--user", "disable", "--now", "ubuntu-configuration-backup.timer"], check=True)\n    if run_backup or install:\n        entrypoint = Path(owner.pw_dir) / "ubuntu-backup.py"\n        if not entrypoint.is_file():\n            entrypoint = kit / "ubuntu-backup.py"  # Compatibility with older recovered kits.\n        child = subprocess.run(["/usr/bin/python3", "-I", str(entrypoint), "--workspace", str(kit), "--non-interactive", "backup"], check=False)\n        if child.returncode not in (0, 3):\n            raise RuntimeError("Configuration backup exited with status " + str(child.returncode))\n        if child.returncode == 3:\n            raise SystemExit(3)\n    else:\n        print("Now run the normal backup command without sudo. Capture includes sensitive settings; it is NOT encrypted.")\n\n\nif __name__ == "__main__":\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument("--owner", type=int)\n    parser.add_argument("--workspace", type=Path)\n    parser.add_argument("--install-timer", action="store_true")\n    parser.add_argument("--replace-user-timer", action="store_true")\n    parser.add_argument("--run-backup", action="store_true")\n    options = parser.parse_args()\n    try:\n        main(options.install_timer, options.owner, options.workspace, options.run_backup, options.replace_user_timer)\n    except (RuntimeError, OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as exc:\n        print(f"Error: {exc}", file=sys.stderr)\n        sys.exit(1)\n'
@@ -4094,7 +4165,7 @@ UMask=0077
 Nice=10
 IOSchedulingClass=idle
 NoNewPrivileges=true
-TimeoutStartSec=10min
+TimeoutStartSec=20min
 """
     timer = f"""{MARKER}
 [Unit]
@@ -4131,7 +4202,11 @@ def disable_timer():
 
 def show_status():
     config = settings()
-    print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots")
+    support = release_support()
+    release = " ".join(value for value in (support.get("version"), support.get("name")) if value)
+    print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots\n"
+          f"Ubuntu: {release or 'unknown'} "
+          f"({'supported' if support.get('supported') else 'outside tested range'})")
     external = config["external_backup"]
     directory = None
     if not external:
@@ -7387,7 +7462,15 @@ def run_tray():
     except Exception as error:  # Typelib missing, version mismatch, or binding failure.
         print(f"AppIndicator GI unavailable ({type(error).__name__}); using ctypes fallback.", file=sys.stderr)
         try:
-            lib = ctypes.CDLL("libayatana-appindicator3.so.1")
+            lib = None
+            for library in ("libayatana-appindicator3.so.1", "libappindicator3.so.1"):
+                try:
+                    lib = ctypes.CDLL(library)
+                    break
+                except OSError:
+                    continue
+            if lib is None:
+                raise OSError("AppIndicator library not found")
 
             class PyCapsule(ctypes.Structure):
                 _fields_ = [("ob_refcnt", ctypes.c_ssize_t), ("ob_type", ctypes.c_void_p),

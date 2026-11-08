@@ -683,6 +683,29 @@ class PackageDeltaTests(unittest.TestCase):
         self.assertEqual(history["events"], 1)
 
 
+class ReleaseCompatibilityTests(unittest.TestCase):
+    def test_release_tuple_handles_point_releases(self):
+        self.assertEqual(backup.release_tuple("26.10"), (26, 10))
+        self.assertEqual(backup.release_tuple("26.04.1"), (26, 4))
+        self.assertIsNone(backup.release_tuple(""))
+        self.assertIsNone(backup.release_tuple("unknown"))
+
+    def test_supported_range_includes_intermediate_and_2610(self):
+        for version in ("22.04", "24.04", "24.10", "25.04", "25.10", "26.04", "26.10"):
+            result = backup.release_support({"VERSION_ID": version,
+                                             "UBUNTU_CODENAME": "test"})
+            self.assertTrue(result["supported"], version)
+        result = backup.release_support({"VERSION_ID": "26.10",
+                                         "UBUNTU_CODENAME": "stonking"})
+        self.assertEqual(result["name"], "Stonking Stingray")
+        self.assertEqual(result["tested_through"], "26.10")
+
+    def test_releases_outside_the_range_warn(self):
+        self.assertFalse(backup.release_support({"VERSION_ID": "20.04"})["supported"])
+        self.assertFalse(backup.release_support({"VERSION_ID": "27.04"})["supported"])
+        self.assertFalse(backup.release_support({"VERSION_ID": ""})["supported"])
+
+
 class PackageIntegrityTests(unittest.TestCase):
     def test_parse_dpkg_verify_reads_flags_notes_and_conffiles(self):
         records = backup.parse_dpkg_verify(

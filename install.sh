@@ -8,9 +8,11 @@ if (( $# )); then
 fi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 python3 -c 'import gi; gi.require_version("Gtk", "3.0")' 2>/dev/null || {
-    echo "GTK 3 Python bindings are required: sudo apt install python3-gi gir1.2-gtk-3.0" >&2
+    echo "GTK 3 Python bindings are required: sudo apt install python3-gi gir1.2-gtk-3.0 libayatana-appindicator3-1 gir1.2-ayatanaappindicator3-0.1" >&2
     exit 1
 }
+python3 -c 'import gi; gi.require_version("AyatanaAppIndicator3", "0.1")' 2>/dev/null || \
+    echo "Warning: Ayatana AppIndicator GI binding not found; the tray will use the ctypes or legacy fallback." >&2
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
