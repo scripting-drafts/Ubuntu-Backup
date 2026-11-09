@@ -6457,6 +6457,26 @@ def run_logged(command, log_path):
         raise ConfigError(message)
 
 
+def run_home_worker_with_fallback(command, log_path, native_capture=False):
+    """Run the tar worker; on volatile-file failure retry with native capture."""
+    try:
+        run_logged(command, log_path)
+        return native_capture
+    except ConfigError as first_error:
+        if native_capture:
+            raise
+        try:
+            native_core_path()
+        except ConfigError:
+            raise first_error
+        print("Strict tar capture failed; retrying with the native capture engine. "
+              "This tolerates volatile app locks and changing files.", file=sys.stderr)
+        native_command = list(command) + ["--native-capture"]
+        run_logged(native_command, Path(log_path).with_name(
+            Path(log_path).stem + "-native.log"))
+        return True
+
+
 def native_core_path():
     candidates = []
     override = os.environ.get("UBUNTU_BACKUP_NATIVE")
@@ -6529,7 +6549,8 @@ def wizard_home_backup(run_id=None, native_capture=False):
                "--workspace", str(KIT), "_backup-home-worker", "--run-id", run_id]
     if native_capture:
         command.append("--native-capture")
-    run_logged(command, KIT / "logs" / ("home-worker-" + run_id + ".log"))
+    native_capture = run_home_worker_with_fallback(
+        command, KIT / "logs" / ("home-worker-" + run_id + ".log"), native_capture)
     if native_capture:
         timeline = directory / "timeline" / "home" / ("home-full-" + run_id)
         manifest = verify_path(timeline)

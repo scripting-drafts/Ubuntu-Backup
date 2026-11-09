@@ -1292,6 +1292,50 @@ class SavedDriveMountTests(unittest.TestCase):
             backup.sys.stdin = saved
 
 
+class HomeCaptureFallbackTests(unittest.TestCase):
+    def test_tar_failure_retries_with_native_capture(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            log = Path(directory) / "home-worker.log"
+            calls = []
+
+            def fake_run(command, path):
+                calls.append((list(command), Path(path)))
+                if len(calls) == 1:
+                    raise backup.ConfigError("tar: file changed as we read it")
+
+            saved_run, saved_native = backup.run_logged, backup.native_core_path
+            backup.run_logged = fake_run
+            backup.native_core_path = lambda: Path("/bin/true")
+            try:
+                result = backup.run_home_worker_with_fallback(["sudo", "python"], log)
+            finally:
+                backup.run_logged, backup.native_core_path = saved_run, saved_native
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0][-1], "--native-capture")
+        self.assertTrue(calls[1][1].name.endswith("-native.log"))
+
+    def test_fallback_does_not_mask_a_native_failure(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            log = Path(directory) / "home-worker.log"
+            calls = []
+
+            def fake_run(command, path):
+                calls.append(list(command))
+                raise backup.ConfigError("worker failed")
+
+            saved_run, saved_native = backup.run_logged, backup.native_core_path
+            backup.run_logged = fake_run
+            backup.native_core_path = lambda: Path("/bin/true")
+            try:
+                with self.assertRaises(backup.ConfigError):
+                    backup.run_home_worker_with_fallback(["sudo", "python"], log)
+            finally:
+                backup.run_logged, backup.native_core_path = saved_run, saved_native
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][-1], "--native-capture")
+
+
 class FullHomeSafetyTests(unittest.TestCase):
     def test_home_backup_lock_rejects_a_second_capture(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
