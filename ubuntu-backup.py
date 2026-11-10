@@ -180,6 +180,9 @@ def settings():
         relative = PurePosixPath(subdirectory)
         if relative.is_absolute() or ".." in relative.parts:
             raise ConfigError("external_backup.subdirectory must stay below the drive root.")
+        marker_id = external.get("marker_id")
+        if marker_id is not None and not isinstance(marker_id, str):
+            raise ConfigError("external_backup.marker_id must be a string.")
     return value
 
 
@@ -3247,6 +3250,9 @@ def external_directory(config):
                           + ", ".join(str(item["directory"]) for item in drives)
                           + "); unmount the extra drives.")
     directory = drives[0]["directory"]
+    expected = external.get("marker_id")
+    if expected and drives[0]["marker"].get("id") != expected:
+        raise ConfigError("The mounted backup drive identity changed; reselect the drive.")
     subdirectory = external.get("subdirectory", "")
     return checked_path(directory, subdirectory) if subdirectory else directory
 
@@ -3405,16 +3411,18 @@ def set_external(mount_point, disable=False):
             existing = json.loads(marker.read_text())
             if existing.get("format") != FORMAT or not isinstance(existing.get("id"), str):
                 raise ConfigError("Refusing an unrecognized backup drive marker.")
+            marker_id = existing["id"]
         else:
+            marker_id = str(uuid.uuid4())
             try:
-                write_json(marker, {"format": FORMAT, "id": str(uuid.uuid4())})
+                write_json(marker, {"format": FORMAT, "id": marker_id})
             except OSError as exc:
                 raise ConfigError(
                     "Cannot write the backup marker on this drive; no backup was configured. "
                     f"Check ownership/permissions: {exc}") from None
-        # Only the relative subdirectory is persisted: the UUID lives in the filesystem
-        # superblock, the identity in the marker, and the mount path in /etc/fstab.
-        external = {"subdirectory": ""}
+        # Persist only the relative subdirectory and marker identity: the UUID lives
+        # in the filesystem superblock, the mount path in /etc/fstab.
+        external = {"subdirectory": "", "marker_id": marker_id}
         try:
             validate_external_directory(directory)
             directory.chmod(0o700)
@@ -5734,6 +5742,17 @@ def stream_object(stage_objects, stage_incoming, external_objects, stream, size,
     return external, sha256
 
 
+def remove_staging():
+    """Remove the disposable staging tree, including root-owned remnants."""
+    stage = KIT / "staging"
+    if stage.is_symlink():
+        stage.unlink(missing_ok=True)
+    elif stage.is_dir():
+        shutil.rmtree(stage)
+    elif stage.exists():
+        stage.unlink()
+
+
 def prepare_staging(external_root):
     """Create the disposable local staging area used before a bulk copy to the drive."""
     stage = KIT / "staging"
@@ -6020,6 +6039,75 @@ def _diagnose_previous_status():
         _status_history("inconsistent", "state=" + str(data.get("state")) +
                         " pid=" + str(data.get("pid")) + " updated=" + str(data.get("updated")) +
                         " reason=" + problem)
+
+
+EXTERNAL_PURGE_NAMES = ("baseline", "timeline", "ubuntu-configuration-backups")
+
+
+def _purge_path(path):
+    if path.is_symlink():
+        raise ConfigError("Refusing symlinked purge target: " + str(path))
+    if path.is_mount():
+        raise ConfigError("Refusing mounted purge target: " + str(path))
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def purge_all_data():
+    data = _read_tray_status()
+    if data.get("state") == "running":
+        raise ConfigError("Cancel the active backup before purging data.")
+    config = settings()
+    external = config.get("external_backup")
+    if external and not isinstance(external, dict):
+        raise ConfigError("Saved backup drive settings are incomplete; nothing was purged.")
+    external_dir = None
+    if external:
+        try:
+            external_dir = external_directory(config)
+            if external_dir.is_symlink():
+                raise ConfigError("Refusing symlinked external backup directory.")
+        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            raise ConfigError("External backup drive is unavailable; nothing was purged. "
+                              "Forget the drive first to purge local data only. " + str(exc)) from None
+        if marker_record(external_dir) is None:
+            raise ConfigError("External backup drive marker is missing or invalid; nothing was purged.")
+    lock_fd = None
+    try:
+        lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ConfigError("A backup is active; cancel it before purging data.") from None
+        if external_dir is not None:
+            for name in EXTERNAL_PURGE_NAMES:
+                _purge_path(external_dir / name)
+            marker = external_dir / ".ubuntu-configuration-target.json"
+            if marker.is_symlink():
+                raise ConfigError("Refusing symlinked external marker: " + str(marker))
+            marker.unlink(missing_ok=True)
+        script = SCRIPT_PATH.resolve()
+        for entry in list(KIT.iterdir()):
+            if entry.name in (".tray.lock", ".backup.lock"):
+                continue
+            if entry.resolve() == script or script.parent == entry:
+                continue
+            _purge_path(entry)
+        defaults = copy.deepcopy(EMBEDDED_DEFAULT_SETTINGS)
+        defaults["external_backup"] = None
+        defaults["home_snapshot"] = "off"
+        write_json(KIT / "config/settings.json", defaults)
+        _write_status("idle", "idle", "All backup data purged")
+        _status_history("idle", "all backup data purged")
+    except OSError as exc:
+        raise ConfigError("Purge incomplete: " + str(exc) +
+                          ". Run ./uninstall.sh --purge-backups with sudo to remove privileged data.") from None
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    return True
 
 
 def _ensure_tray():
@@ -6911,6 +6999,10 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
     KIT = Path(workspace).absolute()
     if HOME not in KIT.parents or ".." in KIT.parts:
         raise ConfigError("Workspace must be inside the sudo caller's home.")
+    try:
+        remove_staging()
+    except OSError as exc:
+        raise ConfigError("Cannot clear stale full /home staging: " + str(exc)) from None
     config = settings()
     allowed_cpus = restrict_backup_cpus()
     print("Backup worker pinned to CPUs: " + ",".join(map(str, sorted(allowed_cpus))), file=sys.stderr)
@@ -6969,6 +7061,10 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
             print("Native full /home timeline: " + str(report.get("timeline")))
             return
         finally:
+            try:
+                remove_staging()
+            except OSError as exc:
+                print("Warning: could not remove full /home staging: " + str(exc), file=sys.stderr)
             if snapshot is not None:
                 snapshot.close()
             os.close(fd)
@@ -7027,7 +7123,10 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
         if temporary is not None and temporary.exists():
             shutil.rmtree(temporary)
             clean_created_objects(created)
-        shutil.rmtree(KIT / "staging", ignore_errors=True)
+        try:
+            remove_staging()
+        except OSError as exc:
+            print("Warning: could not remove full /home staging: " + str(exc), file=sys.stderr)
         if snapshot is not None:
             snapshot.close()
         os.close(fd)
@@ -7260,70 +7359,6 @@ def run_tray():
             return False
 
         GLib.timeout_add(500, watch_window)
-
-    def purge_all_data():
-        data = current_status()
-        if data.get("state") == "running":
-            raise ConfigError("Cancel the active backup before purging data.")
-        config = settings()
-        external = config.get("external_backup")
-        if external and not isinstance(external, dict):
-            raise ConfigError("Saved backup drive settings are incomplete; nothing was purged.")
-        external_dir = None
-        if external:
-            try:
-                external_dir = external_directory(config)
-                if external_dir.is_symlink():
-                    raise ConfigError("Refusing symlinked external backup directory.")
-            except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-                raise ConfigError("External backup drive is unavailable; nothing was purged. "
-                                  "Forget the drive first to purge local data only. " + str(exc)) from None
-            if marker_record(external_dir) is None:
-                raise ConfigError("External backup drive marker is missing or invalid; nothing was purged.")
-        lock_fd = None
-        try:
-            lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                raise ConfigError("A backup is active; cancel it before purging data.") from None
-            if external_dir is not None:
-                for name in ("baseline", "timeline", "ubuntu-configuration-backups"):
-                    target = external_dir / name
-                    if target.is_symlink():
-                        raise ConfigError("Refusing to purge symlinked external data: " + str(target))
-                    if target.is_dir():
-                        shutil.rmtree(target)
-                    elif target.exists():
-                        target.unlink()
-                (external_dir / ".ubuntu-configuration-target.json").unlink(missing_ok=True)
-            script = SCRIPT_PATH.resolve()
-            for entry in list(KIT.iterdir()):
-                if entry.name in (".tray.lock", ".backup.lock", "config", "status.json"):
-                    continue
-                if entry.resolve() == script or script.parent == entry:
-                    continue
-                if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry)
-                else:
-                    entry.unlink(missing_ok=True)
-            config_dir = KIT / "config"
-            if config_dir.is_symlink() or config_dir.is_file():
-                config_dir.unlink()
-            elif config_dir.is_dir():
-                shutil.rmtree(config_dir)
-            status_path = KIT / "status.json"
-            if status_path.is_symlink() or status_path.is_file():
-                status_path.unlink()
-            elif status_path.is_dir():
-                shutil.rmtree(status_path)
-            write_json(KIT / "config/settings.json", json.loads(json.dumps(EMBEDDED_DEFAULT_SETTINGS)))
-            _write_status("idle", "idle", "All backup data purged")
-            _status_history("idle", "all backup data purged")
-        finally:
-            if lock_fd is not None:
-                os.close(lock_fd)
-        return True
 
     def show_purge_dialog(_item=None):
         try:

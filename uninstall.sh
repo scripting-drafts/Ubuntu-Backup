@@ -54,6 +54,62 @@ done
 if (( PURGE_BACKUPS )); then
     echo "Backup data will also be purged: local workspaces and configured external timelines."
 fi
+if (( DRY )) && (( PURGE_BACKUPS )); then
+    python3 - "${WORKSPACES[@]}" <<'PY'
+import json, sys
+from pathlib import Path
+
+def mountpoints():
+    points = []
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return points
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        point = fields[4]
+        for encoded, char in (("\\040", " "), ("\\011", "\t"),
+                              ("\\012", "\n"), ("\\134", "\\")):
+            point = point.replace(encoded, char)
+        points.append(Path(point))
+    return points
+
+def marker_at(base):
+    marker = Path(base) / ".ubuntu-configuration-target.json"
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        value = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return None
+    return marker if value.get("format") == "ubuntu-configuration-v1" else None
+
+for workspace in map(Path, sys.argv[1:]):
+    config = workspace / "config/settings.json"
+    if not config.is_file():
+        continue
+    try:
+        value = json.loads(config.read_text()).get("external_backup")
+    except (OSError, ValueError, AttributeError):
+        continue
+    if not isinstance(value, dict):
+        continue
+    subdirectory = value.get("subdirectory") or ""
+    if not isinstance(subdirectory, str):
+        continue
+    relative = Path(subdirectory)
+    if relative.is_absolute() or ".." in relative.parts:
+        continue
+    legacy = value.get("mount_point")
+    bases = [Path(legacy)] if isinstance(legacy, str) and legacy else mountpoints()
+    for base in bases:
+        marker = marker_at(base / relative if relative.parts else base)
+        if marker is not None:
+            print("External backup root: " + str(marker.parent))
+PY
+fi
 if (( DRY )); then
     echo "Dry run only; nothing removed."
     exit 0
@@ -170,8 +226,10 @@ for workspace in map(Path, sys.argv[1:]):
 
     legacy = value.get("mount_point")
     raw_subdirectory = value.get("subdirectory") or ""
-    if not isinstance(raw_subdirectory, str):
-        print("Invalid external backup subdirectory in " + str(config), file=sys.stderr)
+    expected_marker = value.get("marker_id")
+    if not isinstance(raw_subdirectory, str) or (expected_marker is not None
+                                                 and not isinstance(expected_marker, str)):
+        print("Invalid external backup settings in " + str(config), file=sys.stderr)
         failed_any = True
         continue
     subdirectory = Path(raw_subdirectory)
@@ -198,6 +256,18 @@ for workspace in map(Path, sys.argv[1:]):
         failed_any = True
         continue
     root = next(iter(roots))
+    try:
+        marker_value = json.loads((root / MARKER).read_text())
+    except (OSError, ValueError) as exc:
+        print("Could not read external marker " + str(root / MARKER) + ": " + str(exc),
+              file=sys.stderr)
+        failed_any = True
+        continue
+    if expected_marker and marker_value.get("id") != expected_marker:
+        print("Backup marker identity changed at " + str(root) +
+              "; external purge skipped.", file=sys.stderr)
+        failed_any = True
+        continue
     failed = False
     for name in EXTERNAL_DATA:
         target = root / name
@@ -346,8 +416,12 @@ fi
 if [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
 fi
-command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
-command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
+if command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$APPS" 2>/dev/null || true
+fi
+if command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
+fi
 if (( PURGE_BACKUPS )); then
     if (( PURGE_FAILED )); then
         echo "Uninstall complete, but purge was incomplete; see errors above." >&2

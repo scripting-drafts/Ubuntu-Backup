@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Restart the tray icon if it is stuck or not visible.
 set -Eeuo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/ubuntu-backup.py"
 WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$HOME/ubuntu-backup/data}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -33,5 +32,9 @@ else
     echo "No graphical session detected; tray will start at login." >&2
     exit 1
 fi
-command -v update-desktop-database >/dev/null && update-desktop-database "$DATA/applications" 2>/dev/null || true
-command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
+if command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$DATA/applications" 2>/dev/null || true
+fi
+if command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null || true
+fi

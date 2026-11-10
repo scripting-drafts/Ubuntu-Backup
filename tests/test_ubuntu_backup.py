@@ -248,6 +248,30 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), source.read_bytes())
 
 
+class StagingCleanupTests(unittest.TestCase):
+    def test_remove_staging_removes_tree_and_symlink_without_following(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            saved = backup.KIT
+            backup.KIT = base
+            try:
+                stage = base / "staging"
+                (stage / "objects").mkdir(parents=True)
+                (stage / "objects" / "object").write_text("data")
+                backup.remove_staging()
+                self.assertFalse(stage.exists())
+
+                target = base / "target"
+                target.mkdir()
+                (target / "keep").write_text("keep")
+                stage.symlink_to(target)
+                backup.remove_staging()
+                self.assertFalse(stage.exists())
+                self.assertTrue((target / "keep").is_file())
+            finally:
+                backup.KIT = saved
+
+
 class HomeCaptureSparseTests(unittest.TestCase):
     def test_capture_publishes_a_sparse_file_timeline(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -1224,6 +1248,16 @@ class SavedDriveMountTests(unittest.TestCase):
         backup.attached_drives = lambda: [self.device(uuid="x", mountpoints=[str(directory)])]
         self.assertEqual(backup.external_directory({"external_backup": {"subdirectory": ""}}), directory)
 
+    def test_changed_marker_identity_is_rejected(self):
+        directory = self.marked("drive", "id-1")
+        backup.on_source_filesystem = lambda path: False
+        backup.attached_drives = lambda: [self.device(uuid="x", mountpoints=[str(directory)])]
+        with self.assertRaises(backup.ConfigError):
+            backup.external_directory({"external_backup": {
+                "subdirectory": "", "marker_id": "id-2"}})
+        self.assertEqual(backup.external_directory({"external_backup": {
+            "subdirectory": "", "marker_id": "id-1"}}), directory)
+
     def test_unmarked_and_two_marked_mounts(self):
         plain = self.root / "plain"
         plain.mkdir()
@@ -1249,8 +1283,10 @@ class SavedDriveMountTests(unittest.TestCase):
                 backup.set_external(str(mount))
         finally:
             backup.mount_info, backup.validate_external_directory, backup.on_source_filesystem = saved
+        marker = json.loads((mount / ".ubuntu-configuration-target.json").read_text())
         stored = json.loads((self.root / "config/settings.json").read_text())
-        self.assertEqual(stored["external_backup"], {"subdirectory": ""})
+        self.assertEqual(stored["external_backup"]["subdirectory"], "")
+        self.assertEqual(stored["external_backup"]["marker_id"], marker["id"])
 
     def test_ext4_lost_and_found_does_not_block_adoption(self):
         mount = self.root / "mount"
@@ -1265,7 +1301,8 @@ class SavedDriveMountTests(unittest.TestCase):
             marker = json.loads((mount / ".ubuntu-configuration-target.json").read_text())
             self.assertEqual(marker["format"], backup.FORMAT)
             stored = json.loads((self.root / "config/settings.json").read_text())
-            self.assertEqual(stored["external_backup"], {"subdirectory": ""})
+            self.assertEqual(stored["external_backup"]["subdirectory"], "")
+            self.assertEqual(stored["external_backup"]["marker_id"], marker["id"])
         finally:
             backup.mount_info, backup.validate_external_directory, backup.on_source_filesystem = saved
 
@@ -1565,7 +1602,8 @@ class PrepareDriveIntegrationTests(unittest.TestCase):
             marker = json.loads((mount / ".ubuntu-configuration-target.json").read_text())
             self.assertEqual(marker["format"], backup.FORMAT)
             stored = json.loads((root / "config/settings.json").read_text())
-            self.assertEqual(stored["external_backup"], {"subdirectory": ""})
+            self.assertEqual(stored["external_backup"]["subdirectory"], "")
+            self.assertEqual(stored["external_backup"]["marker_id"], marker["id"])
 
 
 class DriveFormatTests(unittest.TestCase):
@@ -1909,7 +1947,7 @@ class UninstallScriptTests(unittest.TestCase):
             settings_path = workspace / "config/settings.json"
             settings = json.loads(settings_path.read_text())
             settings["external_backup"] = {
-                "mount_point": str(external), "subdirectory": ""}
+                "mount_point": str(external), "subdirectory": "", "marker_id": "test"}
             settings_path.write_text(json.dumps(settings))
             result = subprocess.run(
                 [str(script), "--yes", "--purge-backups"],
@@ -1918,6 +1956,229 @@ class UninstallScriptTests(unittest.TestCase):
             self.assertFalse(workspace.exists())
             self.assertFalse(external.exists())
             self.assertIn("Purged backup layout", result.stdout)
+
+    def test_dry_run_prints_the_exact_external_root(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            script, env, workspace = self._prepare(base)
+            external = base / "external"
+            external.mkdir()
+            (external / ".ubuntu-configuration-target.json").write_text(
+                json.dumps({"format": "ubuntu-configuration-v1", "id": "test"}))
+            (external / "baseline").mkdir()
+            (external / "baseline/data").write_text("sentinel")
+            settings_path = workspace / "config/settings.json"
+            settings = json.loads(settings_path.read_text())
+            settings["external_backup"] = {
+                "mount_point": str(external), "subdirectory": "", "marker_id": "test"}
+            settings_path.write_text(json.dumps(settings))
+            result = subprocess.run(
+                [str(script), "--dry-run", "--purge-backups"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("External backup root: " + str(external), result.stdout)
+            self.assertTrue(workspace.exists())
+            self.assertTrue((external / "baseline/data").is_file())
+
+    def test_purge_refuses_a_changed_external_marker_identity(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            script, env, workspace = self._prepare(base)
+            external = base / "external"
+            external.mkdir()
+            (external / ".ubuntu-configuration-target.json").write_text(
+                json.dumps({"format": "ubuntu-configuration-v1", "id": "test"}))
+            (external / "baseline").mkdir()
+            (external / "baseline/data").write_text("sentinel")
+            settings_path = workspace / "config/settings.json"
+            settings = json.loads(settings_path.read_text())
+            settings["external_backup"] = {
+                "mount_point": str(external), "subdirectory": "", "marker_id": "other"}
+            settings_path.write_text(json.dumps(settings))
+            result = subprocess.run(
+                [str(script), "--yes", "--purge-backups"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("identity changed", result.stderr)
+            self.assertFalse(workspace.exists())
+            self.assertTrue((external / "baseline/data").is_file())
+            self.assertTrue((external / ".ubuntu-configuration-target.json").is_file())
+
+    def test_purge_refuses_a_symlinked_workspace(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            script, env, workspace = self._prepare(base)
+            target = base / "workspace-target"
+            target.mkdir()
+            (target / "keep").write_text("keep")
+            shutil.rmtree(workspace)
+            workspace.symlink_to(target)
+            result = subprocess.run(
+                [str(script), "--yes", "--purge-backups"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlinked workspace", result.stderr)
+            self.assertTrue((target / "keep").is_file())
+
+    def test_purge_refuses_a_mounted_workspace(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            script, env, workspace = self._prepare(base)
+            fake = base / "fakebin"
+            fake.mkdir()
+            (fake / "mountpoint").write_text("#!/bin/sh\nexit 0\n")
+            (fake / "mountpoint").chmod(0o755)
+            env["PATH"] = str(fake) + os.pathsep + env.get("PATH", "")
+            result = subprocess.run(
+                [str(script), "--yes", "--purge-backups"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("mounted workspace", result.stderr)
+            self.assertTrue((workspace / "snapshot/manifest.json").is_file())
+
+    def test_incomplete_external_purge_exits_nonzero(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            script, env, workspace = self._prepare(base)
+            external = base / "external"
+            external.mkdir()
+            (external / ".ubuntu-configuration-target.json").write_text(
+                json.dumps({"format": "ubuntu-configuration-v1", "id": "test"}))
+            target = base / "unrelated"
+            target.mkdir()
+            (target / "keep").write_text("keep")
+            (external / "baseline").symlink_to(target)
+            settings_path = workspace / "config/settings.json"
+            settings = json.loads(settings_path.read_text())
+            settings["external_backup"] = {
+                "mount_point": str(external), "subdirectory": "", "marker_id": "test"}
+            settings_path.write_text(json.dumps(settings))
+            result = subprocess.run(
+                [str(script), "--yes", "--purge-backups"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Could not purge", result.stderr)
+            self.assertIn("purge was incomplete", result.stderr)
+            self.assertTrue((target / "keep").is_file())
+            self.assertFalse(workspace.exists())
+
+
+class PurgeAllDataTests(unittest.TestCase):
+    def _workspace(self, base, external=None):
+        kit = base / "data"
+        (kit / "config").mkdir(parents=True)
+        settings_value = {"keep_snapshots": 30, "external_backup": external}
+        (kit / "config/settings.json").write_text(json.dumps(settings_value))
+        for name in ("snapshot", "logs", "privileged-package-scan"):
+            (kit / name).mkdir()
+            (kit / name / "sentinel").write_text("sentinel")
+        (kit / "history.txt").write_text("old history\n")
+        return kit
+
+    def test_purge_removes_all_local_data_and_resets_defaults(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = self._workspace(Path(directory))
+            saved = backup.KIT
+            backup.KIT = kit
+            try:
+                self.assertTrue(backup.purge_all_data())
+            finally:
+                backup.KIT = saved
+            self.assertFalse((kit / "snapshot").exists())
+            self.assertFalse((kit / "logs").exists())
+            self.assertFalse((kit / "privileged-package-scan").exists())
+            self.assertTrue((kit / "config/settings.json").is_file())
+            self.assertTrue((kit / "status.json").is_file())
+            self.assertIn("all backup data purged", (kit / "history.txt").read_text())
+            status = json.loads((kit / "status.json").read_text())
+            self.assertEqual(status["state"], "idle")
+            self.assertIsNone(backup._status_problem(status))
+            settings_value = json.loads((kit / "config/settings.json").read_text())
+            self.assertIsNone(settings_value["external_backup"])
+            self.assertEqual(settings_value["home_snapshot"], "off")
+
+    def test_purge_removes_configured_external_layout(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            external = base / "external"
+            external.mkdir()
+            (external / ".ubuntu-configuration-target.json").write_text(
+                json.dumps({"format": backup.FORMAT, "id": "test"}))
+            for name in backup.EXTERNAL_PURGE_NAMES:
+                (external / name).mkdir()
+                (external / name / "sentinel").write_text("sentinel")
+            kit = self._workspace(base, external={"subdirectory": ""})
+            saved = (backup.KIT, backup.external_directory, backup.marker_record)
+            backup.KIT = kit
+            backup.external_directory = lambda config: external
+            backup.marker_record = lambda path: {"format": backup.FORMAT, "id": "test"}
+            try:
+                self.assertTrue(backup.purge_all_data())
+            finally:
+                backup.KIT, backup.external_directory, backup.marker_record = saved
+            for name in backup.EXTERNAL_PURGE_NAMES:
+                self.assertFalse((external / name).exists())
+            self.assertFalse((external / ".ubuntu-configuration-target.json").exists())
+
+
+class InstallRoundTripTests(unittest.TestCase):
+    def _prepare(self, base):
+        repo = base / "repo"
+        (repo / "native").mkdir(parents=True)
+        for name in ("install.sh", "uninstall.sh", "ubuntu-backup.py", "ubuntu-backup.svg"):
+            shutil.copy2(ROOT / name, repo / name)
+        shutil.copy2(ROOT / "native/ubackup-core", repo / "native/ubackup-core")
+        (repo / "install.sh").chmod(0o755)
+        (repo / "uninstall.sh").chmod(0o755)
+        (repo / "native/ubackup-core").chmod(0o700)
+
+        home = base / "home"
+        bin_dir = home / ".local/bin"
+        data_dir = home / ".local/share"
+        config_dir = home / ".config"
+        fake = base / "fakebin"
+        fake.mkdir()
+        for name in ("systemctl", "update-desktop-database", "gtk-update-icon-cache"):
+            path = fake / name
+            path.write_text("#!/bin/sh\nexit 0\n")
+            path.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(home),
+            "XDG_BIN_HOME": str(bin_dir),
+            "XDG_DATA_HOME": str(data_dir),
+            "XDG_CONFIG_HOME": str(config_dir),
+            "UBUNTU_BACKUP_SKIP_START": "1",
+            "UBUNTU_BACKUP_SKIP_SERVICE": "1",
+            "PATH": str(fake) + os.pathsep + env.get("PATH", ""),
+        })
+        return repo, env, bin_dir
+
+    def test_install_uninstall_install_restores_the_command_symlink(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            repo, env, bin_dir = self._prepare(Path(directory))
+            for _ in range(2):
+                result = subprocess.run([str(repo / "install.sh")], capture_output=True,
+                                        text=True, env=env, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((bin_dir / "ubuntu-backup.py").is_file())
+                self.assertTrue((bin_dir / "ubuntu-backup").is_symlink())
+                self.assertEqual((bin_dir / "ubuntu-backup").readlink(),
+                                 Path("ubuntu-backup.py"))
+
+            result = subprocess.run([str(repo / "uninstall.sh"), "--yes"],
+                                    input="", capture_output=True, text=True, env=env,
+                                    timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((bin_dir / "ubuntu-backup.py").exists())
+            self.assertFalse((bin_dir / "ubuntu-backup").exists())
+
+            result = subprocess.run([str(repo / "install.sh")], capture_output=True,
+                                    text=True, env=env, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((bin_dir / "ubuntu-backup").is_symlink())
+            self.assertEqual((bin_dir / "ubuntu-backup").readlink(),
+                             Path("ubuntu-backup.py"))
 
 
 class DeployCompatibilityTests(unittest.TestCase):
