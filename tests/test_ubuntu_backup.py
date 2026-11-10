@@ -1881,6 +1881,32 @@ class BackupRestoreFlowTests(unittest.TestCase):
                 backup.backup_everything()
         scan.assert_called_once_with(non_interactive=False, force=True)
 
+    def test_backup_flow_can_skip_the_refresh_prompt(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            drive = Path(directory) / "drive"
+            drive.mkdir()
+            with (
+                mock.patch.object(backup, "_diagnose_previous_status"),
+                mock.patch.object(backup, "_ensure_tray"),
+                mock.patch.object(backup, "_write_status"),
+                mock.patch.object(backup, "_status_history"),
+                mock.patch.object(backup, "package_scan_summary", return_value="Package scan: test"),
+                mock.patch.object(backup, "capture_root_package_scan") as scan,
+                mock.patch.object(backup, "capture_root"),
+                mock.patch.object(backup, "settings",
+                                   return_value={"external_backup": {"subdirectory": ""}}),
+                mock.patch.object(backup, "external_directory", return_value=drive),
+                mock.patch.object(backup, "validate_external_directory"),
+                mock.patch.object(backup, "interactive_backup", return_value=drive / "backup"),
+                mock.patch.object(backup, "wizard_home_backup", return_value=True),
+                mock.patch.object(backup, "confirm") as confirm,
+                redirect_stdout(io.StringIO()),
+            ):
+                backup.backup_everything(refresh_package_scan=False)
+        scan.assert_not_called()
+        confirm.assert_not_called()
+
     def test_recovery_flow_offers_package_restore(self):
         from unittest import mock
         source = Path("/tmp/snapshot")
@@ -1894,6 +1920,20 @@ class BackupRestoreFlowTests(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             backup.wizard_recover()
+        package_restore.assert_called_once_with(destination)
+
+    def test_recovery_flow_accepts_an_explicit_package_choice(self):
+        from unittest import mock
+        destination = Path("/tmp/restored")
+        with (
+            mock.patch.object(backup, "choose_archive", return_value=Path("/tmp/snapshot")),
+            mock.patch.object(backup, "restore", return_value=destination),
+            mock.patch.object(backup, "confirm", side_effect=[False, False]) as confirm,
+            mock.patch.object(backup, "wizard_restore_package_files") as package_restore,
+            redirect_stdout(io.StringIO()),
+        ):
+            backup.wizard_recover(flow="1", restore_packages=True)
+        self.assertEqual(confirm.call_count, 2)
         package_restore.assert_called_once_with(destination)
 
     def test_package_restore_wizard_accepts_an_explicit_source(self):
@@ -1930,7 +1970,7 @@ class MenuIntegrationTests(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             backup.wizard_recover()
-        restore.assert_called_once_with()
+        restore.assert_called_once_with(None)
 
 
 class TrayStatusFallbackTests(unittest.TestCase):
