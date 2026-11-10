@@ -1855,6 +1855,28 @@ class BackupStatusTests(unittest.TestCase):
             self.assertTrue(str(history[1][2]).endswith("logs/ubuntu-backup.log"))
 
 
+class MenuIntegrationTests(unittest.TestCase):
+    def test_backup_action_contains_package_scan(self):
+        from unittest import mock
+        with (
+            mock.patch.object(backup, "ask", side_effect=["1", "2", "0"]),
+            mock.patch.object(backup, "capture_root_package_scan") as scan,
+            redirect_stdout(io.StringIO()),
+        ):
+            backup.menu()
+        scan.assert_called_once_with(non_interactive=False, force=True)
+
+    def test_restore_action_contains_package_restore(self):
+        from unittest import mock
+        with (
+            mock.patch.object(backup, "ask", return_value="4"),
+            mock.patch.object(backup, "wizard_restore_package_files") as restore,
+            redirect_stdout(io.StringIO()),
+        ):
+            backup.wizard_recover()
+        restore.assert_called_once_with()
+
+
 class TrayStatusFallbackTests(unittest.TestCase):
     def test_missing_or_malformed_status_is_valid_idle(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:

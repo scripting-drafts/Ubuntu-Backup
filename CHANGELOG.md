@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Nest package scan under the backup action and modified-package restore under the restore action.
+
 ## v1.0.0 - 2026-11-10
 - Harden purge handling: complete workspace removal, mount/symlink guards, sudo fallback for root-owned data, clear incomplete-purge failures.
 - Verify backup-drive marker identity during selection, backups, and external purge; print exact external roots in uninstall dry runs.

@@ -4444,12 +4444,16 @@ def wizard_recover(source=None):
     print("1. Recover configuration (stage a backup, then optionally deploy)")
     print("2. Recover full /home (stage only; live /home is never changed)")
     print("3. Deploy a saved snapshot directly (may install packages)")
+    print("4. Restore modified package files (in place)")
     print("0. Cancel")
     choice = ask("Recovery", "0")
     if choice == "0":
         return
     if choice == "3":
         wizard_deploy(source)
+        return
+    if choice == "4":
+        wizard_restore_package_files()
         return
     if choice == "1":
         path = source or choose_archive("config")
@@ -4869,8 +4873,6 @@ def menu():
         print("4. Choose backup drive (or leave unset)")
         print("5. Automatic backup and privileged-capture schedule")
         print("6. Format a new backup drive (ERASES ALL DATA)")
-        print("7. Restore modified package files (in place)")
-        print("8. Refresh privileged package scan (sudo)")
         print("u. Undo restore")
         print("s. Status")
         print("0. Exit")
@@ -4879,7 +4881,16 @@ def menu():
             if choice == "0":
                 return
             if choice == "1":
-                backup_everything()
+                print("1. Run backup now (includes privileged package scan)")
+                print("2. Refresh privileged package scan only (sudo)")
+                print("0. Cancel")
+                backup_choice = ask("Backup", "1")
+                if backup_choice == "1":
+                    backup_everything()
+                elif backup_choice == "2":
+                    capture_root_package_scan(non_interactive=False, force=True)
+                elif backup_choice != "0":
+                    raise ConfigError("Choose one of the listed backup actions.")
             elif choice == "2":
                 wizard_recover()
             elif choice == "3":
@@ -4890,10 +4901,6 @@ def menu():
                 wizard_schedule()
             elif choice == "6":
                 wizard_prepare_drive()
-            elif choice == "7":
-                wizard_restore_package_files()
-            elif choice == "8":
-                capture_root_package_scan(non_interactive=False, force=True)
             elif choice == "u":
                 wizard_undo_restore()
             elif choice == "s":
@@ -7182,21 +7189,29 @@ def run_tray():
     package_status_item.set_sensitive(False)
     package_capture_item = Gtk.MenuItem(label="Refresh package scan…")
     package_restore_item = Gtk.MenuItem(label="Restore modified package files…")
-    restore_option = Gtk.MenuItem(label="Restore…")
+    restore_option = Gtk.MenuItem(label="Recover configuration or full /home…")
     drive_option = Gtk.MenuItem(label="Choose backup drive")
     purge_item = Gtk.MenuItem(label="Purge all data")
+    backup_menu = Gtk.Menu()
+    backup_menu.append(backup_item)
+    backup_menu.append(Gtk.SeparatorMenuItem())
+    backup_menu.append(package_status_item)
+    backup_menu.append(package_capture_item)
+    backup_action_item = Gtk.MenuItem(label="Backup")
+    backup_action_item.set_submenu(backup_menu)
+    restore_menu = Gtk.Menu()
+    restore_menu.append(restore_option)
+    restore_menu.append(package_restore_item)
+    restore_action_item = Gtk.MenuItem(label="Restore")
+    restore_action_item.set_submenu(restore_menu)
     options_menu = Gtk.Menu()
-    options_menu.append(package_status_item)
-    options_menu.append(package_capture_item)
-    options_menu.append(package_restore_item)
-    options_menu.append(Gtk.SeparatorMenuItem())
-    options_menu.append(restore_option)
     options_menu.append(drive_option)
     options_menu.append(purge_item)
     options_item = Gtk.MenuItem(label="Options")
     options_item.set_submenu(options_menu)
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), live_item, history_item, options_item):
+    for item in (status_item, backup_action_item, Gtk.SeparatorMenuItem(), live_item, history_item,
+                 restore_action_item, options_item):
         menu.append(item)
     menu.show_all()
 
