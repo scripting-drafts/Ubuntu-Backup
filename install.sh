@@ -23,6 +23,7 @@ SYSTEMD="$CONFIG/systemd/user"
 WORKSPACE="$HOME/ubuntu-backup/data"
 mkdir -p "$BIN" "$APPS" "$ICONS" "$AUTODIR" "$SYSTEMD"
 install -m 700 "$ROOT/ubuntu-backup.py" "$BIN/ubuntu-backup.py"
+install -m 700 "$ROOT/ubuntu-backup-askpass.py" "$BIN/ubuntu-backup-askpass"
 LINK="$BIN/ubuntu-backup"
 if [[ -L "$LINK" ]]; then
     link_target="$(readlink -- "$LINK" || true)"

@@ -1,5 +1,6 @@
 *
 !ubuntu-backup.py
+!ubuntu-backup-askpass.py
 !ubuntu-backup.svg
 !install.sh
 !uninstall.sh

@@ -5,6 +5,7 @@
 - Include package scan status/refresh in the backup flow and optional modified-package restore in the configuration recovery flow.
 - Hide package scan and modified-package restore from menus; they are now steps inside the Backup and Restore flows.
 - Embed Live status in the Backup and Restore flows and remove the standalone Live status menu entry.
+- Run Backup, Restore, and Prepare Drive in GTK process windows; sudo passwords use an askpass pop-up.
 
 ## v1.0.0 - 2026-11-10
 - Harden purge handling: complete workspace removal, mount/symlink guards, sudo fallback for root-owned data, clear incomplete-purge failures.

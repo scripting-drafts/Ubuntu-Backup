@@ -6,6 +6,7 @@
 import argparse
 import base64
 from contextlib import contextmanager
+import contextlib
 import datetime as dt
 import fcntl
 import fnmatch
@@ -3946,7 +3947,13 @@ class Cancelled(Exception):
     pass
 
 
+_GUI_PROMPT_HANDLER = None
+_GUI_PROCESS_ACTIVE = False
+
+
 def ask(prompt, default=None):
+    if _GUI_PROMPT_HANDLER is not None:
+        return _GUI_PROMPT_HANDLER("ask", prompt, default)
     suffix = f" [{default}]" if default is not None else ""
     try:
         value = input(prompt + suffix + ": ").strip()
@@ -3956,6 +3963,8 @@ def ask(prompt, default=None):
 
 
 def confirm(prompt, default=False):
+    if _GUI_PROMPT_HANDLER is not None:
+        return _GUI_PROMPT_HANDLER("confirm", prompt, default)
     while True:
         value = ask(prompt + (" [Y/n]" if default else " [y/N]")).lower()
         if not value:
@@ -4755,8 +4764,11 @@ def interactive_backup():
 def backup_everything(native_capture=False):
     """Single flow: privileged configuration, configuration backup, full /home."""
     global _STATUS_RUN, _LAST_HOME_WARNINGS
-    signal.signal(signal.SIGTERM, signal.default_int_handler)
-    signal.signal(signal.SIGHUP, signal.default_int_handler)
+    try:
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
+        signal.signal(signal.SIGHUP, signal.default_int_handler)
+    except ValueError:
+        pass  # GUI worker threads cannot install signal handlers.
     _STATUS_RUN = True
     _LAST_HOME_WARNINGS = 0
     _diagnose_previous_status()
@@ -7127,6 +7139,169 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
             snapshot.close()
         os.close(fd)
 
+def run_process_window(title, target):
+    """Run a Python action in a GTK log window with GUI prompts and sudo askpass."""
+    global _GUI_PROMPT_HANDLER, _GUI_PROCESS_ACTIVE
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk
+    import queue
+    if _GUI_PROCESS_ACTIVE:
+        raise ConfigError("A backup or restore process window is already running.")
+    _GUI_PROCESS_ACTIVE = True
+
+    window = Gtk.Window(title="Ubuntu Backup — " + title)
+    window.set_default_size(760, 460)
+    window.set_icon_name("ubuntu-backup")
+    window.set_border_width(12)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    window.add(outer)
+    progress = Gtk.ProgressBar()
+    outer.pack_start(progress, False, False, 0)
+    view = Gtk.TextView(editable=False, monospace=True)
+    scroll = Gtk.ScrolledWindow()
+    scroll.add(view)
+    outer.pack_start(scroll, True, True, 0)
+    controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    close_button = Gtk.Button(label="Running…")
+    close_button.set_sensitive(False)
+    close_button.connect("clicked", lambda _button: window.destroy())
+    controls.pack_end(close_button, False, False, 0)
+    outer.pack_start(controls, False, False, 0)
+    output = queue.Queue()
+    state = {"active": True, "ok": False}
+
+    class Writer:
+        def write(self, text):
+            if text:
+                output.put(text)
+            return len(text)
+
+        def flush(self):
+            pass
+
+    def append(text):
+        buffer = view.get_buffer()
+        buffer.insert(buffer.get_end_iter(), text)
+        view.scroll_to_mark(buffer.get_insert(), 0.0, True, 0.0, 1.0)
+
+    def drain():
+        if not window.get_visible():
+            return False
+        while True:
+            try:
+                append(output.get_nowait())
+            except queue.Empty:
+                break
+        return True
+
+    def finish(ok):
+        global _GUI_PROMPT_HANDLER, _GUI_PROCESS_ACTIVE
+        state["active"] = False
+        state["ok"] = ok
+        _GUI_PROMPT_HANDLER = None
+        _GUI_PROCESS_ACTIVE = False
+        progress.set_fraction(1.0 if ok else 0.0)
+        close_button.set_sensitive(True)
+        close_button.set_label("Close")
+        append("\nProcess finished.\n" if ok else "\nProcess failed.\n")
+        return False
+
+    def pulse():
+        if not state["active"] or not window.get_visible():
+            return False
+        progress.pulse()
+        return True
+
+    def prompt(kind, message, default):
+        result = {"value": None}
+        done = threading.Event()
+
+        def show():
+            if kind == "confirm":
+                dialog = Gtk.MessageDialog(
+                    parent=window, flags=Gtk.DialogFlags.MODAL,
+                    type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.YES_NO,
+                    text=message)
+                dialog.set_default_response(
+                    Gtk.ResponseType.YES if default else Gtk.ResponseType.NO)
+                response = dialog.run()
+                dialog.destroy()
+                result["value"] = (response == Gtk.ResponseType.YES if response in
+                                   (Gtk.ResponseType.YES, Gtk.ResponseType.NO) else bool(default))
+            else:
+                dialog = Gtk.Dialog(title="Ubuntu Backup", parent=window,
+                                    flags=Gtk.DialogFlags.MODAL)
+                dialog.set_default_size(460, 150)
+                dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+                dialog.add_button("Continue", Gtk.ResponseType.OK)
+                dialog.set_default_response(Gtk.ResponseType.OK)
+                box = dialog.get_content_area()
+                box.set_border_width(12)
+                box.set_spacing(8)
+                label = Gtk.Label(label=message, xalign=0, wrap=True)
+                label.set_max_width_chars(72)
+                entry = Gtk.Entry()
+                if default is not None:
+                    entry.set_text(str(default))
+                entry.set_activates_default(True)
+                box.pack_start(label, False, False, 0)
+                box.pack_start(entry, False, False, 0)
+                box.show_all()
+                response = dialog.run()
+                value = entry.get_text()
+                dialog.destroy()
+                if response == Gtk.ResponseType.OK:
+                    result["value"] = value.strip() if value.strip() else (
+                        str(default) if default is not None else "")
+            done.set()
+            return False
+
+        GLib.idle_add(show)
+        done.wait()
+        if result["value"] is None:
+            raise Cancelled("Input cancelled.")
+        return result["value"]
+
+    def worker():
+        global _GUI_PROMPT_HANDLER
+        _GUI_PROMPT_HANDLER = prompt
+        saved_env = {key: os.environ.get(key)
+                     for key in ("SUDO_ASKPASS", "SUDO_ASKPASS_REQUIRE")}
+        helper = next((path for path in (
+            SCRIPT_PATH.parent / "ubuntu-backup-askpass",
+            SCRIPT_PATH.parent / "ubuntu-backup-askpass.py",
+        ) if path.is_file() and os.access(path, os.X_OK)), None)
+        if helper is not None:
+            os.environ["SUDO_ASKPASS"] = str(helper)
+            os.environ["SUDO_ASKPASS_REQUIRE"] = "force"
+        writer = Writer()
+        ok = False
+        try:
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                target()
+            ok = True
+        except Cancelled as exc:
+            output.put("\nCancelled: " + str(exc) + "\n")
+        except BaseException as exc:
+            output.put(f"\n{type(exc).__name__}: {exc}\n")
+        finally:
+            _GUI_PROMPT_HANDLER = None
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            GLib.idle_add(finish, ok)
+
+    window.connect("delete-event", lambda _window, _event: state["active"])
+    window.show_all()
+    GLib.timeout_add(100, drain)
+    GLib.timeout_add(250, pulse)
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 def run_tray():
     """Top-bar status icon: flickers while running; menu shows live status/history."""
     import ctypes
@@ -7269,27 +7444,6 @@ def run_tray():
         buffer.place_cursor(buffer.get_end_iter())
         history_view.scroll_to_mark(buffer.get_insert(), 0.0, True, 0.0, 1.0)
 
-    def launch_terminal(action):
-        import shlex
-        command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
-                   *shlex.split(action)]
-        terminal = next((shutil.which(name) for name in
-                         ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
-                         if shutil.which(name)), None)
-        if terminal is None:
-            message = "No terminal emulator found; backup not started."
-            _write_status("failed", "terminal", message)
-            _status_history("failed", message)
-            return
-        # Leave the result visible briefly without requiring another keypress.
-        inner = (" ".join(shlex.quote(part) for part in command)
-                 + "; status=$?; echo; sleep 8; exit $status")
-        terminal_name = os.path.basename(os.path.realpath(terminal))
-        arguments = [terminal, "--", "/bin/bash", "-c", inner] \
-            if terminal_name in ("gnome-terminal", "kgx") \
-            else [terminal, "-e", "bash -c " + shlex.quote(inner)]
-        return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
-
     drive_cache = {"at": 0.0, "ready": False, "error": None}
 
     def drive_ready(force=False):
@@ -7326,49 +7480,24 @@ def run_tray():
             GLib.idle_add(lambda: (show_drive_chooser(then_backup=True), False)[1])
             return
         show_status()
-        process = launch_terminal("backup-now")
-        if process is None:
-            return
-
-        def watch_window():
-            if process.poll() is None:
-                return True
-            data = read_status()
-            if data.get("state") == "running":
-                pid = data.get("pid")
-                if isinstance(pid, int):
-                    try:
-                        if os.getsid(pid) == process.pid:
-                            os.kill(pid, signal.SIGTERM)
-                    except OSError:
-                        pass
-                _write_status("cancelled", "cancelled", "Backup cancelled: terminal window closed")
-                _status_history("cancelled", "Backup cancelled: terminal window closed")
-            return False
-
-        GLib.timeout_add(500, watch_window)
+        run_process_window("Backup", lambda: backup_everything())
 
     def restore_action(_item=None):
         show_status()
-        process = launch_terminal("recover")
-        if process is None:
-            return
-        _write_status("running", "recovery", "Recovery started")
-        _status_history("started", "Recovery started")
 
-        def watch_window():
-            if process.poll() is None:
-                return True
-            if process.returncode:
-                message = f"Recovery exited with status {process.returncode}"
-                _write_status("failed", "failed", message)
-                _status_history("failed", message)
-            else:
-                _write_status("idle", "idle", "Recovery finished")
-                _status_history("idle", "Recovery finished")
-            return False
+        def run_restore():
+            _write_status("running", "recovery", "Recovery started")
+            _status_history("started", "Recovery started")
+            try:
+                wizard_recover()
+            except BaseException:
+                _write_status("failed", "failed", "Recovery failed")
+                _status_history("failed", "Recovery failed")
+                raise
+            _write_status("idle", "idle", "Recovery finished")
+            _status_history("idle", "Recovery finished")
 
-        GLib.timeout_add(500, watch_window)
+        run_process_window("Restore", run_restore)
 
     def show_purge_dialog(_item=None):
         try:
@@ -7456,7 +7585,7 @@ def run_tray():
         selected = options[chooser.get_active()][1] if options and chooser.get_active() >= 0 else None
         dialog.destroy()
         if response == 3:
-            launch_terminal("prepare-drive")
+            run_process_window("Prepare drive", lambda: wizard_prepare_drive())
             return
         try:
             if response == 2:

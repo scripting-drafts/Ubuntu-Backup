@@ -1935,6 +1935,25 @@ class MenuIntegrationTests(unittest.TestCase):
         recover.assert_called_once_with()
 
 
+class GuiPromptTests(unittest.TestCase):
+    def test_gui_handler_receives_ask_and_confirm(self):
+        saved = backup._GUI_PROMPT_HANDLER
+        calls = []
+
+        def handler(kind, prompt, default):
+            calls.append((kind, prompt, default))
+            return "answer" if kind == "ask" else True
+
+        backup._GUI_PROMPT_HANDLER = handler
+        try:
+            self.assertEqual(backup.ask("Question", "default"), "answer")
+            self.assertTrue(backup.confirm("Continue?", False))
+        finally:
+            backup._GUI_PROMPT_HANDLER = saved
+        self.assertEqual(calls, [("ask", "Question", "default"),
+                                ("confirm", "Continue?", False)])
+
+
 class TrayStatusFallbackTests(unittest.TestCase):
     def test_missing_or_malformed_status_is_valid_idle(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -2205,7 +2224,8 @@ class InstallRoundTripTests(unittest.TestCase):
     def _prepare(self, base):
         repo = base / "repo"
         (repo / "native").mkdir(parents=True)
-        for name in ("install.sh", "uninstall.sh", "ubuntu-backup.py", "ubuntu-backup.svg"):
+        for name in ("install.sh", "uninstall.sh", "ubuntu-backup.py",
+                     "ubuntu-backup-askpass.py", "ubuntu-backup.svg"):
             shutil.copy2(ROOT / name, repo / name)
         shutil.copy2(ROOT / "native/ubackup-core", repo / "native/ubackup-core")
         (repo / "install.sh").chmod(0o755)
@@ -2242,6 +2262,7 @@ class InstallRoundTripTests(unittest.TestCase):
                                         text=True, env=env, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue((bin_dir / "ubuntu-backup.py").is_file())
+                self.assertTrue((bin_dir / "ubuntu-backup-askpass").is_file())
                 self.assertTrue((bin_dir / "ubuntu-backup").is_symlink())
                 self.assertEqual((bin_dir / "ubuntu-backup").readlink(),
                                  Path("ubuntu-backup.py"))
@@ -2251,6 +2272,7 @@ class InstallRoundTripTests(unittest.TestCase):
                                     timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((bin_dir / "ubuntu-backup.py").exists())
+            self.assertFalse((bin_dir / "ubuntu-backup-askpass").exists())
             self.assertFalse((bin_dir / "ubuntu-backup").exists())
 
             result = subprocess.run([str(repo / "install.sh")], capture_output=True,
