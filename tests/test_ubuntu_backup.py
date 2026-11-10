@@ -1855,24 +1855,6 @@ class BackupStatusTests(unittest.TestCase):
             self.assertTrue(str(history[1][2]).endswith("logs/ubuntu-backup.log"))
 
 
-class GUIControlPanelTests(unittest.TestCase):
-    def test_action_groups_cover_all_public_commands(self):
-        import shlex
-        commands = set()
-        for _group, actions in backup.GUI_ACTION_GROUPS:
-            for _label, action, _description in actions:
-                parts = shlex.split(action)
-                commands.add(next(part for part in parts if not part.startswith("-")))
-        expected = {
-            "backup", "backup-now", "capture-root", "capture-package-files",
-            "install-timer", "disable-timer", "recover", "restore-home",
-            "restore-package-files", "selective-restore", "undo-restore", "restore",
-            "choose-drive", "set-external", "prepare-drive", "mount-saved",
-            "unmount-saved", "status", "verify", "deploy",
-        }
-        self.assertEqual(commands, expected)
-
-
 class MenuIntegrationTests(unittest.TestCase):
     def test_backup_action_contains_package_scan(self):
         from unittest import mock

@@ -4875,7 +4875,6 @@ def menu():
         print("6. Format a new backup drive (ERASES ALL DATA)")
         print("u. Undo restore")
         print("s. Status")
-        print("g. Open GUI control panel")
         print("0. Exit")
         choice = ask("Choice", "0").lower()
         try:
@@ -4906,8 +4905,6 @@ def menu():
                 wizard_undo_restore()
             elif choice == "s":
                 show_status()
-            elif choice == "g":
-                open_control_panel()
             else:
                 print("Choose a listed action.")
         except (ConfigError, OSError, ValueError, KeyError, TypeError, tarfile.TarError,
@@ -4939,7 +4936,6 @@ def main():
         "status": "Show workspace, drive and scheduler status",
         "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
-        "gui": "Open the graphical control panel",
         "backup-now": "Run the combined backup in this terminal",
         "recover": "Restore configuration or full /home (interactive)",
         "choose-drive": "Select a backup drive; can add a boot mount",
@@ -5075,8 +5071,6 @@ def main():
         capture_root_package_scan(non_interactive=not interactive, force=args.force)
     elif command == "tray":
         return run_tray()
-    elif command == "gui":
-        return run_gui()
     elif command == "backup-now":
         if not interactive:
             raise ConfigError("The manual backup action needs an interactive terminal.")
@@ -7144,229 +7138,6 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
             snapshot.close()
         os.close(fd)
 
-def launch_terminal(action):
-    """Run one interactive action in a terminal, leaving its result visible."""
-    import shlex
-    command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
-               *shlex.split(action)]
-    terminal = next((shutil.which(name) for name in
-                     ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
-                     if shutil.which(name)), None)
-    if terminal is None:
-        message = "No terminal emulator found; action not started."
-        _write_status("failed", "terminal", message)
-        _status_history("failed", message)
-        return None
-    inner = (" ".join(shlex.quote(part) for part in command)
-             + "; status=$?; echo; sleep 8; exit $status")
-    terminal_name = os.path.basename(os.path.realpath(terminal))
-    arguments = [terminal, "--", "/bin/bash", "-c", inner] \
-        if terminal_name in ("gnome-terminal", "kgx") \
-        else [terminal, "-e", "bash -c " + shlex.quote(inner)]
-    return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
-
-
-def open_control_panel():
-    """Open the graphical control panel in a detached process."""
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        raise ConfigError("The control panel needs a graphical session.")
-    try:
-        return subprocess.Popen(
-            [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "gui"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, close_fds=True)
-    except OSError as exc:
-        raise ConfigError("Could not open the control panel: " + str(exc)) from None
-
-
-def show_purge_dialog(_item=None, parent=None):
-    import gi
-    gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk
-    try:
-        config = settings()
-    except (OSError, ValueError, KeyError) as exc:
-        _write_status("failed", "purge", "Cannot read settings: " + str(exc))
-        return
-    external = config.get("external_backup")
-    external_text = "No external backup drive is configured."
-    if external:
-        try:
-            directory = external_directory(config)
-        except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
-            external_text = ("The configured external drive is unavailable. "
-                             "Purge would stop before deleting anything; forget the drive first "
-                             "to purge local data only.")
-        else:
-            external_text = f"External backup data on {directory} will also be deleted."
-    dialog = Gtk.Dialog(title="Purge all backup data", flags=0)
-    if parent is not None:
-        dialog.set_transient_for(parent)
-    dialog.set_modal(True)
-    dialog.set_keep_above(True)
-    dialog.set_position(Gtk.WindowPosition.CENTER)
-    dialog.set_resizable(False)
-    dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-    purge_button = dialog.add_button("Purge all data", 1)
-    purge_button.get_style_context().add_class("destructive-action")
-    dialog.set_default_response(Gtk.ResponseType.CANCEL)
-    box = dialog.get_content_area()
-    box.set_border_width(12)
-    box.set_spacing(8)
-    for text in (
-        "This permanently deletes local snapshots, backups, history, logs, and settings.",
-        external_text,
-        "The drive itself is not formatted. This cannot be undone.",
-    ):
-        label = Gtk.Label(label=text, xalign=0, wrap=True)
-        label.set_max_width_chars(72)
-        box.add(label)
-    box.show_all()
-    response = dialog.run()
-    dialog.destroy()
-    if response != 1:
-        return
-    try:
-        purge_all_data()
-    except Exception as exc:
-        _write_status("failed", "purge", "Purge failed: " + str(exc))
-        _status_history("failed", "purge failed: " + str(exc))
-
-
-GUI_ACTION_GROUPS = (
-    ("Backup", (
-        ("Run full backup", "backup-now", "Configuration plus full /home; opens a terminal."),
-        ("Configuration backup only", "--non-interactive backup",
-         "Capture configuration without the full /home stage."),
-        ("Capture system-wide configuration", "capture-root",
-         "Read whitelisted system configuration using sudo."),
-        ("Refresh package scan", "capture-package-files --force",
-         "Refresh the privileged package-file scan."),
-    )),
-    ("Schedule", (
-        ("Configure backup schedule", "install-timer", "Daily or weekly timer; opens a terminal."),
-        ("Disable backup timer", "disable-timer", "Stop scheduling and keep existing archives."),
-    )),
-    ("Recovery", (
-        ("Recovery wizard", "recover", "Configuration or full /home recovery."),
-        ("Restore full /home", "restore-home", "Stage a full /home timeline; live /home is never changed."),
-        ("Restore modified package files", "restore-package-files --wizard",
-         "Review and restore captured modified package files."),
-        ("Selective restore", "selective-restore", "Per-file restore with review and typed confirmation."),
-        ("Undo selective restore", "undo-restore", "Undo unchanged steps from a selective restore."),
-        ("Restore into a directory", "restore", "Recover an archive into a new directory."),
-    )),
-    ("Drives", (
-        ("Choose backup drive", "choose-drive", "Select or forget a drive."),
-        ("Select drive (advanced)", "set-external", "Set an already-mounted drive without formatting."),
-        ("Prepare new drive", "prepare-drive", "Format and select a drive; erases all data."),
-        ("Mount saved drive", "mount-saved", "Mount the drive declared in /etc/fstab."),
-        ("Unmount saved drive", "unmount-saved", "Unmount the saved drive and keep the boot entry."),
-    )),
-    ("Verify and deploy", (
-        ("Detailed status", "status", "Show workspace, drive, retention, and timer status."),
-        ("Verify a backup", "verify", "Verify a snapshot, archive, or full /home timeline."),
-        ("Deploy saved configuration", "deploy", "Preview or apply a saved configuration."),
-    )),
-)
-
-
-def run_gui():
-    """Graphical control panel exposing every public backup action."""
-    import gi
-    gi.require_version("Gtk", "3.0")
-    from gi.repository import GLib, Gtk
-
-    window = Gtk.Window(title="Ubuntu Backup — Control panel")
-    window.set_default_size(840, 700)
-    window.set_icon_name("ubuntu-backup")
-    window.set_border_width(12)
-    window.connect("destroy", Gtk.main_quit)
-    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-    window.add(outer)
-
-    title = Gtk.Label()
-    title.set_markup("<b>Ubuntu Backup</b>")
-    title.set_xalign(0)
-    outer.pack_start(title, False, False, 0)
-    status_label = Gtk.Label(xalign=0, yalign=0)
-    status_label.set_selectable(True)
-    outer.pack_start(status_label, False, False, 0)
-
-    scroll = Gtk.ScrolledWindow()
-    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-    outer.pack_start(scroll, True, True, 0)
-    grid = Gtk.Grid(column_spacing=10, row_spacing=10)
-    grid.set_column_homogeneous(True)
-    grid.set_hexpand(True)
-    scroll.add(grid)
-    for index, (group, actions) in enumerate(GUI_ACTION_GROUPS):
-        frame = Gtk.Frame(label=group)
-        frame.set_border_width(4)
-        frame.set_hexpand(True)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_border_width(8)
-        for label, action, description in actions:
-            button = Gtk.Button(label=label)
-            button.set_tooltip_text(description)
-            button.connect("clicked", lambda _button, value=action: launch_terminal(value))
-            box.pack_start(button, False, False, 0)
-        frame.add(box)
-        grid.attach(frame, index % 2, index // 2, 1, 1)
-
-    history_window = [None]
-
-    def show_history(_button=None):
-        if history_window[0] is None:
-            history_window[0] = Gtk.Window(title="Ubuntu Backup — History")
-            history_window[0].set_default_size(780, 420)
-            history_window[0].set_transient_for(window)
-            history_window[0].connect("delete-event", lambda w, _e: (w.hide(), True)[1])
-            view = Gtk.TextView(editable=False, monospace=True)
-            scroll_view = Gtk.ScrolledWindow()
-            scroll_view.add(view)
-            history_window[0].add(scroll_view)
-            history_window[0].view = view
-        try:
-            body = _history_path().read_text()
-        except OSError:
-            body = "No history yet."
-        buffer = history_window[0].view.get_buffer()
-        buffer.set_text(body)
-        history_window[0].show_all()
-        history_window[0].present()
-
-    def refresh_status():
-        data = _read_tray_status()
-        status_label.set_text(
-            f"State: {data.get('state', 'idle')}    Phase: {data.get('phase', '')}\n"
-            f"{package_scan_summary()}\n{data.get('message', '')}")
-        return True
-
-    tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-    refresh_button = Gtk.Button(label="Refresh status")
-    refresh_button.connect("clicked", lambda _button: refresh_status())
-    history_button = Gtk.Button(label="History")
-    history_button.connect("clicked", show_history)
-    tray_button = Gtk.Button(label="Start tray icon")
-    tray_button.connect("clicked", lambda _button: _ensure_tray())
-    purge_button = Gtk.Button(label="Purge all data")
-    purge_button.get_style_context().add_class("destructive-action")
-    purge_button.connect("clicked", lambda _button: show_purge_dialog(parent=window))
-    close_button = Gtk.Button(label="Close")
-    close_button.connect("clicked", lambda _button: window.destroy())
-    for button in (refresh_button, history_button, tray_button, purge_button):
-        tools.pack_start(button, False, False, 0)
-    tools.pack_end(close_button, False, False, 0)
-    outer.pack_start(tools, False, False, 0)
-
-    GLib.timeout_add(1000, refresh_status)
-    refresh_status()
-    window.show_all()
-    Gtk.main()
-    return 0
-
-
 def run_tray():
     """Top-bar status icon: flickers while running; menu shows live status/history."""
     import ctypes
@@ -7414,7 +7185,6 @@ def run_tray():
     backup_item = Gtk.MenuItem(label="Run backup now")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
-    control_item = Gtk.MenuItem(label="Control panel…")
     package_status_item = Gtk.MenuItem(label="Package scan: checking…")
     package_status_item.set_sensitive(False)
     package_capture_item = Gtk.MenuItem(label="Refresh package scan…")
@@ -7441,7 +7211,7 @@ def run_tray():
     options_item.set_submenu(options_menu)
     menu = Gtk.Menu()
     for item in (status_item, backup_action_item, Gtk.SeparatorMenuItem(), live_item, history_item,
-                 control_item, restore_action_item, options_item):
+                 restore_action_item, options_item):
         menu.append(item)
     menu.show_all()
 
@@ -7527,6 +7297,27 @@ def run_tray():
         buffer.place_cursor(buffer.get_end_iter())
         history_view.scroll_to_mark(buffer.get_insert(), 0.0, True, 0.0, 1.0)
 
+    def launch_terminal(action):
+        import shlex
+        command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
+                   *shlex.split(action)]
+        terminal = next((shutil.which(name) for name in
+                         ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
+                         if shutil.which(name)), None)
+        if terminal is None:
+            message = "No terminal emulator found; backup not started."
+            _write_status("failed", "terminal", message)
+            _status_history("failed", message)
+            return
+        # Leave the result visible briefly without requiring another keypress.
+        inner = (" ".join(shlex.quote(part) for part in command)
+                 + "; status=$?; echo; sleep 8; exit $status")
+        terminal_name = os.path.basename(os.path.realpath(terminal))
+        arguments = [terminal, "--", "/bin/bash", "-c", inner] \
+            if terminal_name in ("gnome-terminal", "kgx") \
+            else [terminal, "-e", "bash -c " + shlex.quote(inner)]
+        return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
+
     drive_cache = {"at": 0.0, "ready": False, "error": None}
 
     def drive_ready(force=False):
@@ -7583,6 +7374,54 @@ def run_tray():
             return False
 
         GLib.timeout_add(500, watch_window)
+
+    def show_purge_dialog(_item=None):
+        try:
+            config = settings()
+        except (OSError, ValueError, KeyError) as exc:
+            _write_status("failed", "purge", "Cannot read settings: " + str(exc))
+            return
+        external = config.get("external_backup")
+        external_text = "No external backup drive is configured."
+        if external:
+            try:
+                directory = external_directory(config)
+            except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+                external_text = ("The configured external drive is unavailable. "
+                                 "Purge would stop before deleting anything; forget the drive first "
+                                 "to purge local data only.")
+            else:
+                external_text = f"External backup data on {directory} will also be deleted."
+        dialog = Gtk.Dialog(title="Purge all backup data", flags=0)
+        dialog.set_modal(True)
+        dialog.set_keep_above(True)
+        dialog.set_position(Gtk.WindowPosition.CENTER)
+        dialog.set_resizable(False)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        purge_button = dialog.add_button("Purge all data", 1)
+        purge_button.get_style_context().add_class("destructive-action")
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        box = dialog.get_content_area()
+        box.set_border_width(12)
+        box.set_spacing(8)
+        for text in (
+            "This permanently deletes local snapshots, backups, history, logs, and settings.",
+            external_text,
+            "The drive itself is not formatted. This cannot be undone.",
+        ):
+            label = Gtk.Label(label=text, xalign=0, wrap=True)
+            label.set_max_width_chars(72)
+            box.add(label)
+        box.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if response != 1:
+            return
+        try:
+            purge_all_data()
+        except Exception as exc:
+            _write_status("failed", "purge", "Purge failed: " + str(exc))
+            _status_history("failed", "purge failed: " + str(exc))
 
     def show_drive_chooser(_item=None, then_backup=False):
         options = []
@@ -7731,12 +7570,6 @@ def run_tray():
         quit_window.present()
         return False
 
-    def show_control_panel(_item=None):
-        try:
-            open_control_panel()
-        except ConfigError as exc:
-            _write_status("failed", "gui", str(exc))
-
     backup_item.connect("activate", backup_action)
     package_capture_item.connect("activate", lambda _item: launch_terminal("capture-package-files --force"))
     package_restore_item.connect("activate", lambda _item: launch_terminal("restore-package-files --wizard"))
@@ -7745,7 +7578,6 @@ def run_tray():
     purge_item.connect("activate", show_purge_dialog)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
-    control_item.connect("activate", show_control_panel)
 
     # The patched AppIndicator host calls this service on right-click so the
     # full native menu can stay on left-click.
