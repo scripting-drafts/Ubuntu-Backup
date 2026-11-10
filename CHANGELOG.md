@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Add a GTK control panel exposing all public backup, recovery, drive, schedule, verification, status, history, tray, and purge actions.
 - Nest package scan under the backup action and modified-package restore under the restore action.
 
 ## v1.0.0 - 2026-11-10
