@@ -4875,7 +4875,6 @@ def menu():
         print("5. Automatic backup and privileged-capture schedule")
         print("6. Format a new backup drive (ERASES ALL DATA)")
         print("u. Undo restore")
-        print("s. Status")
         print("0. Exit")
         choice = ask("Choice", "0").lower()
         try:
@@ -4895,8 +4894,6 @@ def menu():
                 wizard_prepare_drive()
             elif choice == "u":
                 wizard_undo_restore()
-            elif choice == "s":
-                show_status()
             else:
                 print("Choose a listed action.")
         except (ConfigError, OSError, ValueError, KeyError, TypeError, tarfile.TarError,
@@ -7175,7 +7172,6 @@ def run_tray():
     status_item = Gtk.MenuItem(label="Idle")
     status_item.set_sensitive(False)
     backup_item = Gtk.MenuItem(label="Backup")
-    live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
     restore_option = Gtk.MenuItem(label="Restore")
     drive_option = Gtk.MenuItem(label="Choose backup drive")
@@ -7186,7 +7182,7 @@ def run_tray():
     options_item = Gtk.MenuItem(label="Options")
     options_item.set_submenu(options_menu)
     menu = Gtk.Menu()
-    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), live_item, history_item,
+    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), history_item,
                  restore_option, options_item):
         menu.append(item)
     menu.show_all()
@@ -7329,6 +7325,7 @@ def run_tray():
                 _status_history("cancelled", message)
             GLib.idle_add(lambda: (show_drive_chooser(then_backup=True), False)[1])
             return
+        show_status()
         process = launch_terminal("backup-now")
         if process is None:
             return
@@ -7347,6 +7344,28 @@ def run_tray():
                         pass
                 _write_status("cancelled", "cancelled", "Backup cancelled: terminal window closed")
                 _status_history("cancelled", "Backup cancelled: terminal window closed")
+            return False
+
+        GLib.timeout_add(500, watch_window)
+
+    def restore_action(_item=None):
+        show_status()
+        process = launch_terminal("recover")
+        if process is None:
+            return
+        _write_status("running", "recovery", "Recovery started")
+        _status_history("started", "Recovery started")
+
+        def watch_window():
+            if process.poll() is None:
+                return True
+            if process.returncode:
+                message = f"Recovery exited with status {process.returncode}"
+                _write_status("failed", "failed", message)
+                _status_history("failed", message)
+            else:
+                _write_status("idle", "idle", "Recovery finished")
+                _status_history("idle", "Recovery finished")
             return False
 
         GLib.timeout_add(500, watch_window)
@@ -7547,10 +7566,9 @@ def run_tray():
         return False
 
     backup_item.connect("activate", backup_action)
-    restore_option.connect("activate", lambda _item: launch_terminal("recover"))
+    restore_option.connect("activate", restore_action)
     drive_option.connect("activate", show_drive_chooser)
     purge_item.connect("activate", show_purge_dialog)
-    live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
 
     # The patched AppIndicator host calls this service on right-click so the

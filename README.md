@@ -6,5 +6,5 @@
 - Never publish snapshots or exports; they contain secrets and are not encrypted.
 - External backups use the selected drive root and symlink timelines over a shared baseline; dated configuration copies are external-only by default (`keep_local_backups` keeps local).
 - One backup action captures configuration, development code and full `/home`; developments reapply in dependency order and package names are re-resolved without version pins.
-- The tray and menu expose Backup and Restore flows, drive choice, status/history, scheduling, and guarded data purge.
+- The tray and menu expose Backup and Restore flows, drive choice, live process status/history, scheduling, and guarded data purge.
 - Full `/home` snapshots are manual, external-only, and require explicit sudo approval.
