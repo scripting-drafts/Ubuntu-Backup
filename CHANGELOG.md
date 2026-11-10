@@ -1,0 +1,9 @@
+# Changelog
+
+## Unreleased
+- Harden purge handling: complete workspace removal, mount/symlink guards, sudo fallback for root-owned data, clear incomplete-purge failures.
+- Verify backup-drive marker identity during selection, backups, and external purge; print exact external roots in uninstall dry runs.
+- Fix fresh-workspace tray status fallback, install/uninstall command symlink handling, and root-owned staging cleanup.
+- Add regression coverage for purge, marker identity, install round trips, symlink/mount refusal, and staging cleanup.
+- Add CI for Ubuntu 22.04/24.04 with shell checks, Python checks, and the full test suite.
+- Document testing and prerequisites.

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Ubuntu ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
+            libayatana-appindicator3-1 shellcheck acl
+      - name: Shell checks
+        run: |
+          shellcheck install.sh uninstall.sh refresh.sh drive.sh \
+            extension/install.sh extension/uninstall.sh
+          bash -n install.sh uninstall.sh refresh.sh drive.sh \
+            extension/install.sh extension/uninstall.sh
+      - name: Python checks
+        run: python3 -m compileall -q ubuntu-backup.py tests
+      - name: Regression tests
+        run: python3 -m unittest discover -s tests -v
