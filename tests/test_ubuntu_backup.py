@@ -1855,6 +1855,62 @@ class BackupStatusTests(unittest.TestCase):
             self.assertTrue(str(history[1][2]).endswith("logs/ubuntu-backup.log"))
 
 
+class BackupRestoreFlowTests(unittest.TestCase):
+    def test_backup_flow_refreshes_the_package_scan(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            drive = Path(directory) / "drive"
+            drive.mkdir()
+            with (
+                mock.patch.object(backup, "_diagnose_previous_status"),
+                mock.patch.object(backup, "_ensure_tray"),
+                mock.patch.object(backup, "_write_status"),
+                mock.patch.object(backup, "_status_history"),
+                mock.patch.object(backup, "package_scan_summary", return_value="Package scan: test"),
+                mock.patch.object(backup, "capture_root_package_scan") as scan,
+                mock.patch.object(backup, "capture_root"),
+                mock.patch.object(backup, "settings",
+                                   return_value={"external_backup": {"subdirectory": ""}}),
+                mock.patch.object(backup, "external_directory", return_value=drive),
+                mock.patch.object(backup, "validate_external_directory"),
+                mock.patch.object(backup, "interactive_backup", return_value=drive / "backup"),
+                mock.patch.object(backup, "wizard_home_backup", return_value=True),
+                mock.patch.object(backup, "confirm", return_value=True),
+                redirect_stdout(io.StringIO()),
+            ):
+                backup.backup_everything()
+        scan.assert_called_once_with(non_interactive=False, force=True)
+
+    def test_recovery_flow_offers_package_restore(self):
+        from unittest import mock
+        source = Path("/tmp/snapshot")
+        destination = Path("/tmp/restored")
+        with (
+            mock.patch.object(backup, "ask", return_value="1"),
+            mock.patch.object(backup, "choose_archive", return_value=source),
+            mock.patch.object(backup, "restore", return_value=destination),
+            mock.patch.object(backup, "confirm", side_effect=[False, False, True]),
+            mock.patch.object(backup, "wizard_restore_package_files") as package_restore,
+            redirect_stdout(io.StringIO()),
+        ):
+            backup.wizard_recover()
+        package_restore.assert_called_once_with(destination)
+
+    def test_package_restore_wizard_accepts_an_explicit_source(self):
+        from unittest import mock
+        source = Path("/tmp/snapshot")
+        plan = [{"action": "restore"}]
+        with (
+            mock.patch.object(backup, "ask", side_effect=["", ""]),
+            mock.patch.object(backup, "confirm", return_value=True),
+            mock.patch.object(backup, "restore_package_files", return_value=plan) as restore,
+            redirect_stdout(io.StringIO()),
+        ):
+            backup.wizard_restore_package_files(source)
+        self.assertEqual(restore.call_args_list[0].args[0], source)
+        self.assertEqual(restore.call_args_list[1].args[0], source)
+
+
 class MenuIntegrationTests(unittest.TestCase):
     def test_backup_action_contains_package_scan(self):
         from unittest import mock

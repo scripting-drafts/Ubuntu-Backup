@@ -898,9 +898,9 @@ def latest_config_snapshot():
     return max(pool, key=lambda path: path.stat().st_mtime)
 
 
-def wizard_restore_package_files():
+def wizard_restore_package_files(source=None):
     """Interactive frontend for the package-file restore review."""
-    source = latest_config_snapshot()
+    source = Path(source).expanduser().resolve() if source else latest_config_snapshot()
     print("Package-file restore source: " + str(source))
     packages = [item.strip() for item in ask(
         "Limit to packages (comma-separated; blank for all)", "").split(",") if item.strip()]
@@ -4468,6 +4468,8 @@ def wizard_recover(source=None):
             restore_system_integration(destination)
         if confirm("Deploy this recovered configuration now? This may install packages."):
             wizard_deploy(destination)
+        if confirm("Restore modified package files captured in this snapshot now?", False):
+            wizard_restore_package_files(destination)
         return
     if choice == "2":
         path = source or choose_archive("home")
@@ -4781,6 +4783,9 @@ def backup_everything(native_capture=False):
             _status_history("cancelled", message)
             print(message)
             return None
+        print("Package scan before backup: " + package_scan_summary())
+        if confirm("Refresh the privileged package scan before backing up?", True):
+            capture_root_package_scan(non_interactive=False, force=True)
         _write_status("running", "privileged", "Capturing system-wide configuration")
         capture_root(hide_followup_hint=True)
         _write_status("running", "configuration", "Capturing configuration")
