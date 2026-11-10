@@ -1912,25 +1912,27 @@ class BackupRestoreFlowTests(unittest.TestCase):
 
 
 class MenuIntegrationTests(unittest.TestCase):
-    def test_backup_action_contains_package_scan(self):
+    def test_backup_action_starts_the_full_backup_flow(self):
         from unittest import mock
         with (
-            mock.patch.object(backup, "ask", side_effect=["1", "2", "0"]),
+            mock.patch.object(backup, "ask", side_effect=["1", "0"]),
+            mock.patch.object(backup, "backup_everything") as run,
             mock.patch.object(backup, "capture_root_package_scan") as scan,
             redirect_stdout(io.StringIO()),
         ):
             backup.menu()
-        scan.assert_called_once_with(non_interactive=False, force=True)
+        run.assert_called_once_with()
+        scan.assert_not_called()
 
-    def test_restore_action_contains_package_restore(self):
+    def test_restore_action_starts_the_recovery_flow(self):
         from unittest import mock
         with (
-            mock.patch.object(backup, "ask", return_value="4"),
-            mock.patch.object(backup, "wizard_restore_package_files") as restore,
+            mock.patch.object(backup, "ask", side_effect=["2", "0"]),
+            mock.patch.object(backup, "wizard_recover") as recover,
             redirect_stdout(io.StringIO()),
         ):
-            backup.wizard_recover()
-        restore.assert_called_once_with()
+            backup.menu()
+        recover.assert_called_once_with()
 
 
 class TrayStatusFallbackTests(unittest.TestCase):

@@ -4444,16 +4444,12 @@ def wizard_recover(source=None):
     print("1. Recover configuration (stage a backup, then optionally deploy)")
     print("2. Recover full /home (stage only; live /home is never changed)")
     print("3. Deploy a saved snapshot directly (may install packages)")
-    print("4. Restore modified package files (in place)")
     print("0. Cancel")
     choice = ask("Recovery", "0")
     if choice == "0":
         return
     if choice == "3":
         wizard_deploy(source)
-        return
-    if choice == "4":
-        wizard_restore_package_files()
         return
     if choice == "1":
         path = source or choose_archive("config")
@@ -4886,16 +4882,7 @@ def menu():
             if choice == "0":
                 return
             if choice == "1":
-                print("1. Run backup now (includes privileged package scan)")
-                print("2. Refresh privileged package scan only (sudo)")
-                print("0. Cancel")
-                backup_choice = ask("Backup", "1")
-                if backup_choice == "1":
-                    backup_everything()
-                elif backup_choice == "2":
-                    capture_root_package_scan(non_interactive=False, force=True)
-                elif backup_choice != "0":
-                    raise ConfigError("Choose one of the listed backup actions.")
+                backup_everything()
             elif choice == "2":
                 wizard_recover()
             elif choice == "3":
@@ -7187,36 +7174,20 @@ def run_tray():
 
     status_item = Gtk.MenuItem(label="Idle")
     status_item.set_sensitive(False)
-    backup_item = Gtk.MenuItem(label="Run backup now")
+    backup_item = Gtk.MenuItem(label="Backup")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
-    package_status_item = Gtk.MenuItem(label="Package scan: checking…")
-    package_status_item.set_sensitive(False)
-    package_capture_item = Gtk.MenuItem(label="Refresh package scan…")
-    package_restore_item = Gtk.MenuItem(label="Restore modified package files…")
-    restore_option = Gtk.MenuItem(label="Recover configuration or full /home…")
+    restore_option = Gtk.MenuItem(label="Restore")
     drive_option = Gtk.MenuItem(label="Choose backup drive")
     purge_item = Gtk.MenuItem(label="Purge all data")
-    backup_menu = Gtk.Menu()
-    backup_menu.append(backup_item)
-    backup_menu.append(Gtk.SeparatorMenuItem())
-    backup_menu.append(package_status_item)
-    backup_menu.append(package_capture_item)
-    backup_action_item = Gtk.MenuItem(label="Backup")
-    backup_action_item.set_submenu(backup_menu)
-    restore_menu = Gtk.Menu()
-    restore_menu.append(restore_option)
-    restore_menu.append(package_restore_item)
-    restore_action_item = Gtk.MenuItem(label="Restore")
-    restore_action_item.set_submenu(restore_menu)
     options_menu = Gtk.Menu()
     options_menu.append(drive_option)
     options_menu.append(purge_item)
     options_item = Gtk.MenuItem(label="Options")
     options_item.set_submenu(options_menu)
     menu = Gtk.Menu()
-    for item in (status_item, backup_action_item, Gtk.SeparatorMenuItem(), live_item, history_item,
-                 restore_action_item, options_item):
+    for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), live_item, history_item,
+                 restore_option, options_item):
         menu.append(item)
     menu.show_all()
 
@@ -7576,8 +7547,6 @@ def run_tray():
         return False
 
     backup_item.connect("activate", backup_action)
-    package_capture_item.connect("activate", lambda _item: launch_terminal("capture-package-files --force"))
-    package_restore_item.connect("activate", lambda _item: launch_terminal("restore-package-files --wizard"))
     restore_option.connect("activate", lambda _item: launch_terminal("recover"))
     drive_option.connect("activate", show_drive_chooser)
     purge_item.connect("activate", show_purge_dialog)
@@ -7699,13 +7668,6 @@ def run_tray():
         label = label[:90]
         if status_item.get_label() != label:
             status_item.set_label(label)
-        desired = ("Stop backup" if running else
-                   "Run backup now" if drive_ready() else "Select a backup drive first")
-        if backup_item.get_label() != desired:
-            backup_item.set_label(desired)
-        package_label = package_scan_summary()
-        if package_status_item.get_label() != package_label:
-            package_status_item.set_label(package_label)
         if running:
             toggle[0] = not toggle[0]
             set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
