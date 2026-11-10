@@ -1732,7 +1732,7 @@ class BackupWarningTests(unittest.TestCase):
             run_id = "20261106T113637.000000Z"
             calls = []
 
-            def fake_impl(skip_external=False):
+            def fake_impl(skip_external=False, **kwargs):
                 backup._LAST_BACKUP_RUN_ID = run_id
                 backup._LAST_BACKUP_WARNINGS = 2
                 return "/tmp/backup"
@@ -1868,6 +1868,60 @@ class BackupRestoreFlowTests(unittest.TestCase):
                 mock.patch.object(backup, "_status_history"),
                 mock.patch.object(backup, "package_scan_summary", return_value="Package scan: test"),
                 mock.patch.object(backup, "capture_root_package_scan") as scan,
+                mock.patch.object(backup, "capture_root") as root_capture,
+                mock.patch.object(backup, "settings",
+                                   return_value={"external_backup": {"subdirectory": ""}}),
+                mock.patch.object(backup, "external_directory", return_value=drive),
+                mock.patch.object(backup, "validate_external_directory"),
+                mock.patch.object(backup, "interactive_backup") as interactive,
+                mock.patch.object(backup, "wizard_home_backup", return_value=True),
+                mock.patch.object(backup, "confirm", return_value=True),
+                redirect_stdout(io.StringIO()),
+            ):
+                interactive.return_value = drive / "backup"
+                backup.backup_everything()
+        scan.assert_called_once_with(non_interactive=False, force=True)
+        root_capture.assert_called_once_with(hide_followup_hint=True, package_scan=False)
+        interactive.assert_called_once_with(package_scan=False)
+
+    def test_backup_impl_skips_scan_when_flow_already_scanned(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            kit = Path(directory) / "kit"
+            (kit / "config").mkdir(parents=True)
+            (kit / "config/settings.json").write_text(json.dumps({
+                "home_snapshot": "off", "keep_snapshots": 3, "keep_local_backups": True,
+                "coverage": "system-wide-configuration", "backup_calendar": "daily",
+                "development_include": [], "home_include": [], "home_reference_only": [],
+                "system_reference_only": [], "exclude": [], "apt_review_only": [],
+                "exclude_cpus": [], "external_backup": None,
+            }))
+            saved = backup.KIT, backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS
+            backup.KIT = kit
+            try:
+                with (
+                    mock.patch.object(backup, "capture_root_package_scan") as scan,
+                    mock.patch.object(backup, "build_snapshot",
+                                      side_effect=backup.ConfigError("stop")),
+                ):
+                    with self.assertRaises(backup.ConfigError):
+                        backup._backup_impl(package_scan=False)
+            finally:
+                backup.KIT, backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS = saved
+        scan.assert_not_called()
+
+    def test_backup_flow_uses_existing_scan_without_prompt(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            drive = Path(directory) / "drive"
+            drive.mkdir()
+            with (
+                mock.patch.object(backup, "_diagnose_previous_status"),
+                mock.patch.object(backup, "_ensure_tray"),
+                mock.patch.object(backup, "_write_status"),
+                mock.patch.object(backup, "_status_history"),
+                mock.patch.object(backup, "package_scan_summary", return_value="Package scan: test"),
+                mock.patch.object(backup, "capture_root_package_scan") as scan,
                 mock.patch.object(backup, "capture_root"),
                 mock.patch.object(backup, "settings",
                                    return_value={"external_backup": {"subdirectory": ""}}),
@@ -1875,11 +1929,12 @@ class BackupRestoreFlowTests(unittest.TestCase):
                 mock.patch.object(backup, "validate_external_directory"),
                 mock.patch.object(backup, "interactive_backup", return_value=drive / "backup"),
                 mock.patch.object(backup, "wizard_home_backup", return_value=True),
-                mock.patch.object(backup, "confirm", return_value=True),
+                mock.patch.object(backup, "confirm") as confirm,
                 redirect_stdout(io.StringIO()),
             ):
-                backup.backup_everything()
-        scan.assert_called_once_with(non_interactive=False, force=True)
+                backup.backup_everything(refresh_package_scan=False)
+        scan.assert_called_once_with(non_interactive=False, force=False)
+        confirm.assert_not_called()
 
     def test_recovery_flow_offers_package_restore(self):
         from unittest import mock
@@ -1955,6 +2010,18 @@ class GuiPromptTests(unittest.TestCase):
 
 
 class TrayStatusFallbackTests(unittest.TestCase):
+    def test_gui_worker_pid_is_not_treated_as_stale(self):
+        saved = backup._GUI_PROCESS_ACTIVE
+        status = {"state": "running", "pid": os.getpid(),
+                  "updated": "2026-01-01T00:00:00+00:00"}
+        backup._GUI_PROCESS_ACTIVE = True
+        try:
+            self.assertIsNone(backup._status_problem(status))
+        finally:
+            backup._GUI_PROCESS_ACTIVE = saved
+        self.assertEqual(backup._status_problem(status),
+                         "running status points to this process")
+
     def test_missing_or_malformed_status_is_valid_idle(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             saved = backup.KIT

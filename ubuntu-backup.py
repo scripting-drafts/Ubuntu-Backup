@@ -3445,7 +3445,7 @@ def set_external(mount_point, disable=False):
                   "remains in /etc/fstab; remove that line if the disk was replaced or reformatted.")
 
 
-def backup(skip_external=False):
+def backup(skip_external=False, package_scan=True):
     """Run one configuration backup, publishing status for timer/CLI runs."""
     global _STATUS_RUN, _EXIT_CODE
     manage_status = not _STATUS_RUN
@@ -3456,7 +3456,7 @@ def backup(skip_external=False):
         _status_history("started", "Configuration backup started")
         _write_status("running", "configuration", "Capturing configuration")
     try:
-        result = _backup_impl(skip_external)
+        result = _backup_impl(skip_external, package_scan=package_scan)
     except KeyboardInterrupt:
         if manage_status:
             message = "Configuration backup cancelled"
@@ -3487,7 +3487,7 @@ def backup(skip_external=False):
             _STATUS_RUN = False
 
 
-def _backup_impl(skip_external=False):
+def _backup_impl(skip_external=False, package_scan=True):
     global _LAST_BACKUP_RUN_ID, _LAST_BACKUP_WARNINGS
     _LAST_BACKUP_RUN_ID = None
     _LAST_BACKUP_WARNINGS = 0
@@ -3498,7 +3498,8 @@ def _backup_impl(skip_external=False):
     lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        capture_root_package_scan(non_interactive=True)
+        if package_scan:
+            capture_root_package_scan(non_interactive=True)
         previous = KIT / ".previous-snapshot"
         current = KIT / "snapshot"
         if previous.exists():
@@ -4200,7 +4201,8 @@ def default_snapshot():
         return bundled_profile()
 
 
-def capture_root(non_interactive=False, install=False, replace_user_timer=False, hide_followup_hint=False):
+def capture_root(non_interactive=False, install=False, replace_user_timer=False,
+                 hide_followup_hint=False, package_scan=True):
     print("System-wide configuration and local accounts' settings will be read, including sensitive configuration.")
     command = ["sudo"] + (["-n"] if non_interactive else [])
     command += ["/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "_capture-root-worker"]
@@ -4215,7 +4217,7 @@ def capture_root(non_interactive=False, install=False, replace_user_timer=False,
         print(line)
     for line in result.stderr.splitlines():
         print(line, file=sys.stderr)
-    if result.returncode in (0, 3):
+    if result.returncode in (0, 3) and package_scan:
         capture_root_package_scan(non_interactive)
     if result.returncode == 3:
         print("System-wide capture completed with warnings; inspect unreadable-files.json.",
@@ -4744,7 +4746,7 @@ def wizard_drive(mount_point=None, disable=False):
     return True
 
 
-def interactive_backup():
+def interactive_backup(package_scan=True):
     """Ask only when a saved destination is absent/unavailable; skip never clears it."""
     external = settings()["external_backup"]
     if external:
@@ -4755,13 +4757,13 @@ def interactive_backup():
             return None
         else:
             print("Using previously approved backup drive: " + str(directory))
-            return backup()
+            return backup(package_scan=package_scan)
     else:
         print("No backup drive is selected. Select one from the tray or menu first; backup cancelled.")
         return None
 
 
-def backup_everything(native_capture=False):
+def backup_everything(native_capture=False, refresh_package_scan=None):
     """Single flow: privileged configuration, configuration backup, full /home."""
     global _STATUS_RUN, _LAST_HOME_WARNINGS
     try:
@@ -4792,12 +4794,15 @@ def backup_everything(native_capture=False):
             print(message)
             return None
         print("Package scan before backup: " + package_scan_summary())
-        if confirm("Refresh the privileged package scan before backing up?", True):
-            capture_root_package_scan(non_interactive=False, force=True)
+        if refresh_package_scan is None:
+            refresh_package_scan = confirm(
+                "Refresh the privileged package scan before backing up?", True)
+        capture_root_package_scan(
+            non_interactive=False, force=bool(refresh_package_scan))
         _write_status("running", "privileged", "Capturing system-wide configuration")
-        capture_root(hide_followup_hint=True)
+        capture_root(hide_followup_hint=True, package_scan=False)
         _write_status("running", "configuration", "Capturing configuration")
-        path = interactive_backup()
+        path = interactive_backup(package_scan=False)
         if path is None:
             message = "Backup cancelled: backup drive unavailable or not selected."
             _write_status("cancelled", "cancelled", message)
@@ -6034,6 +6039,8 @@ def _status_problem(data):
         if not isinstance(pid, int):
             return "running status has no process id"
         if pid == os.getpid():
+            if _GUI_PROCESS_ACTIVE:
+                return None
             return "running status points to this process"
         if not _live_backup_pid(pid):
             return f"recorded process {pid} is not active"
