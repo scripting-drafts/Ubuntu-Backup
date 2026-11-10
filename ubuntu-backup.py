@@ -4440,23 +4440,22 @@ def is_full_home(path):
         return False
 
 
-def wizard_recover(source=None, flow=None, restore_packages=None):
-    if flow is None:
-        print("1. Recover configuration (stage a backup, then optionally deploy)")
-        print("2. Recover full /home (stage only; live /home is never changed)")
-        print("3. Deploy a saved snapshot directly (may install packages)")
-        print("4. Restore modified package files (in place)")
-        print("0. Cancel")
-        flow = ask("Recovery", "0")
-    if flow == "0":
+def wizard_recover(source=None):
+    print("1. Recover configuration (stage a backup, then optionally deploy)")
+    print("2. Recover full /home (stage only; live /home is never changed)")
+    print("3. Deploy a saved snapshot directly (may install packages)")
+    print("4. Restore modified package files (in place)")
+    print("0. Cancel")
+    choice = ask("Recovery", "0")
+    if choice == "0":
         return
-    if flow == "3":
+    if choice == "3":
         wizard_deploy(source)
         return
-    if flow == "4":
-        wizard_restore_package_files(source)
+    if choice == "4":
+        wizard_restore_package_files()
         return
-    if flow == "1":
+    if choice == "1":
         path = source or choose_archive("config")
         if path is None:
             return
@@ -4469,13 +4468,10 @@ def wizard_recover(source=None, flow=None, restore_packages=None):
             restore_system_integration(destination)
         if confirm("Deploy this recovered configuration now? This may install packages."):
             wizard_deploy(destination)
-        if restore_packages is None:
-            restore_packages = confirm(
-                "Restore modified package files captured in this snapshot now?", False)
-        if restore_packages:
+        if confirm("Restore modified package files captured in this snapshot now?", False):
             wizard_restore_package_files(destination)
         return
-    if flow == "2":
+    if choice == "2":
         path = source or choose_archive("home")
         if path is None:
             return
@@ -4760,7 +4756,7 @@ def interactive_backup():
         return None
 
 
-def backup_everything(native_capture=False, refresh_package_scan=None):
+def backup_everything(native_capture=False):
     """Single flow: privileged configuration, configuration backup, full /home."""
     global _STATUS_RUN, _LAST_HOME_WARNINGS
     signal.signal(signal.SIGTERM, signal.default_int_handler)
@@ -4788,9 +4784,7 @@ def backup_everything(native_capture=False, refresh_package_scan=None):
             print(message)
             return None
         print("Package scan before backup: " + package_scan_summary())
-        if refresh_package_scan is None:
-            refresh_package_scan = confirm("Refresh the privileged package scan before backing up?", True)
-        if refresh_package_scan:
+        if confirm("Refresh the privileged package scan before backing up?", True):
             capture_root_package_scan(non_interactive=False, force=True)
         _write_status("running", "privileged", "Capturing system-wide configuration")
         capture_root(hide_followup_hint=True)
@@ -4886,7 +4880,6 @@ def menu():
         print("6. Format a new backup drive (ERASES ALL DATA)")
         print("u. Undo restore")
         print("s. Status")
-        print("g. Backup and Restore GUI")
         print("0. Exit")
         choice = ask("Choice", "0").lower()
         try:
@@ -4917,8 +4910,6 @@ def menu():
                 wizard_undo_restore()
             elif choice == "s":
                 show_status()
-            elif choice == "g":
-                open_backup_gui()
             else:
                 print("Choose a listed action.")
         except (ConfigError, OSError, ValueError, KeyError, TypeError, tarfile.TarError,
@@ -4950,7 +4941,6 @@ def main():
         "status": "Show workspace, drive and scheduler status",
         "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
-        "gui": "Open the graphical backup and restore control panel",
         "backup-now": "Run the combined backup in this terminal",
         "recover": "Restore configuration or full /home (interactive)",
         "choose-drive": "Select a backup drive; can add a boot mount",
@@ -4964,22 +4954,6 @@ def main():
         commands.choices[command].add_argument(
             "--native-capture", action="store_true",
             help="Use the native capture engine for full /home (experimental)")
-    refresh = commands.choices["backup-now"].add_mutually_exclusive_group()
-    refresh.add_argument("--refresh-package-scan", action="store_true",
-                         help="Refresh the privileged package scan before backing up")
-    refresh.add_argument("--no-refresh-package-scan", action="store_true",
-                         help="Use the existing package scan without prompting")
-    recover = commands.choices["recover"]
-    recovery_flow = recover.add_mutually_exclusive_group()
-    recovery_flow.add_argument("--configuration", action="store_true",
-                               help="Recover configuration without showing the recovery menu")
-    recovery_flow.add_argument("--home", action="store_true",
-                               help="Recover full /home without showing the recovery menu")
-    packages = recover.add_mutually_exclusive_group()
-    packages.add_argument("--restore-package-files", action="store_true",
-                          help="Restore modified package files after configuration recovery")
-    packages.add_argument("--no-restore-package-files", action="store_true",
-                          help="Skip modified package files after configuration recovery")
     commands.choices["prepare-drive"].add_argument(
         "--allow-internal", action="store_true",
         help="Also offer non-removable internal disks (requires an INTERNAL confirmation)")
@@ -5083,9 +5057,7 @@ def main():
     elif command == "recover":
         if not interactive:
             raise ConfigError("Recovery needs an interactive terminal.")
-        flow = "1" if args.configuration else "2" if args.home else None
-        packages = True if args.restore_package_files else False if args.no_restore_package_files else None
-        wizard_recover(flow=flow, restore_packages=packages)
+        wizard_recover()
     elif command == "restore-home":
         if interactive and args.timeline is None:
             wizard_restore_home()
@@ -5104,17 +5076,12 @@ def main():
         capture_root_package_scan(non_interactive=not interactive, force=args.force)
     elif command == "tray":
         return run_tray()
-    elif command == "gui":
-        return run_gui()
     elif command == "backup-now":
         if not interactive:
             raise ConfigError("The manual backup action needs an interactive terminal.")
         signal.signal(signal.SIGTERM, signal.default_int_handler)
         signal.signal(signal.SIGHUP, signal.default_int_handler)
-        refresh_package_scan = (True if args.refresh_package_scan else
-                                False if args.no_refresh_package_scan else None)
-        backup_everything(native_capture=args.native_capture,
-                          refresh_package_scan=refresh_package_scan)
+        backup_everything(native_capture=args.native_capture)
     elif command == "choose-drive":
         if not interactive:
             raise ConfigError("Drive selection needs an interactive terminal.")
@@ -7176,187 +7143,6 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
             snapshot.close()
         os.close(fd)
 
-def launch_terminal(action, env=None):
-    """Run one interactive action in a terminal, leaving its result visible."""
-    import shlex
-    command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
-               *shlex.split(action)]
-    terminal = next((shutil.which(name) for name in
-                     ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
-                     if shutil.which(name)), None)
-    if terminal is None:
-        message = "No terminal emulator found; action not started."
-        _write_status("failed", "terminal", message)
-        _status_history("failed", message)
-        return None
-    inner = (" ".join(shlex.quote(part) for part in command)
-             + "; status=$?; echo; sleep 8; exit $status")
-    terminal_name = os.path.basename(os.path.realpath(terminal))
-    arguments = [terminal, "--", "/bin/bash", "-c", inner] \
-        if terminal_name in ("gnome-terminal", "kgx") \
-        else [terminal, "-e", "bash -c " + shlex.quote(inner)]
-    return subprocess.Popen(arguments, start_new_session=True, close_fds=True, env=env)
-
-
-def open_backup_gui():
-    """Open the graphical backup/restore flow in a detached process."""
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        raise ConfigError("The backup and restore GUI needs a graphical session.")
-    try:
-        return subprocess.Popen(
-            [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "gui"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, close_fds=True)
-    except OSError as exc:
-        raise ConfigError("Could not open the backup and restore GUI: " + str(exc)) from None
-
-
-def run_gui():
-    """Graphical backup and restore flow; privileged work opens a terminal."""
-    import gi
-    gi.require_version("Gtk", "3.0")
-    from gi.repository import GLib, Gtk
-
-    window = Gtk.Window(title="Ubuntu Backup — Backup and Restore")
-    window.set_default_size(680, 380)
-    window.set_icon_name("ubuntu-backup")
-    window.set_border_width(12)
-    window.connect("destroy", Gtk.main_quit)
-    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-    window.add(outer)
-
-    title = Gtk.Label()
-    title.set_markup("<b>Backup and restore</b>")
-    title.set_xalign(0)
-    outer.pack_start(title, False, False, 0)
-    status_label = Gtk.Label(xalign=0, yalign=0)
-    status_label.set_selectable(True)
-    outer.pack_start(status_label, False, False, 0)
-
-    actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-    backup_button = Gtk.Button(label="Backup…")
-    restore_button = Gtk.Button(label="Restore…")
-    backup_button.set_size_request(180, 56)
-    restore_button.set_size_request(180, 56)
-    actions.pack_start(backup_button, True, True, 0)
-    actions.pack_start(restore_button, True, True, 0)
-    outer.pack_start(actions, False, False, 0)
-
-    def show_backup(_button=None):
-        dialog = Gtk.Dialog(title="Backup", parent=window, flags=Gtk.DialogFlags.MODAL)
-        dialog.set_default_size(560, 220)
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Start backup", 1)
-        box = dialog.get_content_area()
-        box.set_border_width(12)
-        box.set_spacing(8)
-        box.add(Gtk.Label(label=package_scan_summary(), xalign=0, wrap=True))
-        refresh = Gtk.CheckButton(label="Refresh privileged package scan before backup")
-        refresh.set_active(True)
-        box.add(refresh)
-        box.add(Gtk.Label(label="Full backup captures configuration and /home. "
-                                "Privileged steps continue in a terminal.",
-                          xalign=0, wrap=True))
-        box.show_all()
-        response = dialog.run()
-        active = refresh.get_active()
-        dialog.destroy()
-        if response == 1:
-            action = ("backup-now --refresh-package-scan" if active
-                      else "backup-now --no-refresh-package-scan")
-            launch_terminal(action)
-
-    def show_restore(_button=None):
-        dialog = Gtk.Dialog(title="Restore", parent=window, flags=Gtk.DialogFlags.MODAL)
-        dialog.set_default_size(560, 300)
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Start restore", 1)
-        box = dialog.get_content_area()
-        box.set_border_width(12)
-        box.set_spacing(8)
-        configuration = Gtk.RadioButton.new_with_label_from_widget(
-            None, "Recover configuration")
-        home = Gtk.RadioButton.new_with_label_from_widget(
-            configuration, "Recover full /home (stage only)")
-        packages = Gtk.RadioButton.new_with_label_from_widget(
-            configuration, "Restore modified package files only")
-        for button in (configuration, home, packages):
-            box.add(button)
-        restore_packages = Gtk.CheckButton(
-            label="After configuration recovery, restore modified package files")
-        restore_packages.set_active(True)
-        box.add(restore_packages)
-        configuration.connect("toggled", lambda button: restore_packages.set_sensitive(button.get_active()))
-        box.show_all()
-        response = dialog.run()
-        package_choice = restore_packages.get_active()
-        selected = ("configuration" if configuration.get_active() else
-                    "home" if home.get_active() else "packages")
-        dialog.destroy()
-        if response != 1:
-            return
-        if selected == "configuration":
-            action = ("recover --configuration --restore-package-files" if package_choice
-                      else "recover --configuration --no-restore-package-files")
-        elif selected == "home":
-            action = "recover --home"
-        else:
-            action = "restore-package-files --wizard"
-        launch_terminal(action)
-
-    backup_button.connect("clicked", show_backup)
-    restore_button.connect("clicked", show_restore)
-
-    history_window = [None]
-
-    def show_history(_button=None):
-        if history_window[0] is None:
-            history_window[0] = Gtk.Window(title="Ubuntu Backup — History")
-            history_window[0].set_default_size(780, 420)
-            history_window[0].set_transient_for(window)
-            history_window[0].connect("delete-event", lambda w, _e: (w.hide(), True)[1])
-            view = Gtk.TextView(editable=False, monospace=True)
-            scroll_view = Gtk.ScrolledWindow()
-            scroll_view.add(view)
-            history_window[0].add(scroll_view)
-            history_window[0].view = view
-        try:
-            body = _history_path().read_text()
-        except OSError:
-            body = "No history yet."
-        buffer = history_window[0].view.get_buffer()
-        buffer.set_text(body)
-        history_window[0].show_all()
-        history_window[0].present()
-
-    def refresh_status():
-        data = _read_tray_status()
-        status_label.set_text(
-            f"State: {data.get('state', 'idle')}    Phase: {data.get('phase', '')}\n"
-            f"{package_scan_summary()}\n{data.get('message', '')}")
-        return True
-
-    tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-    refresh_button = Gtk.Button(label="Refresh status")
-    refresh_button.connect("clicked", lambda _button: refresh_status())
-    history_button = Gtk.Button(label="History")
-    history_button.connect("clicked", show_history)
-    tray_button = Gtk.Button(label="Start tray icon")
-    tray_button.connect("clicked", lambda _button: _ensure_tray())
-    close_button = Gtk.Button(label="Close")
-    close_button.connect("clicked", lambda _button: window.destroy())
-    for button in (refresh_button, history_button, tray_button):
-        tools.pack_start(button, False, False, 0)
-    tools.pack_end(close_button, False, False, 0)
-    outer.pack_start(tools, False, False, 0)
-
-    GLib.timeout_add(1000, refresh_status)
-    refresh_status()
-    window.show_all()
-    Gtk.main()
-    return 0
-
-
 def run_tray():
     """Top-bar status icon: flickers while running; menu shows live status/history."""
     import ctypes
@@ -7404,7 +7190,6 @@ def run_tray():
     backup_item = Gtk.MenuItem(label="Run backup now")
     live_item = Gtk.MenuItem(label="Live status")
     history_item = Gtk.MenuItem(label="History")
-    gui_item = Gtk.MenuItem(label="Backup and Restore…")
     package_status_item = Gtk.MenuItem(label="Package scan: checking…")
     package_status_item.set_sensitive(False)
     package_capture_item = Gtk.MenuItem(label="Refresh package scan…")
@@ -7431,7 +7216,7 @@ def run_tray():
     options_item.set_submenu(options_menu)
     menu = Gtk.Menu()
     for item in (status_item, backup_action_item, Gtk.SeparatorMenuItem(), live_item, history_item,
-                 gui_item, restore_action_item, options_item):
+                 restore_action_item, options_item):
         menu.append(item)
     menu.show_all()
 
@@ -7516,6 +7301,27 @@ def run_tray():
         buffer = history_view.get_buffer()
         buffer.place_cursor(buffer.get_end_iter())
         history_view.scroll_to_mark(buffer.get_insert(), 0.0, True, 0.0, 1.0)
+
+    def launch_terminal(action):
+        import shlex
+        command = [sys.executable, "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
+                   *shlex.split(action)]
+        terminal = next((shutil.which(name) for name in
+                         ("x-terminal-emulator", "gnome-terminal", "kgx", "xfce4-terminal", "konsole")
+                         if shutil.which(name)), None)
+        if terminal is None:
+            message = "No terminal emulator found; backup not started."
+            _write_status("failed", "terminal", message)
+            _status_history("failed", message)
+            return
+        # Leave the result visible briefly without requiring another keypress.
+        inner = (" ".join(shlex.quote(part) for part in command)
+                 + "; status=$?; echo; sleep 8; exit $status")
+        terminal_name = os.path.basename(os.path.realpath(terminal))
+        arguments = [terminal, "--", "/bin/bash", "-c", inner] \
+            if terminal_name in ("gnome-terminal", "kgx") \
+            else [terminal, "-e", "bash -c " + shlex.quote(inner)]
+        return subprocess.Popen(arguments, start_new_session=True, close_fds=True)
 
     drive_cache = {"at": 0.0, "ready": False, "error": None}
 
@@ -7769,12 +7575,6 @@ def run_tray():
         quit_window.present()
         return False
 
-    def show_backup_gui(_item=None):
-        try:
-            open_backup_gui()
-        except ConfigError as exc:
-            _write_status("failed", "gui", str(exc))
-
     backup_item.connect("activate", backup_action)
     package_capture_item.connect("activate", lambda _item: launch_terminal("capture-package-files --force"))
     package_restore_item.connect("activate", lambda _item: launch_terminal("restore-package-files --wizard"))
@@ -7783,7 +7583,6 @@ def run_tray():
     purge_item.connect("activate", show_purge_dialog)
     live_item.connect("activate", show_status)
     history_item.connect("activate", show_history)
-    gui_item.connect("activate", show_backup_gui)
 
     # The patched AppIndicator host calls this service on right-click so the
     # full native menu can stay on left-click.
