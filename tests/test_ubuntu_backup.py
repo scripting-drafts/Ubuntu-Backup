@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -1814,6 +1815,109 @@ class BackupStatusTests(unittest.TestCase):
             history = next(item for item in calls
                            if item[0] == "history" and item[1][0] == "failed")
             self.assertTrue(str(history[1][2]).endswith("logs/ubuntu-backup.log"))
+
+
+class TrayStatusFallbackTests(unittest.TestCase):
+    def test_missing_or_malformed_status_is_valid_idle(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.KIT
+            backup.KIT = Path(directory)
+            try:
+                status = backup._read_tray_status()
+                self.assertEqual(status["state"], "idle")
+                self.assertIsNone(status["pid"])
+                self.assertIsNone(backup._status_problem(status))
+                (Path(directory) / "status.json").write_text("{not json")
+                status = backup._read_tray_status()
+                self.assertIsNone(backup._status_problem(status))
+                (Path(directory) / "status.json").write_text('{"state": "idle"}')
+                status = backup._read_tray_status()
+                self.assertEqual(backup._status_problem(status), "missing updated timestamp")
+            finally:
+                backup.KIT = saved
+
+
+class UninstallScriptTests(unittest.TestCase):
+    def _prepare(self, base):
+        home = base / "home"
+        bin_dir = home / ".local/bin"
+        data_dir = home / ".local/share"
+        config_dir = home / ".config"
+        workspace = home / "ubuntu-backup/data"
+        for path in (bin_dir, data_dir / "applications", config_dir / "autostart",
+                     workspace / "config", workspace / "logs", workspace / "snapshot",
+                     workspace / "staging", workspace / "privileged-package-scan"):
+            path.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "ubuntu-backup.py").write_text("#!/usr/bin/env python3\n")
+        (bin_dir / "ubackup-core").write_text("core")
+        (bin_dir / "ubuntu-backup").symlink_to("ubuntu-backup.py")
+        (workspace / "config/settings.json").write_text(
+            json.dumps({"external_backup": None}))
+        for name in ("history.txt", "status.json", "native-home-entries.ndjson",
+                     "logs/ubuntu-backup.log", "snapshot/manifest.json",
+                     "staging/file", "privileged-package-scan/file"):
+            (workspace / name).write_text("sentinel")
+        script = base / "uninstall.sh"
+        shutil.copy2(ROOT / "uninstall.sh", script)
+        script.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(home),
+            "XDG_BIN_HOME": str(bin_dir),
+            "XDG_DATA_HOME": str(data_dir),
+            "XDG_CONFIG_HOME": str(config_dir),
+            "UBUNTU_BACKUP_SKIP_SERVICE": "1",
+        })
+        return script, env, workspace
+
+    def test_yes_purge_is_noninteractive_and_removes_all_local_data(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            script, env, workspace = self._prepare(Path(directory))
+            result = subprocess.run(
+                [str(script), "--yes", "--purge-backups"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Permanently delete all backup data?", result.stdout)
+            self.assertFalse(workspace.exists())
+            self.assertFalse((Path(env["XDG_BIN_HOME"]) / "ubuntu-backup.py").exists())
+            self.assertFalse((Path(env["XDG_BIN_HOME"]) / "ubuntu-backup").exists())
+            self.assertIn("Program and backup data removed", result.stdout)
+
+    def test_without_purge_preserves_the_workspace(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            script, env, workspace = self._prepare(Path(directory))
+            result = subprocess.run(
+                [str(script), "--yes"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((workspace / "snapshot/manifest.json").is_file())
+            self.assertFalse((Path(env["XDG_BIN_HOME"]) / "ubuntu-backup.py").exists())
+            self.assertFalse((Path(env["XDG_BIN_HOME"]) / "ubuntu-backup").exists())
+            self.assertIn("preserved", result.stdout)
+
+    def test_purge_removes_the_configured_external_layout(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            script, env, workspace = self._prepare(base)
+            external = base / "external"
+            external.mkdir()
+            (external / ".ubuntu-configuration-target.json").write_text(
+                json.dumps({"format": "ubuntu-configuration-v1", "id": "test"}))
+            for name in ("baseline", "timeline", "ubuntu-configuration-backups"):
+                (external / name).mkdir()
+                (external / name / "data").write_text("sentinel")
+            settings_path = workspace / "config/settings.json"
+            settings = json.loads(settings_path.read_text())
+            settings["external_backup"] = {
+                "mount_point": str(external), "subdirectory": ""}
+            settings_path.write_text(json.dumps(settings))
+            result = subprocess.run(
+                [str(script), "--yes", "--purge-backups"],
+                input="", capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(workspace.exists())
+            self.assertFalse(external.exists())
+            self.assertIn("Purged backup layout", result.stdout)
 
 
 class DeployCompatibilityTests(unittest.TestCase):

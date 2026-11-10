@@ -23,6 +23,19 @@ SYSTEMD="$CONFIG/systemd/user"
 WORKSPACE="$HOME/ubuntu-backup/data"
 mkdir -p "$BIN" "$APPS" "$ICONS" "$AUTODIR" "$SYSTEMD"
 install -m 700 "$ROOT/ubuntu-backup.py" "$BIN/ubuntu-backup.py"
+LINK="$BIN/ubuntu-backup"
+if [[ -L "$LINK" ]]; then
+    link_target="$(readlink -- "$LINK" || true)"
+    if [[ "$link_target" == "ubuntu-backup.py" || "$link_target" == "$BIN/ubuntu-backup.py" ]]; then
+        ln -sfn ubuntu-backup.py "$LINK"
+    else
+        echo "Warning: leaving unrelated symlink $LINK" >&2
+    fi
+elif [[ ! -e "$LINK" ]]; then
+    ln -s ubuntu-backup.py "$LINK"
+else
+    echo "Warning: leaving existing $LINK" >&2
+fi
 if [[ ! -x "$ROOT/native/ubackup-core" && -f "$ROOT/native/ubackup-core.c" ]]; then
     make -C "$ROOT/native" >/dev/null 2>&1 || echo "Warning: native capture core build failed; --native-capture will be unavailable." >&2
 fi

@@ -5970,6 +5970,15 @@ def _read_status():
         return {}
 
 
+def _read_tray_status():
+    """Return a valid idle record when the workspace has no status file yet."""
+    data = _read_status()
+    if data:
+        return data
+    return {"state": "idle", "phase": "idle", "message": "No backup running",
+            "pid": None, "updated": dt.datetime.now(dt.timezone.utc).isoformat()}
+
+
 def _live_backup_pid(pid):
     if not isinstance(pid, int) or pid <= 1:
         return False
@@ -7037,10 +7046,7 @@ def run_tray():
         return 1
 
     def read_status():
-        try:
-            return json.loads(_status_path().read_text())
-        except (OSError, ValueError):
-            return {"state": "idle", "phase": "idle", "message": "No backup running"}
+        return _read_tray_status()
 
     stale_marks = set()
 
