@@ -4763,7 +4763,7 @@ def interactive_backup(package_scan=True):
         return None
 
 
-def backup_everything(native_capture=False, refresh_package_scan=None):
+def backup_everything(native_capture=False, refresh_package_scan=True):
     """Single flow: privileged configuration, configuration backup, full /home."""
     global _STATUS_RUN, _LAST_HOME_WARNINGS
     try:
@@ -4794,9 +4794,6 @@ def backup_everything(native_capture=False, refresh_package_scan=None):
             print(message)
             return None
         print("Package scan before backup: " + package_scan_summary())
-        if refresh_package_scan is None:
-            refresh_package_scan = confirm(
-                "Refresh the privileged package scan before backing up?", True)
         capture_root_package_scan(
             non_interactive=False, force=bool(refresh_package_scan))
         _write_status("running", "privileged", "Capturing system-wide configuration")
