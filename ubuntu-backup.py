@@ -4468,10 +4468,7 @@ def wizard_recover(source=None):
         ("1", "Recover configuration (stage a backup, then optionally deploy)"),
         ("2", "Recover full /home (stage only; live /home is never changed)"),
         ("3", "Deploy a saved snapshot", "May install packages."),
-        ("0", "Cancel"),
-    ), "0")
-    if choice == "0":
-        return
+    ), "1")
     if choice == "3":
         wizard_deploy(source)
         return

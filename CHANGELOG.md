@@ -8,6 +8,7 @@
 - Run Backup, Restore, and Prepare Drive in GTK process windows; sudo passwords use an askpass pop-up.
 - Refresh the privileged package scan by default, once per backup, and keep GUI-worker status from being marked stale.
 - Present Restore recovery choices as a selectable GUI menu, with a small-print package-install warning.
+- Remove Cancel from the Restore recovery dropdown; dialog cancellation remains available.
 
 ## v1.0.0 - 2026-11-10
 - Harden purge handling: complete workspace removal, mount/symlink guards, sudo fallback for root-owned data, clear incomplete-purge failures.

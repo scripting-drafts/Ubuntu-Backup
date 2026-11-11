@@ -1936,6 +1936,18 @@ class BackupRestoreFlowTests(unittest.TestCase):
         scan.assert_called_once_with(non_interactive=False, force=False)
         confirm.assert_not_called()
 
+    def test_recovery_menu_has_no_cancel_entry(self):
+        from unittest import mock
+        with (
+            mock.patch.object(backup, "choose", return_value="1") as choose,
+            mock.patch.object(backup, "choose_archive", return_value=None),
+            redirect_stdout(io.StringIO()),
+        ):
+            backup.wizard_recover()
+        choices = choose.call_args.args[1]
+        self.assertEqual([value for value, _label, *_detail in choices], ["1", "2", "3"])
+        self.assertEqual(choose.call_args.args[2], "1")
+
     def test_recovery_flow_offers_package_restore(self):
         from unittest import mock
         source = Path("/tmp/snapshot")
