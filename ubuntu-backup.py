@@ -3977,6 +3977,15 @@ def confirm(prompt, default=False):
         print("Please answer yes or no.")
 
 
+def choose(prompt, choices, default=None):
+    """Select one labelled answer from a menu; choices are (value, label) pairs."""
+    if _GUI_PROMPT_HANDLER is not None:
+        return _GUI_PROMPT_HANDLER("choose", prompt, default, choices)
+    for value, label in choices:
+        print(f"{value}. {label}")
+    return ask(prompt, default)
+
+
 def private_workspace(path):
     global KIT
     path = Path(path).expanduser().absolute()
@@ -4452,11 +4461,12 @@ def is_full_home(path):
 
 
 def wizard_recover(source=None):
-    print("1. Recover configuration (stage a backup, then optionally deploy)")
-    print("2. Recover full /home (stage only; live /home is never changed)")
-    print("3. Deploy a saved snapshot directly (may install packages)")
-    print("0. Cancel")
-    choice = ask("Recovery", "0")
+    choice = choose("Recovery", (
+        ("1", "Recover configuration (stage a backup, then optionally deploy)"),
+        ("2", "Recover full /home (stage only; live /home is never changed)"),
+        ("3", "Deploy a saved snapshot directly (may install packages)"),
+        ("0", "Cancel"),
+    ), "0")
     if choice == "0":
         return
     if choice == "3":
@@ -7217,7 +7227,7 @@ def run_process_window(title, target):
         progress.pulse()
         return True
 
-    def prompt(kind, message, default):
+    def prompt(kind, message, default, choices=None):
         result = {"value": None}
         done = threading.Event()
 
@@ -7233,6 +7243,34 @@ def run_process_window(title, target):
                 dialog.destroy()
                 result["value"] = (response == Gtk.ResponseType.YES if response in
                                    (Gtk.ResponseType.YES, Gtk.ResponseType.NO) else bool(default))
+            elif kind == "choose":
+                dialog = Gtk.Dialog(title="Ubuntu Backup", parent=window,
+                                    flags=Gtk.DialogFlags.MODAL)
+                dialog.set_default_size(560, 170)
+                dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+                dialog.add_button("Continue", Gtk.ResponseType.OK)
+                dialog.set_default_response(Gtk.ResponseType.OK)
+                box = dialog.get_content_area()
+                box.set_border_width(12)
+                box.set_spacing(8)
+                label = Gtk.Label(label=message, xalign=0, wrap=True)
+                label.set_max_width_chars(72)
+                box.add(label)
+                chooser = Gtk.ComboBoxText()
+                items = list(choices or [])
+                for value, text in items:
+                    chooser.append(value, text)
+                active = next((index for index, (value, _text) in enumerate(items)
+                               if value == default), 0)
+                if items:
+                    chooser.set_active(active)
+                box.add(chooser)
+                box.show_all()
+                response = dialog.run()
+                index = chooser.get_active()
+                dialog.destroy()
+                if response == Gtk.ResponseType.OK and 0 <= index < len(items):
+                    result["value"] = items[index][0]
             else:
                 dialog = Gtk.Dialog(title="Ubuntu Backup", parent=window,
                                     flags=Gtk.DialogFlags.MODAL)

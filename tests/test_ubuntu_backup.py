@@ -1995,18 +1995,27 @@ class GuiPromptTests(unittest.TestCase):
         saved = backup._GUI_PROMPT_HANDLER
         calls = []
 
-        def handler(kind, prompt, default):
-            calls.append((kind, prompt, default))
-            return "answer" if kind == "ask" else True
+        def handler(kind, prompt, default, choices=None):
+            calls.append((kind, prompt, default, choices))
+            if kind == "ask":
+                return "answer"
+            if kind == "choose":
+                return choices[1][0]
+            return True
 
         backup._GUI_PROMPT_HANDLER = handler
         try:
             self.assertEqual(backup.ask("Question", "default"), "answer")
             self.assertTrue(backup.confirm("Continue?", False))
+            self.assertEqual(
+                backup.choose("Pick", [("1", "One"), ("2", "Two")], "1"), "2")
         finally:
             backup._GUI_PROMPT_HANDLER = saved
-        self.assertEqual(calls, [("ask", "Question", "default"),
-                                ("confirm", "Continue?", False)])
+        self.assertEqual(calls, [
+            ("ask", "Question", "default", None),
+            ("confirm", "Continue?", False, None),
+            ("choose", "Pick", "1", [("1", "One"), ("2", "Two")]),
+        ])
 
 
 class TrayStatusFallbackTests(unittest.TestCase):
