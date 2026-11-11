@@ -3978,11 +3978,14 @@ def confirm(prompt, default=False):
 
 
 def choose(prompt, choices, default=None):
-    """Select one labelled answer from a menu; choices are (value, label) pairs."""
+    """Select one labelled answer; choices are (value, label[, detail]) tuples."""
     if _GUI_PROMPT_HANDLER is not None:
         return _GUI_PROMPT_HANDLER("choose", prompt, default, choices)
-    for value, label in choices:
+    for choice in choices:
+        value, label = choice[0], choice[1]
         print(f"{value}. {label}")
+        if len(choice) > 2 and choice[2]:
+            print(f"   {choice[2]}")
     return ask(prompt, default)
 
 
@@ -4464,7 +4467,7 @@ def wizard_recover(source=None):
     choice = choose("Recovery", (
         ("1", "Recover configuration (stage a backup, then optionally deploy)"),
         ("2", "Recover full /home (stage only; live /home is never changed)"),
-        ("3", "Deploy a saved snapshot directly (may install packages)"),
+        ("3", "Deploy a saved snapshot", "May install packages."),
         ("0", "Cancel"),
     ), "0")
     if choice == "0":
@@ -7258,14 +7261,32 @@ def run_process_window(title, target):
                 box.add(label)
                 chooser = Gtk.ComboBoxText()
                 items = list(choices or [])
-                for value, text in items:
-                    chooser.append(value, text)
-                active = next((index for index, (value, _text) in enumerate(items)
-                               if value == default), 0)
+                for item in items:
+                    chooser.append(item[0], item[1])
+                active = next((index for index, item in enumerate(items)
+                               if item[0] == default), 0)
                 if items:
                     chooser.set_active(active)
+                detail_label = Gtk.Label(xalign=0, wrap=True)
+                detail_label.set_max_width_chars(72)
+
+                def update_detail(_chooser=None):
+                    index = chooser.get_active()
+                    detail = (items[index][2] if 0 <= index < len(items)
+                              and len(items[index]) > 2 else "")
+                    if detail:
+                        detail_label.set_markup(
+                            "<small>" + GLib.markup_escape_text(detail) + "</small>")
+                        detail_label.show()
+                    else:
+                        detail_label.set_text("")
+                        detail_label.hide()
+
+                chooser.connect("changed", update_detail)
                 box.add(chooser)
+                box.add(detail_label)
                 box.show_all()
+                update_detail()
                 response = dialog.run()
                 index = chooser.get_active()
                 dialog.destroy()

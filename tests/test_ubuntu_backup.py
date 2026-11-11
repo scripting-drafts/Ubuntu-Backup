@@ -2017,6 +2017,20 @@ class GuiPromptTests(unittest.TestCase):
             ("choose", "Pick", "1", [("1", "One"), ("2", "Two")]),
         ])
 
+    def test_cli_choice_prints_detail_line(self):
+        from unittest import mock
+        saved = backup._GUI_PROMPT_HANDLER
+        backup._GUI_PROMPT_HANDLER = None
+        output = io.StringIO()
+        try:
+            with mock.patch.object(backup, "ask", return_value="3"), redirect_stdout(output):
+                self.assertEqual(backup.choose(
+                    "Recovery", [("3", "Deploy a saved snapshot", "May install packages.")], "3"), "3")
+        finally:
+            backup._GUI_PROMPT_HANDLER = saved
+        self.assertIn("3. Deploy a saved snapshot", output.getvalue())
+        self.assertIn("May install packages.", output.getvalue())
+
 
 class TrayStatusFallbackTests(unittest.TestCase):
     def test_gui_worker_pid_is_not_treated_as_stale(self):
