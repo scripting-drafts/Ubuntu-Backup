@@ -1,4 +1,4 @@
-[# Ubuntu Backup
+# Ubuntu Backup
 
 Ubuntu Backup is an interactive backup and recovery utility for Ubuntu desktops. It captures system configuration, development environments, and—when explicitly requested—a complete `/home` snapshot. A tray application provides backup and restore workflows, progress reporting, scheduling, and backup-drive management.
 
