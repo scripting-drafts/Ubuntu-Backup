@@ -1,4 +1,4 @@
-# Ubuntu Backup
+[# Ubuntu Backup
 
 Ubuntu Backup is an interactive backup and recovery utility for Ubuntu desktops. It captures system configuration, development environments, and—when explicitly requested—a complete `/home` snapshot. A tray application provides backup and restore workflows, progress reporting, scheduling, and backup-drive management.
 
@@ -236,3 +236,4 @@ Even a filesystem snapshot does not guarantee application-level consistency for 
 ## License
 
 No license is currently specified in this repository. Unless a license is added, the source should not be assumed to be available for unrestricted reuse or redistribution.
+](https://github.com/scripting-drafts/Ubuntu-Backup/blob/main/README.md?utm_source=chatgpt.com)
