@@ -2,7 +2,7 @@
 # Restart the tray icon if it is stuck or not visible.
 set -Eeuo pipefail
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/ubuntu-backup.py"
-WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$HOME/ubuntu-backup/data}"
+WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$HOME/Ubuntu-Backup/data}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 [[ -x "$BIN" ]] || { echo "Install first: ./install.sh" >&2; exit 1; }
 python3 - "$BIN" <<'PY'

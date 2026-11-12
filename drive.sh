@@ -4,7 +4,7 @@
 # filesystem owns its UUID, the marker owns its identity, fstab owns the path.
 set -Eeuo pipefail
 BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/ubuntu-backup.py"
-WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$HOME/ubuntu-backup/data}"
+WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$HOME/Ubuntu-Backup/data}"
 [[ -x "$BIN" ]] || { echo "Install first: ./install.sh" >&2; exit 1; }
 case "${1:-status}" in
     mount)

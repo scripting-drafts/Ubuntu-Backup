@@ -19,7 +19,7 @@ CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 APPS="$DATA/applications"
 ICON="$DATA/icons/hicolor/scalable/apps/ubuntu-backup.svg"
 AUTOSTART="$CONFIG/autostart/ubuntu-backup-tray.desktop"
-WORKSPACES=("$HOME/ubuntu-backup/data" "$HOME/ubuntu-backup-data" "$HOME/ubuntu-configuration")
+WORKSPACES=("$HOME/Ubuntu-Backup/data" "$HOME/ubuntu-backup/data" "$HOME/ubuntu-backup-data" "$HOME/ubuntu-configuration")
 FILES=("$BIN/ubuntu-backup.py" "$BIN/ubuntu-backup-askpass" "$BIN/ubackup-core" "$HOME/ubuntu-backup.py" "$HOME/ubuntu-configuration.py"
        "$HOME/ubuntu-backup.zip" "$APPS/ubuntu-backup.desktop" "$AUTOSTART" "$ICON"
        "$CONFIG/systemd/user/ubuntu-configuration-backup.service"
