@@ -5100,7 +5100,11 @@ def preferred_workspace():
     if (parent / "config/settings.json").is_file() or (parent.parent / "manifest.json").is_file():
         if parent != HOME:
             return parent
-    return HOME / "ubuntu-backup" / "data"
+    canonical = HOME / "Ubuntu-Backup" / "data"
+    legacy = HOME / "ubuntu-backup" / "data"
+    if not canonical.exists() and legacy.is_dir():
+        return legacy
+    return canonical
 
 
 def main():
@@ -5111,7 +5115,9 @@ def main():
     )
     parser.add_argument("-h", "--help", action="store_true", dest="show_help",
                         help="Show embedded documentation and usage")
-    parser.add_argument("--workspace", type=Path, help="Private working folder (default: ~/ubuntu-backup-data)")
+    parser.add_argument("--workspace", type=Path,
+                        help="Private working folder (default: ~/Ubuntu-Backup/data; "
+                             "legacy ~/ubuntu-backup/data is reused when present)")
     parser.add_argument("--non-interactive", action="store_true", help="Never ask questions; use explicit command/options")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     descriptions = {
@@ -6137,14 +6143,8 @@ def purge_all_data():
 def _ensure_tray():
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return
-    try:
-        lock_fd = os.open(KIT / ".tray.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    except OSError:
-        return
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(lock_fd)
+    lock_fd = _acquire_tray_lock()
+    if lock_fd is None:
         return
     os.close(lock_fd)
     try:
@@ -7146,18 +7146,66 @@ def run_process_window(title, target, cancellable=True):
     thread.start()
 
 
+def _tray_lock_paths():
+    for variable in ("XDG_RUNTIME_DIR", "XDG_STATE_HOME"):
+        value = os.environ.get(variable)
+        if value and os.path.isabs(value):
+            yield Path(value) / "ubuntu-backup" / "tray.lock"
+    yield HOME / ".local" / "state" / "ubuntu-backup" / "tray.lock"
+
+
+def _private_lock_directory(path):
+    directory = path.parent
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = directory.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        return False
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_tray_lock():
+    """Take the per-session tray lock; keep the fd open for the tray lifetime."""
+    for path in _tray_lock_paths():
+        if not _private_lock_directory(path):
+            continue
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError:
+            # The private directory is valid but the lock path is not: fail closed.
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise OSError("invalid tray lock file")
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+    return None
+
+
 def run_tray():
     """Top-bar status icon: flickers while running; menu shows live status/history."""
+    global _EXIT_CODE
+    tray_lock_fd = _acquire_tray_lock()
+    if tray_lock_fd is None:
+        print("Another Ubuntu Backup tray is already running.", file=sys.stderr)
+        _EXIT_CODE = 1
+        return 1
+    _setup_logging()
     import ctypes
     import gi
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gio, GLib, Gtk
-
-    try:
-        lock_fd = os.open(KIT / ".tray.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return 1
 
     def read_status():
         return _read_tray_status()
@@ -7587,8 +7635,13 @@ def run_tray():
     def tray_name_acquired(_connection, _name):
         pass
 
+    tray_failed = [False]
+
     def tray_name_lost(_connection, _name):
-        print("Tray status service name lost.", file=sys.stderr)
+        tray_failed[0] = True
+        print("Tray status service name lost; another tray owns org.ubuntu.Backup.",
+              file=sys.stderr)
+        GLib.idle_add(Gtk.main_quit)
 
     Gio.bus_own_name(Gio.BusType.SESSION, "org.ubuntu.Backup", Gio.BusNameOwnerFlags.NONE,
                      tray_bus_acquired, tray_name_acquired, tray_name_lost)
@@ -7650,6 +7703,11 @@ def run_tray():
             icon.set_visible(True)
             provider = ("statusicon", icon, None)
 
+    backend_names = {"gi-indicator": "Ayatana AppIndicator (GI)",
+                     "indicator": "Ayatana AppIndicator (ctypes)",
+                     "statusicon": "GTK status icon"}
+    print("Tray backend: " + backend_names[provider[0]], file=sys.stderr)
+
     last_icon = [None]
 
     def set_icon(name):
@@ -7688,6 +7746,9 @@ def run_tray():
     GLib.timeout_add(750, refresh)
     refresh()
     Gtk.main()
+    if tray_failed[0]:
+        _EXIT_CODE = 1
+        return 1
     return 0
 
 

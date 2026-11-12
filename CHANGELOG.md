@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v1.1.0 - 2026-11-12
+- Enforce a per-session tray singleton in `$XDG_RUNTIME_DIR/ubuntu-backup/tray.lock` (independent of the workspace), make loss of `org.ubuntu.Backup` fatal, align the desktop launcher with the autostart workspace, and log the selected tray backend.
+- Harden tray shutdown with `pidfd` signals, validate private lock directories and lock files, fail closed on a tampered lock path, refuse symlinked extension destinations, and publish extension updates atomically with `mv -T`.
 - Autoscroll the Backup/Restore log window to new output; scrolling up pauses follow mode and returning to the bottom resumes it.
 - Make the tray summary status clickable: dismiss finished/failed/cancelled messages, remove the status row, and restore the default icon; running operations open Live status.
 - Add cooperative cancellation for backup and restore: GUI Cancel button, workspace cancel file for sudo workers, and SIGINT/SIGTERM handling in `ubackup-core`.

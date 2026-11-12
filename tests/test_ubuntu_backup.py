@@ -51,6 +51,112 @@ class BoundedTraceTests(unittest.TestCase):
             self.assertLessEqual(sum(path.stat().st_size for path in segments), 300)
 
 
+class WorkspaceDefaultTests(unittest.TestCase):
+    def test_preferred_workspace_prefers_canonical_layout(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            home = Path(directory)
+            saved = backup.HOME, backup.SCRIPT_PATH
+            backup.HOME = home
+            backup.SCRIPT_PATH = home / ".local/bin/ubuntu-backup.py"
+            try:
+                self.assertEqual(backup.preferred_workspace(), home / "Ubuntu-Backup/data")
+                legacy = home / "ubuntu-backup/data"
+                legacy.mkdir(parents=True)
+                self.assertEqual(backup.preferred_workspace(), legacy)
+                canonical = home / "Ubuntu-Backup/data"
+                canonical.mkdir(parents=True)
+                self.assertEqual(backup.preferred_workspace(), canonical)
+            finally:
+                backup.HOME, backup.SCRIPT_PATH = saved
+
+
+class TraySingletonTests(unittest.TestCase):
+    KEYS = ("XDG_RUNTIME_DIR", "XDG_STATE_HOME")
+
+    def _save(self):
+        return {key: os.environ.get(key) for key in self.KEYS}
+
+    def _restore(self, saved):
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_tray_lock_is_session_scoped_and_exclusive(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = self._save()
+            os.environ["XDG_RUNTIME_DIR"] = str(Path(directory) / "runtime")
+            os.environ.pop("XDG_STATE_HOME", None)
+            first = second = None
+            try:
+                first = backup._acquire_tray_lock()
+                self.assertIsNotNone(first)
+                self.assertIsNone(backup._acquire_tray_lock())
+                os.close(first)
+                first = None
+                second = backup._acquire_tray_lock()
+                self.assertIsNotNone(second)
+            finally:
+                for fd in (first, second):
+                    if fd is not None:
+                        os.close(fd)
+                self._restore(saved)
+
+    def test_relative_runtime_dir_falls_back_to_state(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = self._save()
+            state = Path(directory) / "state"
+            os.environ["XDG_RUNTIME_DIR"] = "relative/runtime"
+            os.environ["XDG_STATE_HOME"] = str(state)
+            fd = None
+            try:
+                fd = backup._acquire_tray_lock()
+                self.assertIsNotNone(fd)
+                self.assertTrue((state / "ubuntu-backup/tray.lock").is_file())
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                self._restore(saved)
+
+    def test_symlinked_lock_directory_is_refused(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = self._save()
+            runtime = Path(directory) / "runtime"
+            state = Path(directory) / "state"
+            target = Path(directory) / "target"
+            (runtime / "ubuntu-backup").mkdir(parents=True)
+            target.mkdir()
+            (runtime / "ubuntu-backup").rmdir()
+            (runtime / "ubuntu-backup").symlink_to(target)
+            os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+            os.environ["XDG_STATE_HOME"] = str(state)
+            fd = None
+            try:
+                fd = backup._acquire_tray_lock()
+                self.assertIsNotNone(fd)
+                self.assertTrue((state / "ubuntu-backup/tray.lock").is_file())
+                self.assertFalse((target / "tray.lock").exists())
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                self._restore(saved)
+
+    def test_invalid_lock_file_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = self._save()
+            runtime = Path(directory) / "runtime"
+            state = Path(directory) / "state"
+            (runtime / "ubuntu-backup/tray.lock").mkdir(parents=True)
+            os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+            os.environ["XDG_STATE_HOME"] = str(state)
+            try:
+                self.assertIsNone(backup._acquire_tray_lock())
+                self.assertFalse((state / "ubuntu-backup/tray.lock").exists())
+            finally:
+                self._restore(saved)
+
+
 class DriveGuardTests(unittest.TestCase):
     def test_low_space_is_rejected_before_probe(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -2494,6 +2600,90 @@ class InstallRoundTripTests(unittest.TestCase):
             self.assertTrue((bin_dir / "ubuntu-backup").is_symlink())
             self.assertEqual((bin_dir / "ubuntu-backup").readlink(),
                              Path("ubuntu-backup.py"))
+
+    def test_launcher_and_autostart_share_the_canonical_workspace(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            repo, env, _bin_dir = self._prepare(Path(directory))
+            result = subprocess.run([str(repo / "install.sh")], capture_output=True,
+                                    text=True, env=env, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            home = Path(env["HOME"])
+            workspace = str(home / "Ubuntu-Backup/data")
+            desktop = (home / ".local/share/applications/ubuntu-backup.desktop").read_text()
+            autostart = (home / ".config/autostart/ubuntu-backup-tray.desktop").read_text()
+            self.assertIn("--workspace", desktop)
+            self.assertIn(workspace, desktop)
+            self.assertIn(workspace, autostart)
+
+
+class ExtensionInstallIntegrityTests(unittest.TestCase):
+    UUID = "ubuntu-appindicators@ubuntu.com"
+
+    def _prepare(self, base):
+        repo = base / "repo"
+        (repo / "extension").mkdir(parents=True)
+        script = repo / "extension/install.sh"
+        shutil.copy2(ROOT / "extension/install.sh", script)
+        script.chmod(0o755)
+
+        source = base / "source-extension"
+        source.mkdir()
+        (source / "metadata.json").write_text(json.dumps({
+            "uuid": self.UUID, "name": "Test", "description": "Test", "version": 1}))
+        (source / "appIndicator.js").write_text("// source\n")
+        (source / "indicatorStatusIcon.js").write_text("// source\n")
+
+        fake = base / "fakebin"
+        fake.mkdir()
+        (fake / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+        (fake / "gsettings").write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in\n"
+            "  *'get org.gnome.shell enabled-extensions'*) echo \"['ding@rastersoft.com']\" ;;\n"
+            "  *'get org.gnome.shell disabled-extensions'*) echo \"[]\" ;;\n"
+            "  *) exit 0 ;;\n"
+            "esac\n")
+        for name in ("systemctl", "gsettings"):
+            (fake / name).chmod(0o755)
+
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(base / "home"),
+            "XDG_DATA_HOME": str(base / "data"),
+            "XDG_CONFIG_HOME": str(base / "config"),
+            "UBUNTU_APPINDICATOR_SRC": str(source),
+            "PATH": str(fake) + os.pathsep + env.get("PATH", ""),
+        })
+        dest = base / "data/ubuntu-backup-system/gnome-shell/extensions" / self.UUID
+        return script, env, dest
+
+    def test_install_is_atomic_and_repeatable(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            script, env, dest = self._prepare(Path(directory))
+            for _ in range(2):
+                result = subprocess.run([str(script)], capture_output=True,
+                                        text=True, env=env, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(dest.is_dir())
+                self.assertFalse(dest.is_symlink())
+                metadata = json.loads((dest / "metadata.json").read_text())
+                self.assertEqual(metadata["uuid"], self.UUID)
+
+    def test_symlinked_destination_is_refused(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            script, env, dest = self._prepare(Path(directory))
+            target = Path(directory) / "target"
+            target.mkdir()
+            (target / "metadata.json").write_text(json.dumps({"uuid": self.UUID}))
+            (target / "sentinel").write_text("keep")
+            dest.parent.mkdir(parents=True)
+            dest.symlink_to(target, target_is_directory=True)
+            result = subprocess.run([str(script)], capture_output=True,
+                                    text=True, env=env, timeout=60)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("symlinked extension path", result.stderr)
+            self.assertTrue(dest.is_symlink())
+            self.assertTrue((target / "sentinel").is_file())
 
 
 class DeployCompatibilityTests(unittest.TestCase):

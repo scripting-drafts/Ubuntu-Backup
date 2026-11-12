@@ -133,16 +133,42 @@ if (( PURGE_BACKUPS )) && (( ! YES )); then
 fi
 python3 - "$BIN/ubuntu-backup.py" <<'PY'
 import os, signal, sys
+
 target = os.path.realpath(sys.argv[1])
-for entry in os.listdir('/proc'):
-    if not entry.isdigit():
-        continue
+
+def is_tray(args):
+    for index, arg in enumerate(args):
+        if not arg or not os.path.isabs(os.fsdecode(arg)):
+            continue
+        if os.path.realpath(os.fsdecode(arg)) != target:
+            continue
+        return b'tray' in args[index + 1:]
+    return False
+
+def stop(entry):
+    try:
+        pidfd = os.pidfd_open(int(entry))
+    except (AttributeError, OSError):
+        pidfd = None
     try:
         args = open(f'/proc/{entry}/cmdline', 'rb').read().split(b'\0')
-        if target.encode() in args and b'tray' in args:
-            os.kill(int(entry), signal.SIGTERM)
-    except (OSError, ValueError):
+    except OSError:
+        args = []
+    try:
+        if is_tray(args):
+            if pidfd is not None:
+                signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            else:
+                os.kill(int(entry), signal.SIGTERM)
+    except (AttributeError, OSError):
         pass
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+for entry in os.listdir('/proc'):
+    if entry.isdigit():
+        stop(entry)
 PY
 if [[ "${UBUNTU_BACKUP_SKIP_SERVICE:-0}" != 1 ]]; then
     systemctl --user disable --now ubuntu-configuration-backup.timer 2>/dev/null || true

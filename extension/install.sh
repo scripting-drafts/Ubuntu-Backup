@@ -100,14 +100,46 @@ if command -v node >/dev/null; then
     node --check "$TMP/indicatorStatusIcon.js" >/dev/null 2>&1 || \
         echo "Warning: indicatorStatusIcon.js syntax check failed; verify the extension manually." >&2
 fi
-if [[ -d "$DEST" ]]; then
+if [[ -L "$DEST" ]]; then
+    echo "Refusing symlinked extension path: $DEST" >&2
+    exit 1
+fi
+if [[ -e "$DEST" ]]; then
+    [[ -d "$DEST" ]] || { echo "Refusing non-directory extension path: $DEST" >&2; exit 1; }
     existing="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("uuid",""))' "$DEST/metadata.json" 2>/dev/null || true)"
     [[ "$existing" == "$SYSTEM_UUID" ]] || { echo "Refusing to replace unexpected extension at $DEST" >&2; exit 1; }
-    rm -rf "$DEST"
+    rm -rf -- "$DEST"
 fi
-mkdir -p "$(dirname "$DEST")"
-mv "$TMP" "$DEST"
+parent_dir="$(dirname "$DEST")"
+mkdir -p -- "$parent_dir"
+if [[ ! -d "$parent_dir" || -L "$parent_dir" || ! -O "$parent_dir" ]]; then
+    echo "Refusing unsafe extension directory: $parent_dir" >&2
+    exit 1
+fi
+backup_dest=""
+if [[ -e "$DEST" ]]; then
+    backup_dest="$DEST.old.$$.$RANDOM"
+    mv -T -- "$DEST" "$backup_dest"
+fi
+if ! mv -T -- "$TMP" "$DEST"; then
+    if [[ -n "$backup_dest" ]]; then
+        mv -T -- "$backup_dest" "$DEST"
+    fi
+    exit 1
+fi
 trap - EXIT
+installed_uuid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("uuid",""))' "$DEST/metadata.json" 2>/dev/null || true)"
+if [[ "$installed_uuid" != "$SYSTEM_UUID" ]]; then
+    echo "Extension install integrity check failed at $DEST" >&2
+    rm -rf -- "$DEST"
+    if [[ -n "$backup_dest" ]]; then
+        mv -T -- "$backup_dest" "$DEST"
+    fi
+    exit 1
+fi
+if [[ -n "$backup_dest" ]]; then
+    rm -rf -- "$backup_dest"
+fi
 rm -rf "$OLD_FORK_DEST"
 
 python3 - "$OLD_FORK_UUID" "$SYSTEM_UUID" <<'PY'
