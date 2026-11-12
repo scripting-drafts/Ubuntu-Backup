@@ -233,7 +233,16 @@ Even a filesystem snapshot does not guarantee application-level consistency for 
 - **No tray appears:** confirm that you are in a graphical desktop session and that GTK 3 / Ayatana AppIndicator dependencies are installed.
 - **Restore reports omissions:** inspect the operation report; a completed operation with omissions is distinct from a fatal failure.
 
+# History
+
+Version 1.1.0 (2026-11-12)
+
+Lead Developer - Gerard Sala
+- LinkedIn: https://www.linkedin.com/in/gerard-sala/
+- GitHub: https://github.com/scripting-drafts
+
 ## License
 
-No license is currently specified in this repository. Unless a license is added, the source should not be assumed to be available for unrestricted reuse or redistribution.
-](https://github.com/scripting-drafts/Ubuntu-Backup/blob/main/README.md?utm_source=chatgpt.com)
+The MIT License (MIT)
+
+Copyright (c) 2026 Gerard Sala
