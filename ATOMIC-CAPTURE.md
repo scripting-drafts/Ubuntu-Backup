@@ -5,13 +5,13 @@ LVM, btrfs and ZFS detection/creation/cleanup are implemented; unsupported files
 to a live read under `auto`, while `required` refuses to start. The copier still never tries to
 emulate point-in-time consistency by itself.
 
-## Why the current capture is not atomic
+## Why a live capture is not atomic
 
-`root_home_backup()` streams a live `tar` over `/home` while applications keep writing. GNU tar
-trusts the size in each header, so a file that grows or shrinks mid-read is stored torn (padded or
-truncated). The timeline is published atomically (temp directory, verify, `rename`), but its
-*content* spans the whole capture window rather than one instant. No amount of retrying in the
-copier can fix that: the filesystem itself must hold still.
+`root_home_backup()` scans a live `/home` while applications keep writing. The native core detects
+a file that changes during read and retries it; if it keeps changing, the path is recorded as an
+omission instead of storing torn content. The timeline is published atomically (temp directory,
+verify, `rename`), but its *content* spans the whole capture window rather than one instant. No
+amount of retrying in the copier can fix that: the filesystem itself must hold still.
 
 ## Layout constraint
 
@@ -32,7 +32,7 @@ copy-on-write growth for the capture window.
 3. Freeze the source filesystem only around snapshot creation:
    `fsfreeze --freeze /home`, `lvcreate -s -n <name> -L <size> <root_lv>`, `fsfreeze --unfreeze /home`.
 4. Mount the snapshot read-only (`-o ro,nouuid`) under a private root-only directory.
-5. Stream the existing `tar` pipeline from the snapshot mountpoint.
+5. Run `ubackup-core scan` from the snapshot mountpoint.
 6. In `finally`: unmount, then `lvremove -f`. Never leave an orphan snapshot mounted.
 
 Window: seconds for the freeze. Long-lived cost is only thin-pool growth while the snapshot exists.
@@ -42,12 +42,12 @@ Window: seconds for the freeze. Long-lived cost is only thin-pool growth while t
 Root on btrfs with `/home` as a subvolume (`@home`):
 
 1. `btrfs subvolume snapshot -r /home <private>/snap`
-2. Mount read-only, stream tar from it, unmount.
+2. Mount read-only, run `ubackup-core scan` from it, unmount.
 3. `btrfs subvolume delete <private>/snap` in `finally`.
 
 No freeze is needed. In-place `btrfs-convert` is possible but risky; prefer a planned reinstall or a
-maintenance-window migration. `btrfs send` is an option later, but keep tar so the on-drive format
-stays unchanged.
+maintenance-window migration. `btrfs send` is an option later, but keep the native object-store
+format so the on-drive layout stays unchanged.
 
 ### C. ZFS
 
@@ -60,14 +60,15 @@ then `zfs destroy`. Same integration points as A and B.
    snapshot, return `(mountpoint, metadata, release)`. Unsupported or unavailable must raise, never
    silently fall back to a live read when atomic capture is required.
 2. **`root_home_backup()`** — create the snapshot *before* the writer drops privileges; point
-   `tar --directory=` at the snapshot mountpoint; keep the existing exclusion list, resolved
-   relative to the workspace inside the snapshot. Record a `snapshot` block in the manifest
-   (`kind`, `id`, `created_at`, `window_ms`).
+   `ubackup-core scan --source` at the snapshot mountpoint; keep the existing exclusion list,
+   resolved relative to the workspace inside the snapshot. Record a `snapshot` block in the
+   manifest (`kind`, `id`, `created_at`, `window_ms`).
 3. **Privilege ordering** — snapshot create/teardown need root, but the writer deliberately drops to
    the owner before consuming the stream. Use a small root supervisor process that creates the
    snapshot up front and unmounts/destroys it after the stream ends, or have the worker fork a root
    helper before `setuid`. Teardown must run on failure, SIGINT, and disk-full.
-4. **`capture_home_archive()`** — unchanged; it stays a pure stream consumer.
+4. **`ubackup-core scan` / `ubackup-core restore`** — the only full `/home` backup/restore engine;
+   Python only orchestrates snapshots, privileges, verification, and status.
 5. **`wizard_home_backup()`** — replace the "capture is not atomic" warning with the actual snapshot
    status. New setting `home_snapshot: "auto" | "required" | "off"`; `required` refuses to start
    without a snapshot.

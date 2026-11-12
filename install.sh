@@ -37,12 +37,17 @@ elif [[ ! -e "$LINK" ]]; then
 else
     echo "Warning: leaving existing $LINK" >&2
 fi
-if [[ ! -x "$ROOT/native/ubackup-core" && -f "$ROOT/native/ubackup-core.c" ]]; then
-    make -C "$ROOT/native" >/dev/null 2>&1 || echo "Warning: native capture core build failed; --native-capture will be unavailable." >&2
+if [[ -f "$ROOT/native/ubackup-core.c" ]]; then
+    make -C "$ROOT/native" >/dev/null 2>&1 || {
+        echo "The native backup core is required but failed to build." >&2
+        exit 1
+    }
 fi
-if [[ -x "$ROOT/native/ubackup-core" ]]; then
-    install -m 700 "$ROOT/native/ubackup-core" "$BIN/ubackup-core"
+if [[ ! -x "$ROOT/native/ubackup-core" ]]; then
+    echo "The native backup core is required: native/ubackup-core is missing." >&2
+    exit 1
 fi
+install -m 700 "$ROOT/native/ubackup-core" "$BIN/ubackup-core"
 install -m 600 "$ROOT/ubuntu-backup.svg" "$ICONS/ubuntu-backup.svg"
 quote() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
 # systemd specifier %h keeps the generated units portable between machines/accounts.

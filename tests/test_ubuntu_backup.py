@@ -15,6 +15,8 @@ import pwd
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,13 +118,13 @@ class CaptureRootTests(unittest.TestCase):
     def test_worker_stderr_is_surfaced(self):
         calls = []
 
-        def fake_run(command, **kwargs):
-            calls.append((command, kwargs))
+        def fake_run(command):
+            calls.append(command)
             return subprocess.CompletedProcess(command, 1, "", "Error: missing parent\n")
 
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            saved = backup.subprocess.run, backup.KIT
-            backup.subprocess.run = fake_run
+            saved = backup.run_cancellable, backup.KIT
+            backup.run_cancellable = fake_run
             backup.KIT = Path(directory)
             stderr = io.StringIO()
             stdout = io.StringIO()
@@ -131,10 +133,10 @@ class CaptureRootTests(unittest.TestCase):
                     with self.assertRaises(backup.ConfigError) as raised:
                         backup.capture_root()
             finally:
-                backup.subprocess.run, backup.KIT = saved
+                backup.run_cancellable, backup.KIT = saved
             self.assertIn("missing parent", str(raised.exception))
             self.assertIn("missing parent", stderr.getvalue())
-            self.assertEqual(calls[0][1].get("stderr"), subprocess.PIPE)
+            self.assertIn("_capture-root-worker", calls[0])
 
 
 class CpuGuardTests(unittest.TestCase):
@@ -169,83 +171,24 @@ class CpuGuardTests(unittest.TestCase):
             finally:
                 backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity = saved
 
-
-class StagingTests(unittest.TestCase):
-    def test_stream_object_stages_until_bulk_copy(self):
+    def test_no_exclusions_uses_every_available_cpu_without_pinning(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            base = Path(directory)
-            stage_objects = base / "stage" / "objects"
-            stage_incoming = base / "stage" / "incoming"
-            external_objects = base / "external" / "objects"
-            stage_objects.mkdir(parents=True)
-            stage_incoming.mkdir(parents=True)
-            external_objects.mkdir(parents=True)
-            data = b"hello staged backup\n"
-            created = []
-            destination, sha256 = backup.stream_object(
-                stage_objects, stage_incoming, external_objects,
-                io.BytesIO(data), len(data), None, created)
-            self.assertEqual(destination, backup.object_path(external_objects, sha256))
-            self.assertFalse(destination.exists())
-            self.assertEqual(created, [destination])
-            self.assertEqual(backup.object_path(stage_objects, sha256).read_bytes(), data)
-            self.assertEqual(backup.copy_staged_objects(stage_objects, external_objects), 1)
-            self.assertEqual(destination.read_bytes(), data)
-
-    def test_existing_external_object_is_reused(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            base = Path(directory)
-            stage_objects = base / "stage" / "objects"
-            stage_incoming = base / "stage" / "incoming"
-            external_objects = base / "external" / "objects"
-            stage_objects.mkdir(parents=True)
-            stage_incoming.mkdir(parents=True)
-            external_objects.mkdir(parents=True)
-            data = b"already stored\n"
-            sha256 = hashlib.sha256(data).hexdigest()
-            destination = backup.object_path(external_objects, sha256)
-            destination.parent.mkdir(parents=True)
-            destination.write_bytes(data)
-            created = []
-            result, digest_value = backup.stream_object(
-                stage_objects, stage_incoming, external_objects,
-                io.BytesIO(data), len(data), None, created)
-            self.assertEqual(result, destination)
-            self.assertEqual(digest_value, sha256)
-            self.assertEqual(created, [])
-            self.assertFalse(backup.object_path(stage_objects, sha256).exists())
-            self.assertEqual(list(stage_incoming.iterdir()), [])
-
-    def test_sparse_tar_sentinels_are_ignored(self):
-        import tarfile
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            base = Path(directory)
-            source = base / "sparse.bin"
-            with source.open("wb") as stream:
-                stream.write(b"A" * 4096)
-                stream.seek(8 * 1024 * 1024)
-                stream.write(b"B" * 4096)
-                stream.truncate(16 * 1024 * 1024)
-            archive_path = base / "sparse.tar"
-            subprocess.run(["tar", "--create", "--file", str(archive_path), "--sparse",
-                            "--directory", str(base), source.name], check=True)
-            stage_objects = base / "stage/objects"
-            stage_incoming = base / "stage/incoming"
-            external_objects = base / "external/objects"
-            stage_objects.mkdir(parents=True)
-            stage_incoming.mkdir(parents=True)
-            external_objects.mkdir(parents=True)
-            with tarfile.open(archive_path, "r|") as archive:
-                member = next(iter(archive))
-                self.assertTrue(member.sparse)
-                self.assertIn((0, 0), [tuple(item) for item in member.sparse])
-                destination, sha256 = backup.stream_object(
-                    stage_objects, stage_incoming, external_objects,
-                    archive.extractfile(member), member.size,
-                    [list(item) for item in member.sparse], [])
-            self.assertEqual(sha256, hashlib.sha256(source.read_bytes()).hexdigest())
-            self.assertEqual(backup.copy_staged_objects(stage_objects, external_objects), 1)
-            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            kit = Path(directory)
+            (kit / "config").mkdir()
+            (kit / "config/settings.json").write_text(
+                json.dumps({"keep_snapshots": 30, "exclude_cpus": []}))
+            available = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+            calls = []
+            saved = backup.KIT, backup.os.sched_getaffinity, backup.os.sched_setaffinity
+            backup.KIT = kit
+            backup.os.sched_getaffinity = lambda _pid: set(available)
+            backup.os.sched_setaffinity = lambda pid, cpus: calls.append((pid, set(cpus)))
+            try:
+                self.assertEqual(backup.allowed_backup_cpus(), available)
+                self.assertEqual(backup.restrict_backup_cpus(), available)
+                self.assertEqual(calls, [])
+            finally:
+                backup.KIT, backup.os.sched_getaffinity, backup.os.sched_setaffinity = saved
 
 
 class StagingCleanupTests(unittest.TestCase):
@@ -270,47 +213,6 @@ class StagingCleanupTests(unittest.TestCase):
                 self.assertTrue((target / "keep").is_file())
             finally:
                 backup.KIT = saved
-
-
-class HomeCaptureSparseTests(unittest.TestCase):
-    def test_capture_publishes_a_sparse_file_timeline(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            base = Path(directory)
-            source = base / "source"
-            source.mkdir()
-            sparse = source / "sparse.bin"
-            with sparse.open("wb") as stream:
-                stream.write(b"A" * 4096)
-                stream.seek(8 * 1024 * 1024)
-                stream.write(b"B" * 4096)
-                stream.truncate(16 * 1024 * 1024)
-            (source / "link").symlink_to("sparse.bin")
-            (source / "hard").hardlink_to(sparse)
-            (source / "dir").mkdir()
-            (source / "dir/file.txt").write_text("text\n")
-            archive_path = base / "home.tar"
-            subprocess.run(["tar", "--create", "--file", str(archive_path),
-                            "--sparse", "--acls", "--xattrs", "--numeric-owner",
-                            "--directory", str(source), "."], check=True)
-            external = base / "external"
-            external.mkdir()
-            stage = base / "stage"
-            stage.mkdir()
-            saved = backup.KIT, backup.prepare_staging
-            backup.KIT = base / "kit"
-            backup.KIT.mkdir()
-            backup.prepare_staging = lambda _root: stage
-            try:
-                with archive_path.open("rb") as stream:
-                    timeline, manifest, _created, _timelines = backup.capture_home_archive(
-                        stream, external, {}, [])
-                self.assertTrue(timeline.is_dir())
-                self.assertGreaterEqual(manifest["entry_count"], 5)
-                backup.verify_home_timeline(timeline)
-                self.assertEqual(timeline.joinpath("tree/sparse.bin").read_bytes(),
-                                 sparse.read_bytes())
-            finally:
-                backup.KIT, backup.prepare_staging = saved
 
 
 class DevelopmentOrderTests(unittest.TestCase):
@@ -976,7 +878,7 @@ class PackageIntegrityTests(unittest.TestCase):
             saved = backup.KIT
             backup.KIT = kit
             try:
-                with mock.patch.object(backup.subprocess, "run",
+                with mock.patch.object(backup, "run_cancellable",
                                        return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
                     self.assertTrue(backup.capture_root_package_scan(force=True))
                     run.assert_called_once()
@@ -1330,48 +1232,197 @@ class SavedDriveMountTests(unittest.TestCase):
             backup.sys.stdin = saved
 
 
-class HomeCaptureFallbackTests(unittest.TestCase):
-    def test_tar_failure_retries_with_native_capture(self):
+class HomeCaptureNativeTests(unittest.TestCase):
+    def test_native_worker_is_the_only_worker(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             log = Path(directory) / "home-worker.log"
             calls = []
 
             def fake_run(command, path):
                 calls.append((list(command), Path(path)))
-                if len(calls) == 1:
-                    raise backup.ConfigError("tar: file changed as we read it")
 
-            saved_run, saved_native = backup.run_logged, backup.native_core_path
+            saved_run = backup.run_logged
             backup.run_logged = fake_run
-            backup.native_core_path = lambda: Path("/bin/true")
             try:
-                result = backup.run_home_worker_with_fallback(["sudo", "python"], log)
+                backup.run_home_worker(["sudo", "python"], log)
             finally:
-                backup.run_logged, backup.native_core_path = saved_run, saved_native
-        self.assertTrue(result)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1][0][-1], "--native-capture")
-        self.assertTrue(calls[1][1].name.endswith("-native.log"))
+                backup.run_logged = saved_run
+        self.assertEqual(calls, [(["sudo", "python"], log)])
 
-    def test_fallback_does_not_mask_a_native_failure(self):
+    def test_missing_native_core_is_fatal(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            log = Path(directory) / "home-worker.log"
-            calls = []
-
-            def fake_run(command, path):
-                calls.append(list(command))
-                raise backup.ConfigError("worker failed")
-
-            saved_run, saved_native = backup.run_logged, backup.native_core_path
-            backup.run_logged = fake_run
-            backup.native_core_path = lambda: Path("/bin/true")
+            base = Path(directory)
+            saved = backup.KIT, backup.SCRIPT_PATH, os.environ.pop("UBUNTU_BACKUP_NATIVE", None)
+            backup.KIT = base / "workspace" / "data"
+            backup.SCRIPT_PATH = base / "bin" / "ubuntu-backup.py"
             try:
-                with self.assertRaises(backup.ConfigError):
-                    backup.run_home_worker_with_fallback(["sudo", "python"], log)
+                with self.assertRaises(backup.ConfigError) as caught:
+                    backup.native_core_path()
             finally:
-                backup.run_logged, backup.native_core_path = saved_run, saved_native
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1][-1], "--native-capture")
+                backup.KIT, backup.SCRIPT_PATH = saved[0], saved[1]
+                if saved[2] is not None:
+                    os.environ["UBUNTU_BACKUP_NATIVE"] = saved[2]
+        self.assertIn("native backup core is required", str(caught.exception))
+
+
+class NativeRestoreIntegrationTests(unittest.TestCase):
+    def test_restore_home_uses_the_native_core(self):
+        if shutil.which("cc") is None:
+            self.skipTest("cc is unavailable")
+        build = subprocess.run(["make", "-C", str(ROOT / "native")],
+                               capture_output=True, text=True)
+        if build.returncode:
+            self.skipTest("native core build failed")
+        core = ROOT / "native" / "ubackup-core"
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "source"
+            (source / "dir").mkdir(parents=True)
+            (source / "file.txt").write_text("hello\n")
+            (source / "dir/nested.txt").write_text("nested\n")
+            (source / "link").symlink_to("file.txt")
+            root = base / "root"
+            objects = root / "baseline/home/objects"
+            timeline = root / "timeline/home"
+            timeline.mkdir(parents=True)
+            scan = subprocess.run([
+                str(core), "scan", "--source", str(source),
+                "--objects", str(objects),
+                "--entries", str(base / "entries.ndjson"),
+                "--report", str(base / "scan.json"),
+                "--timeline", str(timeline),
+                "--run-id", "20261112T120000.000000Z",
+            ], capture_output=True, text=True)
+            self.assertEqual(scan.returncode, 0, scan.stderr)
+            saved = backup.KIT, os.environ.get("UBUNTU_BACKUP_NATIVE")
+            backup.KIT = base / "kit"
+            backup.KIT.mkdir()
+            os.environ["UBUNTU_BACKUP_NATIVE"] = str(core)
+            try:
+                destination = backup.restore_home(
+                    timeline / "home-full-20261112T120000.000000Z")
+            finally:
+                backup.KIT = saved[0]
+                if saved[1] is None:
+                    os.environ.pop("UBUNTU_BACKUP_NATIVE", None)
+                else:
+                    os.environ["UBUNTU_BACKUP_NATIVE"] = saved[1]
+            self.assertEqual((destination / "file.txt").read_text(), "hello\n")
+            self.assertEqual((destination / "dir/nested.txt").read_text(), "nested\n")
+            self.assertEqual((destination / "link").readlink(), Path("file.txt"))
+            self.assertTrue((destination.parent / (destination.name + "-restore.json")).is_file())
+
+    def test_restore_home_cancel_removes_partial_destination(self):
+        if shutil.which("cc") is None:
+            self.skipTest("cc is unavailable")
+        build = subprocess.run(["make", "-C", str(ROOT / "native")],
+                               capture_output=True, text=True)
+        if build.returncode:
+            self.skipTest("native core build failed")
+        core = ROOT / "native" / "ubackup-core"
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            source = base / "source"
+            source.mkdir()
+            (source / "file.txt").write_text("hello\n")
+            root = base / "root"
+            objects = root / "baseline/home/objects"
+            timeline = root / "timeline/home"
+            timeline.mkdir(parents=True)
+            scan = subprocess.run([
+                str(core), "scan", "--source", str(source),
+                "--objects", str(objects),
+                "--entries", str(base / "entries.ndjson"),
+                "--report", str(base / "scan.json"),
+                "--timeline", str(timeline),
+                "--run-id", "20261112T120001.000000Z",
+            ], capture_output=True, text=True)
+            self.assertEqual(scan.returncode, 0, scan.stderr)
+            slow = base / "slow-core"
+            slow.write_text("#!/bin/sh\nsleep 30\n")
+            slow.chmod(0o700)
+            saved = backup.KIT, os.environ.get("UBUNTU_BACKUP_NATIVE")
+            backup.KIT = base / "kit"
+            backup.KIT.mkdir()
+            os.environ["UBUNTU_BACKUP_NATIVE"] = str(slow)
+            result = {}
+
+            def run_restore():
+                try:
+                    backup.restore_home(timeline / "home-full-20261112T120001.000000Z")
+                except BaseException as exc:
+                    result["error"] = exc
+
+            thread = threading.Thread(target=run_restore, daemon=True)
+            try:
+                thread.start()
+                time.sleep(0.5)
+                backup._request_cancel()
+                thread.join(15)
+            finally:
+                backup._finish_operation_cancel()
+                backup.KIT = saved[0]
+                if saved[1] is None:
+                    os.environ.pop("UBUNTU_BACKUP_NATIVE", None)
+                else:
+                    os.environ["UBUNTU_BACKUP_NATIVE"] = saved[1]
+            self.assertIsInstance(result.get("error"), backup.OperationCancelled)
+            self.assertEqual(list((backup.KIT / "restored").glob("home-full-*")), [])
+
+
+class OperationCancelTests(unittest.TestCase):
+    def test_cancel_file_requests_and_clears(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.KIT
+            backup.KIT = Path(directory)
+            try:
+                backup._reset_operation_cancel()
+                self.assertFalse(backup._cancel_requested())
+                backup._request_cancel()
+                self.assertTrue(backup._cancel_requested())
+                with self.assertRaises(backup.OperationCancelled):
+                    backup._check_cancel()
+                backup._finish_operation_cancel()
+                self.assertFalse(backup._cancel_requested())
+            finally:
+                backup.KIT = saved
+
+    def test_run_cancellable_terminates_a_child(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.KIT
+            backup.KIT = Path(directory)
+            try:
+                backup._reset_operation_cancel()
+                threading.Thread(
+                    target=lambda: (time.sleep(0.5), backup._request_cancel()),
+                    daemon=True,
+                ).start()
+                started = time.monotonic()
+                with self.assertRaises(backup.OperationCancelled):
+                    backup.run_cancellable(["/bin/sh", "-c", "sleep 30"])
+                self.assertLess(time.monotonic() - started, 10)
+            finally:
+                backup._finish_operation_cancel()
+                backup.KIT = saved
+
+    def test_run_logged_cancels_and_keeps_output(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            saved = backup.KIT
+            backup.KIT = Path(directory)
+            log = Path(directory) / "worker.log"
+            try:
+                backup._reset_operation_cancel()
+                threading.Thread(
+                    target=lambda: (time.sleep(0.5), backup._request_cancel()),
+                    daemon=True,
+                ).start()
+                with self.assertRaises(backup.OperationCancelled):
+                    backup.run_logged(
+                        ["/bin/sh", "-c", "echo started; sleep 30"], log)
+                self.assertIn("started", log.read_text())
+            finally:
+                backup._finish_operation_cancel()
+                backup.KIT = saved
 
 
 class FullHomeSafetyTests(unittest.TestCase):
@@ -1427,6 +1478,7 @@ class FullHomeRunIdTests(unittest.TestCase):
                     mock.patch.object(backup, "external_directory", return_value=Path("/tmp/drive")),
                     mock.patch.object(backup, "home_identity", return_value=identity),
                     mock.patch.object(backup, "run_logged", side_effect=fake_run_logged),
+                    mock.patch.object(backup, "verify_home_timeline", return_value={}),
                 ):
                     self.assertTrue(backup.wizard_home_backup("20261106T113637.000000Z"))
             finally:
@@ -1434,6 +1486,7 @@ class FullHomeRunIdTests(unittest.TestCase):
             command = calls[-1]
             self.assertIn("--run-id", command)
             self.assertEqual(command[command.index("--run-id") + 1], "20261106T113637.000000Z")
+            self.assertNotIn("--native-capture", command)
 
 
 class LoggedWorkerTests(unittest.TestCase):
@@ -1496,7 +1549,7 @@ class NativeCaptureFlagTests(unittest.TestCase):
             self.assertEqual(command[command.index("--identity-json") + 1],
                              '{"host":"test"}')
 
-    def test_home_worker_receives_native_capture_flag(self):
+    def test_home_worker_has_no_native_capture_switch(self):
         from unittest import mock
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             saved = backup.KIT
@@ -1516,13 +1569,13 @@ class NativeCaptureFlagTests(unittest.TestCase):
                     mock.patch.object(backup, "external_directory", return_value=Path("/tmp/drive")),
                     mock.patch.object(backup, "home_identity", return_value=identity),
                     mock.patch.object(backup, "run_logged", side_effect=fake_run_logged),
-                    mock.patch.object(backup, "verify_path", return_value={}),
+                    mock.patch.object(backup, "verify_home_timeline", return_value={}),
                 ):
-                    self.assertTrue(backup.wizard_home_backup(
-                        "20261106T113637.000000Z", native_capture=True))
+                    self.assertTrue(backup.wizard_home_backup("20261106T113637.000000Z"))
             finally:
                 backup.KIT = saved
-            self.assertIn("--native-capture", calls[-1])
+            self.assertNotIn("--native-capture", calls[-1])
+            self.assertTrue(calls[-1][-1] == "20261106T113637.000000Z")
 
 
 class PrepareDriveIntegrationTests(unittest.TestCase):
@@ -1884,6 +1937,33 @@ class BackupRestoreFlowTests(unittest.TestCase):
         root_capture.assert_called_once_with(hide_followup_hint=True, package_scan=False)
         interactive.assert_called_once_with(package_scan=False)
 
+    def test_backup_flow_omits_the_empty_package_cache_banner(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            drive = Path(directory) / "drive"
+            drive.mkdir()
+            output = io.StringIO()
+            with (
+                mock.patch.object(backup, "_diagnose_previous_status"),
+                mock.patch.object(backup, "_ensure_tray"),
+                mock.patch.object(backup, "_write_status"),
+                mock.patch.object(backup, "_status_history"),
+                mock.patch.object(backup, "package_scan_summary",
+                                   return_value=backup.NO_PRIVILEGED_CACHE),
+                mock.patch.object(backup, "capture_root_package_scan"),
+                mock.patch.object(backup, "capture_root"),
+                mock.patch.object(backup, "settings",
+                                   return_value={"external_backup": {"subdirectory": ""}}),
+                mock.patch.object(backup, "external_directory", return_value=drive),
+                mock.patch.object(backup, "validate_external_directory"),
+                mock.patch.object(backup, "interactive_backup",
+                                   return_value=drive / "backup"),
+                mock.patch.object(backup, "wizard_home_backup", return_value=True),
+                redirect_stdout(output),
+            ):
+                backup.backup_everything()
+        self.assertNotIn("Package scan before backup", output.getvalue())
+
     def test_backup_impl_skips_scan_when_flow_already_scanned(self):
         from unittest import mock
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -1936,11 +2016,10 @@ class BackupRestoreFlowTests(unittest.TestCase):
         scan.assert_called_once_with(non_interactive=False, force=False)
         confirm.assert_not_called()
 
-    def test_recovery_menu_has_no_cancel_entry(self):
+    def test_recovery_menu_uses_a_dropdown_without_cancel_entry(self):
         from unittest import mock
         with (
-            mock.patch.object(backup, "choose", return_value="1") as choose,
-            mock.patch.object(backup, "choose_archive", return_value=None),
+            mock.patch.object(backup, "choose", return_value="0") as choose,
             redirect_stdout(io.StringIO()),
         ):
             backup.wizard_recover()
@@ -1948,13 +2027,45 @@ class BackupRestoreFlowTests(unittest.TestCase):
         self.assertEqual([value for value, _label, *_detail in choices], ["1", "2", "3"])
         self.assertEqual(choose.call_args.args[2], "1")
 
+    def test_choose_archive_presents_a_dropdown_defaulting_to_latest(self):
+        from unittest import mock
+        found = [(Path("/tmp/config-a"), "external"), (Path("/tmp/config-b"), "local")]
+        saved = backup._GUI_PROMPT_HANDLER
+        backup._GUI_PROMPT_HANDLER = lambda *args: None
+        try:
+            with (
+                mock.patch.object(backup, "recovery_choices", return_value=found),
+                mock.patch.object(backup, "choose",
+                                  return_value="/tmp/config-b") as choose,
+            ):
+                self.assertEqual(backup.choose_archive("config"), Path("/tmp/config-b"))
+        finally:
+            backup._GUI_PROMPT_HANDLER = saved
+        values = [item[0] for item in choose.call_args.args[1]]
+        self.assertEqual(values, ["/tmp/config-a", "/tmp/config-b", "__path__"])
+        self.assertEqual(choose.call_args.args[2], "/tmp/config-a")
+
+    def test_recovery_flow_uses_the_latest_configuration(self):
+        from unittest import mock
+        latest = Path("/tmp/latest-config")
+        with (
+            mock.patch.object(backup, "choose", return_value="1"),
+            mock.patch.object(backup, "recovery_choices", return_value=[(latest, "external")]),
+            mock.patch.object(backup, "is_full_home", return_value=False),
+            mock.patch.object(backup, "restore", return_value=Path("/tmp/restored")) as restore,
+            mock.patch.object(backup, "confirm", return_value=False),
+            redirect_stdout(io.StringIO()),
+        ):
+            backup.wizard_recover()
+        restore.assert_called_once_with(latest)
+
     def test_recovery_flow_offers_package_restore(self):
         from unittest import mock
         source = Path("/tmp/snapshot")
         destination = Path("/tmp/restored")
         with (
-            mock.patch.object(backup, "ask", return_value="1"),
-            mock.patch.object(backup, "choose_archive", return_value=source),
+            mock.patch.object(backup, "choose", return_value="1"),
+            mock.patch.object(backup, "recovery_choices", return_value=[(source, "external")]),
             mock.patch.object(backup, "restore", return_value=destination),
             mock.patch.object(backup, "confirm", side_effect=[False, False, True]),
             mock.patch.object(backup, "wizard_restore_package_files") as package_restore,

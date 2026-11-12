@@ -343,63 +343,6 @@ class NativeCoreTests(unittest.TestCase):
             self.assertEqual(manifest["warning_count"], 1)
             self.assertEqual(manifest["warnings"][0]["path"], "secret.txt")
 
-    def test_differential_entries_match_python_capture(self):
-        import tarfile
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            base = Path(directory)
-            source = base / "source"
-            (source / "dir").mkdir(parents=True)
-            (source / "file.txt").write_text("differential\n")
-            (source / "dir/nested.txt").write_text("nested\n")
-            (source / "link").symlink_to("file.txt")
-            os.setxattr(source / "file.txt", b"user.demo", b"differential")
-            tar_path = base / "home.tar"
-            subprocess.run(["tar", "--create", "--file", str(tar_path),
-                            "--sparse", "--acls", "--xattrs", "--numeric-owner",
-                            "--directory", str(source), "."], check=True)
-
-            root = base / "root"
-            objects = root / "baseline/home/objects"
-            timeline_parent = root / "timeline/home"
-            timeline_parent.mkdir(parents=True)
-            report = base / "report.json"
-            entries = base / "entries.ndjson"
-            result = subprocess.run([
-                str(BINARY), "scan", "--source", str(source),
-                "--objects", str(objects), "--entries", str(entries),
-                "--report", str(report), "--timeline", str(timeline_parent),
-                "--run-id", "20261106T160001.000000Z",
-            ], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            common = json.loads(report.read_text())
-
-            external = base / "python-external"
-            external.mkdir()
-            stage = base / "python-stage"
-            stage.mkdir()
-            saved = (self.reference.KIT, self.reference.prepare_staging)
-            self.reference.KIT = base / "python-kit"
-            self.reference.KIT.mkdir()
-            self.reference.prepare_staging = lambda _root: stage
-            try:
-                with tar_path.open("rb") as stream:
-                    python_timeline, _manifest, _created, _timelines =                         self.reference.capture_home_archive(stream, external, {}, [])
-            finally:
-                self.reference.KIT, self.reference.prepare_staging = saved
-
-            def core(path):
-                result = {}
-                for line in Path(path).read_text().splitlines():
-                    entry = json.loads(line)
-                    result[entry["path"]] = (
-                        entry["type"], entry.get("size"), entry.get("sha256"),
-                        entry.get("target"), entry.get("hardlink_to"),
-                    )
-                return result
-
-            self.assertEqual(core(entries), core(python_timeline / "entries.ndjson"))
-            self.reference.verify_home_timeline(python_timeline)
-
     def test_restore_preserves_xattrs_and_acls(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             base = Path(directory)

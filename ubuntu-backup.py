@@ -18,6 +18,7 @@ import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import pwd
+import queue
 import re
 import shutil
 import signal
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 
@@ -41,13 +43,13 @@ ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
 PACKAGE_FILE_MAX = 64 * 1024 * 1024
 PACKAGE_FILE_TOTAL = 256 * 1024 * 1024
+NO_PRIVILEGED_CACHE = "Package scan: no privileged cache"
 XATTR_MAX = 64 * 1024
 XATTR_PREFIXES = ("user.", "system.posix_acl_")
 XATTR_EXACT = {"security.capability"}
 MAX_IN_MEMORY = 64 * 1024 * 1024
 MAX_FILE = 2 * 1024 * 1024 * 1024
 MAX_TOTAL = 8 * 1024 * 1024 * 1024
-STAGING_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 SYSTEM_CONFIG_ROOTS = ("/etc", "/usr/local/etc")
 DISTRO_METAPACKAGES = ("ubuntu-desktop", "ubuntu-desktop-minimal", "ubuntu-minimal",
                        "ubuntu-standard", "ubuntu-restricted-addons")
@@ -209,9 +211,12 @@ def cpu_siblings(cpu):
 
 
 def allowed_backup_cpus():
-    """Current affinity minus excluded CPUs and their SMT siblings."""
+    """All CPUs available to this process, minus any configured exclusions."""
+    excluded = settings().get("exclude_cpus", [])
+    if not excluded:
+        return set(os.sched_getaffinity(0))
     blocked = set()
-    for cpu in settings().get("exclude_cpus", []):
+    for cpu in excluded:
         blocked |= cpu_siblings(cpu)
     allowed = set(os.sched_getaffinity(0)) - blocked
     if not allowed:
@@ -220,8 +225,10 @@ def allowed_backup_cpus():
 
 
 def restrict_backup_cpus():
+    """Use every available CPU unless the configuration explicitly excludes some."""
     allowed = allowed_backup_cpus()
-    os.sched_setaffinity(0, allowed)
+    if settings().get("exclude_cpus", []):
+        os.sched_setaffinity(0, allowed)
     return allowed
 
 
@@ -765,6 +772,7 @@ def package_integrity(destination, report, verify_output=None, owners=None, conf
     conffiles = dpkg_conffiles() if conffiles is None else conffiles
     captured_total, seen = 0, set()
     for item in parse_dpkg_verify(verify_output):
+        _check_cancel()
         path = item["path"]
         if path in seen:
             continue
@@ -1117,9 +1125,11 @@ def restore_package_files_worker(plan_path, workspace):
 
 def capture_package_files_worker(workspace):
     """Root-only worker: scan every package file and cache modified contents."""
+    global KIT
     if os.geteuid() != 0:
         raise ConfigError("The package-file capture worker must run as root.")
     workspace = Path(workspace)
+    KIT = workspace
     if workspace.is_symlink() or not workspace.is_dir():
         raise ConfigError("Invalid workspace for package-file capture.")
     owner_uid, owner_gid = workspace.stat().st_uid, workspace.stat().st_gid
@@ -1129,6 +1139,7 @@ def capture_package_files_worker(workspace):
     cache = workspace / "privileged-package-scan"
     report = {"warnings": []}
     try:
+        _check_cancel()
         manifest = package_integrity(staging, report)
         write_json(staging / "package-conffiles.json", conffile_drift())
         for warning in report["warnings"]:
@@ -1306,7 +1317,7 @@ def package_scan_summary():
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
-        return "Package scan: no privileged cache"
+        return NO_PRIVILEGED_CACHE
     counts = data.get("counts", {}) if isinstance(data, dict) else {}
     age = privileged_package_scan_age()
     age_text = f"{age:.1f}h" if age is not None else "unknown"
@@ -1323,8 +1334,7 @@ def capture_root_package_scan(non_interactive=False, force=False):
     command = ["sudo"] + (["-n"] if non_interactive else [])
     command += ["/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
                 "_capture-package-files-worker"]
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True)
+    result = run_cancellable(command)
     for line in result.stdout.splitlines():
         print(line)
     for line in result.stderr.splitlines():
@@ -1514,6 +1524,7 @@ def copy_large_selection(source, destination, info, report, executable):
 
 
 def copy_selection(source, destination, relative, config, report, system=False, skip_kit=False, root_device=None):
+    _check_cancel()
     if skip_kit and (source == KIT or KIT in source.parents):
         return
     if any(fnmatch.fnmatch(relative, pattern) for pattern in config["exclude"]):
@@ -2050,6 +2061,7 @@ def capture_developments(destination, previous=None, source_home=None):
     captured_set = set(captured)
     kinds, contents, executables, sizes = {}, {}, set(), {}
     for path in paths:
+        _check_cancel()
         name = path.relative_to(root).as_posix()
         info = path.stat()
         sizes[name] = info.st_size
@@ -2071,6 +2083,7 @@ def capture_developments(destination, previous=None, source_home=None):
     previous_files, previous_captured = previous_development_records(previous)
     records, edges, changes = [], {}, []
     for name in code_names:
+        _check_cancel()
         staged_path = root / name
         source_path = source_home / name
         text = text_content(contents[name])
@@ -2410,6 +2423,7 @@ def verify_tree(directory):
     manifest = json.loads((directory / "manifest.json").read_text())
     records = validate_manifest(manifest, [path.relative_to(directory).as_posix() for path in files])
     for record in records:
+        _check_cancel()
         path = checked_path(directory, record["path"])
         if path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
             raise ConfigError(f"Checksum mismatch: {record['path']}")
@@ -2429,6 +2443,7 @@ def verify_archive(path):
         manifest = json.loads(archive.extractfile("manifest.json").read())
         records = validate_manifest(manifest, names)
         for record in records:
+            _check_cancel()
             member = archive.getmember(record["path"])
             if member.size != record["size"]:
                 raise ConfigError(f"Size mismatch: {record['path']}")
@@ -2491,6 +2506,7 @@ def create_dated_snapshot(stage, directory):
     shared = 0
     try:
         for record in manifest['files']:
+            _check_cancel()
             name = record['path']
             target = checked_path(destination, name)
             mkdir(target.parent)
@@ -2700,6 +2716,7 @@ def verify_linked_config(timeline):
     seen = set()
     hashes = {}
     for record in records:
+        _check_cancel()
         name = record["path"]
         link = safe_join(timeline, name, allow_final_symlink=True)
         if not link.is_symlink():
@@ -3457,7 +3474,7 @@ def backup(skip_external=False, package_scan=True):
         _write_status("running", "configuration", "Capturing configuration")
     try:
         result = _backup_impl(skip_external, package_scan=package_scan)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, OperationCancelled):
         if manage_status:
             message = "Configuration backup cancelled"
             _write_status("cancelled", "cancelled", message)
@@ -3498,8 +3515,10 @@ def _backup_impl(skip_external=False, package_scan=True):
     lock_fd = os.open(KIT / ".backup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        _check_cancel()
         if package_scan:
             capture_root_package_scan(non_interactive=True)
+        _check_cancel()
         previous = KIT / ".previous-snapshot"
         current = KIT / "snapshot"
         if previous.exists():
@@ -3515,7 +3534,9 @@ def _backup_impl(skip_external=False, package_scan=True):
         local_path = None
         external_path = None
         try:
+            _check_cancel()
             report = build_snapshot(stage, config)
+            _check_cancel()
             _LAST_BACKUP_WARNINGS = len(report.get("unreadable_files", []))
             verify_tree(stage)
             keep_local = bool(config.get("keep_local_backups", False))
@@ -3552,7 +3573,9 @@ def _backup_impl(skip_external=False, package_scan=True):
                 print("External backup drive: not configured.")
             else:
                 try:
+                    _check_cancel()
                     external_path = copy_external_snapshot(current, config, run_id)
+                    _check_cancel()
                 except (ConfigError, OSError, ValueError, KeyError, tarfile.TarError) as exc:
                     if isinstance(exc, FileNotFoundError):
                         raise ConfigError("Workspace disappeared during backup; no partial backup was published.") from None
@@ -3600,6 +3623,7 @@ def restore(path=None):
             else:
                 sources = regular_files(path)
             for source in sources:
+                _check_cancel()
                 name = source.relative_to(path).as_posix()
                 write_path(source, checked_path(destination, name),
                            executable=records.get(name, {}).get("executable", False))
@@ -3928,7 +3952,7 @@ def install_timer():
     print("Daily user backup timer enabled. Missed runs catch up when your user manager next starts.")
 
 
-EMBEDDED_DEFAULT_SETTINGS = {'coverage': 'system-wide-configuration', 'keep_snapshots': 30, 'exclude_cpus': [2, 8], 'external_backup': None, 'keep_local_backups': False, 'development_include': [], 'home_include': ['.bashrc', '.bash_logout', '.bash_aliases', '.profile', '.inputrc', '.gitconfig', '.Xresources', '.xprofile', '.xsessionrc', '.config/autostart', '.config/systemd/user', '.config/mimeapps.list', '.config/user-dirs.dirs', '.config/user-dirs.locale', '.config/fontconfig', '.config/gtk-3.0', '.config/gtk-4.0', '.config/environment.d', '.config/gnome-shell', '.config/gnome-session', '.config/libadwaita-1', '.config/pipewire', '.config/xdg-desktop-portal', '.local/share/nautilus', '.local/share/gnome-shell', '.config/Code/User/settings.json', '.config/Code/User/keybindings.json', '.config/Code/User/snippets', '.config/sublime-text/Packages/User', '.config/libreoffice/4/user/registrymodifications.xcu', '.local/share/applications', '.local/share/fonts', '.local/share/gnome-shell/extensions', '.local/share/themes', '.local/share/icons', '.fonts', '.themes', '.icons', 'bin', '*.sh', '*.py'], 'home_reference_only': ['.local/bin', '.nvidia-settings-rc', '.config/monitors.xml'], 'system_reference_only': ['/etc/default/keyboard', '/etc/default/locale', '/etc/environment', '/etc/locale.gen', '/etc/timezone', '/etc/apt/sources.list', '/etc/apt/sources.list.d', '/etc/apt/preferences.d', '/etc/apt/keyrings', '/etc/apt/apt.conf.d', '/etc/dconf', '/etc/environment.d', '/etc/netplan', '/etc/ubuntu-advantage', '/etc/xdg', '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/modprobe.d', '/etc/modules-load.d', '/etc/udev/rules.d', '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/systemd/system', '/etc/systemd/journald.conf', '/etc/systemd/journald.conf.d', '/etc/systemd/logind.conf', '/etc/systemd/logind.conf.d', '/etc/docker/daemon.json', '/etc/containerd/config.toml', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/etc/cron.d'], 'exclude': ['**/__pycache__', '**/__pycache__/*', '**/*.pyc', '**/.git', '**/.git/*', '.ssh', '.ssh/*', '.gnupg', '.gnupg/*', '.kube', '.kube/*', '.git-credentials', '.config/gh/*', '.docker/config.json', '.config/systemd/user/ubuntu-configuration-backup.*', '.config/systemd/user/timers.target.wants/ubuntu-configuration-backup.timer', 'etc/systemd/system/snap*', 'etc/apt/auth.conf', 'etc/apt/auth.conf.d/*'], 'apt_review_only': ['linux-*', 'grub*', 'shim*', 'nvidia-*', 'libnvidia-*', 'cuda*', 'nsight*', 'firmware-*', 'oem-*', 'efibootmgr', 'os-prober', 'mokutil']}
+EMBEDDED_DEFAULT_SETTINGS = {'coverage': 'system-wide-configuration', 'keep_snapshots': 30, 'exclude_cpus': [], 'external_backup': None, 'keep_local_backups': False, 'development_include': [], 'home_include': ['.bashrc', '.bash_logout', '.bash_aliases', '.profile', '.inputrc', '.gitconfig', '.Xresources', '.xprofile', '.xsessionrc', '.config/autostart', '.config/systemd/user', '.config/mimeapps.list', '.config/user-dirs.dirs', '.config/user-dirs.locale', '.config/fontconfig', '.config/gtk-3.0', '.config/gtk-4.0', '.config/environment.d', '.config/gnome-shell', '.config/gnome-session', '.config/libadwaita-1', '.config/pipewire', '.config/xdg-desktop-portal', '.local/share/nautilus', '.local/share/gnome-shell', '.config/Code/User/settings.json', '.config/Code/User/keybindings.json', '.config/Code/User/snippets', '.config/sublime-text/Packages/User', '.config/libreoffice/4/user/registrymodifications.xcu', '.local/share/applications', '.local/share/fonts', '.local/share/gnome-shell/extensions', '.local/share/themes', '.local/share/icons', '.fonts', '.themes', '.icons', 'bin', '*.sh', '*.py'], 'home_reference_only': ['.local/bin', '.nvidia-settings-rc', '.config/monitors.xml'], 'system_reference_only': ['/etc/default/keyboard', '/etc/default/locale', '/etc/environment', '/etc/locale.gen', '/etc/timezone', '/etc/apt/sources.list', '/etc/apt/sources.list.d', '/etc/apt/preferences.d', '/etc/apt/keyrings', '/etc/apt/apt.conf.d', '/etc/dconf', '/etc/environment.d', '/etc/netplan', '/etc/ubuntu-advantage', '/etc/xdg', '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/modprobe.d', '/etc/modules-load.d', '/etc/udev/rules.d', '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/systemd/system', '/etc/systemd/journald.conf', '/etc/systemd/journald.conf.d', '/etc/systemd/logind.conf', '/etc/systemd/logind.conf.d', '/etc/docker/daemon.json', '/etc/containerd/config.toml', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/etc/cron.d'], 'exclude': ['**/__pycache__', '**/__pycache__/*', '**/*.pyc', '**/.git', '**/.git/*', '.ssh', '.ssh/*', '.gnupg', '.gnupg/*', '.kube', '.kube/*', '.git-credentials', '.config/gh/*', '.docker/config.json', '.config/systemd/user/ubuntu-configuration-backup.*', '.config/systemd/user/timers.target.wants/ubuntu-configuration-backup.timer', 'etc/systemd/system/snap*', 'etc/apt/auth.conf', 'etc/apt/auth.conf.d/*'], 'apt_review_only': ['linux-*', 'grub*', 'shim*', 'nvidia-*', 'libnvidia-*', 'cuda*', 'nsight*', 'firmware-*', 'oem-*', 'efibootmgr', 'os-prober', 'mokutil']}
 EMBEDDED_README = 'Ubuntu Backup: self-contained interactive configuration backup and restore.\nNo personal configuration snapshot or backup data is bundled in this repository.\nGenerated snapshots and exports contain secrets and are NOT encrypted.\nOne backup action captures configuration, development code and full /home; identical files are stored once.\nEach development change records its time, content version and package/library references; reapply follows dependency order and never pins package versions.\nFull recovery stages configuration or full /home; live /home is never overwritten.\n'
 EMBEDDED_GITIGNORE = '*\n!ubuntu-backup.py\n!README.md\n!.gitignore\n'
 EMBEDDED_ROOT_EXPORTER = '#!/usr/bin/python3 -I\n"""System-wide CONFIGURATION capture; root reads, owner writes. Never a disk image."""\n# Managed by ubuntu-configuration system capture v1\nimport argparse\nimport datetime as dt\nimport hashlib\nimport io\nimport json\nimport os\nfrom pathlib import Path\nimport pwd\nimport stat\nimport subprocess\nimport sys\nimport tarfile\nimport tempfile\n\nMARKER = "# Managed by ubuntu-configuration system capture v1"\nUNIT = "ubuntu-configuration-system"\nHELPER = Path("/usr/local/libexec/ubuntu-configuration-system-capture.py")\nROOTS = ("/etc", "/usr/local/etc", "/usr/local/libexec/ubuntu-configuration-system-capture.py")\nMAX_FILE, MAX_TOTAL = 64 * 1024 * 1024, 1024 * 1024 * 1024\nDATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",\n             "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",\n             "indexeddb", "local storage", "session storage", "service worker", "blob_storage", "__pycache__"}\nHOME_PATHS = (".config", ".local/share/applications", ".local/share/fonts", ".local/share/themes", ".local/share/icons",\n              ".local/share/gnome-shell/extensions", ".fonts", ".themes", ".icons", ".ssh/config", ".kube/config",\n              ".gnupg/gpg.conf", ".gnupg/gpg-agent.conf", ".docker/config.json", ".aws/config")\nHISTORIES = {".bash_history", ".python_history", ".scala_history", ".dotty_history", ".lesshst", ".wget-hsts",\n             ".sudo_as_admin_successful", ".Xauthority", ".ICEauthority", ".DS_Store"}\n\n\ndef collect(owner_uid, accounts=None, system_roots=ROOTS):\n    """Pinned descriptors, unlimited depth, no symlinks or nested mounts followed."""\n    files, metadata, links, omissions, excluded = {}, {}, [], [], []\n    total = 0\n\n    def scan(parent_fd, name, prefix, device=None):\n        nonlocal total\n        if name.lower() in DATA_DIRS:\n            excluded.append(prefix)\n            return\n        try:\n            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)\n            if stat.S_ISLNK(info.st_mode):\n                links.append({"path": prefix, "target": os.readlink(name, dir_fd=parent_fd)})\n                return\n            if stat.S_ISDIR(info.st_mode):\n                if device is not None and info.st_dev != device:\n                    excluded.append(prefix + " (nested mount)")\n                    return\n                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)\n                try:\n                    with os.scandir(fd) as entries:\n                        names = sorted(entry.name for entry in entries)\n                    for child in names:\n                        scan(fd, child, prefix + "/" + child, info.st_dev)\n                finally:\n                    os.close(fd)\n                return\n            if not stat.S_ISREG(info.st_mode):\n                excluded.append(prefix + " (runtime/special file)")\n                return\n            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)\n            with os.fdopen(fd, "rb") as source:\n                before = os.fstat(source.fileno())\n                if not stat.S_ISREG(before.st_mode):\n                    raise RuntimeError("Configuration changed type: " + prefix)\n                data = source.read(MAX_FILE + 1)\n                after = os.fstat(source.fileno())\n            if len(data) > MAX_FILE:\n                raise RuntimeError("Configuration exceeds 64 MiB; capture aborted: " + prefix)\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise RuntimeError("Configuration changed during read; retry capture: " + prefix)\n            total += len(data)\n            if total > MAX_TOTAL:\n                raise RuntimeError("Configuration exceeds 1 GiB; review excluded application data before retrying.")\n            files[prefix] = data\n            metadata[prefix] = {"mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid, "gid": before.st_gid}\n        except FileNotFoundError:\n            return\n        except PermissionError:\n            omissions.append(prefix + " (unreadable even with current privileges)")\n\n    for root in system_roots:\n        path = Path(root)\n        try:\n            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        except FileNotFoundError:\n            continue\n        try:\n            scan(parent, path.name, "system/" + path.as_posix().lstrip("/"))\n        finally:\n            os.close(parent)\n    chosen = []\n    for account in accounts if accounts is not None else pwd.getpwall():\n        if account.pw_uid not in (0, owner_uid) and not (1000 <= account.pw_uid < 65534 and account.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin")):\n            continue\n        home = Path(account.pw_dir)\n        if not home.is_dir() or home.is_symlink():\n            omissions.append(f"Account {account.pw_uid}: home missing or symlinked")\n            continue\n        chosen.append({"uid": account.pw_uid, "name": account.pw_name, "home": str(home)})\n        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            prefix = "home" if account.pw_uid == owner_uid else f"accounts/{account.pw_uid}/home"\n            paths = set(HOME_PATHS)\n            with os.scandir(fd) as entries:\n                paths.update(entry.name for entry in entries if entry.name.startswith(".") and entry.is_file(follow_symlinks=False)\n                             and entry.name not in HISTORIES and not entry.name.endswith((".swp", ".swo", "~"))\n                             and not entry.name.startswith(".xsession-errors"))\n            for relative in sorted(paths):\n                parent = os.dup(fd)\n                try:\n                    parts = Path(relative).parts\n                    for part in parts[:-1]:\n                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)\n                        os.close(parent)\n                        parent = child\n                    scan(parent, parts[-1], prefix + "/" + relative)\n                except FileNotFoundError:\n                    pass\n                except OSError as exc:\n                    omissions.append(prefix + "/" + relative + " (ancestor unavailable: " + exc.strerror + ")")\n                finally:\n                    os.close(parent)\n        finally:\n            os.close(fd)\n    files["inventory/privileged-links.json"] = (json.dumps(links, indent=2) + "\\n").encode()\n    files["inventory/privileged-source-metadata.json"] = (json.dumps(metadata, indent=2) + "\\n").encode()\n    files["inventory/privileged-exclusions.json"] = (json.dumps(excluded, indent=2) + "\\n").encode()\n    return files, {"accounts": chosen, "roots": list(system_roots), "omissions": omissions}\n\n\ndef units(owner_uid, kit):\n    def quote(value):\n        value = str(value)\n        if "\\n" in value or "\\r" in value:\n            raise RuntimeError("Newlines are not allowed in a scheduler path.")\n        return \'"\' + value.replace("\\\\", "\\\\\\\\").replace(\'"\', \'\\\\"\').replace("%", "%%") + \'"\'\n    service = f"""{MARKER}\n[Unit]\nDescription=System-wide configuration capture and private user backup\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 -I {HELPER} --owner {owner_uid} --workspace {quote(kit)} --run-backup\nUMask=0077\nNice=10\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths={quote(kit)}\nSuccessExitStatus=3\nTimeoutStartSec=20min\n"""\n    timer = f"""{MARKER}\n[Unit]\nDescription=Daily system-wide configuration backup\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=10m\n[Install]\nWantedBy=timers.target\n"""\n    return service, timer\n\n\ndef install_scheduler(owner_uid, kit):\n    root = Path("/etc/systemd/system")\n    service, timer = units(owner_uid, kit)\n    targets = [(HELPER, globals().get("SELF_SOURCE") or Path(__file__).read_text(), 0o700),\n               (root / (UNIT + ".service"), service, 0o644), (root / (UNIT + ".timer"), timer, 0o644)]\n    HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)\n    for directory in (HELPER.parent, root):\n        info = directory.lstat()\n        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:\n            raise RuntimeError("Scheduler directories must be protected and root-owned.")\n    for path, _, _ in targets:\n        if path.is_symlink() or (path.exists() and MARKER not in path.read_text()):\n            raise RuntimeError("Refusing unmanaged scheduler file: " + str(path))\n        if path.suffix == ".service" and path.exists() and f"--owner {owner_uid} " not in path.read_text():\n            raise RuntimeError("System-wide scheduler belongs to another account.")\n    for path, text, mode in targets:\n        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".system-config-", delete=False) as output:\n            temporary = Path(output.name)\n            try:\n                output.write(text.encode())\n                os.fchmod(output.fileno(), mode)\n                os.fchown(output.fileno(), 0, 0)\n                output.flush()\n                os.fsync(output.fileno())\n                os.replace(temporary, path)\n            finally:\n                temporary.unlink(missing_ok=True)\n    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)\n    subprocess.run(["/usr/bin/systemctl", "enable", "--now", UNIT + ".timer"], check=True)\n\n\ndef main(install=False, owner_uid=None, workspace=None, run_backup=False, replace_user_timer=False):\n    os.umask(0o077)\n    if os.geteuid() != 0:\n        raise RuntimeError("Run the confirmed sudo capture action, or sudo ./capture-root-configs.sh")\n    identity = owner_uid if owner_uid is not None else os.environ.get("SUDO_UID")\n    if identity is None:\n        raise RuntimeError("A non-root sudo caller or explicit scheduler owner is required.")\n    owner = pwd.getpwuid(int(identity))\n    if owner.pw_uid == 0:\n        raise RuntimeError("A non-root backup owner is required.")\n    kit = Path(workspace).expanduser().absolute() if workspace else Path(__file__).resolve().parents[1]\n    if Path(owner.pw_dir) not in kit.parents or ".." in kit.parts or kit.is_symlink():\n        raise RuntimeError("The private workspace must be inside the backup owner\'s real home directory.")\n    files, details = collect(owner.pw_uid)\n    captured = dt.datetime.now(dt.timezone.utc).isoformat()\n    manifest = {"format": "ubuntu-configuration-v1", "kind": "system-wide-configuration-cache", "created_at": captured,\n                "captured_at": captured, **details,\n                "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),\n                           "executable": False} for name, data in sorted(files.items())]}\n    if sum(len(data) for data in files.values()) > MAX_TOTAL or len(json.dumps(manifest).encode()) > MAX_FILE:\n        raise RuntimeError("Complete configuration/metadata exceeds safety limits; old cache preserved.")\n    if install:\n        install_scheduler(owner.pw_uid, kit)\n    os.setgroups([])\n    os.setgid(owner.pw_gid)\n    os.setuid(owner.pw_uid)\n    os.environ.update(HOME=owner.pw_dir, XDG_RUNTIME_DIR=f"/run/user/{owner.pw_uid}",\n                      DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{owner.pw_uid}/bus")\n    destination = kit / "privileged-system"\n    if destination.is_symlink():\n        raise RuntimeError("Refusing a symlinked capture directory.")\n    destination.mkdir(mode=0o700, exist_ok=True)\n    destination.chmod(0o700)\n    temporary = None\n    try:\n        with tempfile.NamedTemporaryFile(dir=destination, prefix=".system-wide-", delete=False) as output:\n            temporary = Path(output.name)\n            with tarfile.open(fileobj=output, mode="w:gz") as archive:\n                payload = dict(files)\n                payload["manifest.json"] = (json.dumps(manifest, indent=2) + "\\n").encode()\n                for name, data in sorted(payload.items()):\n                    info = tarfile.TarInfo(name)\n                    info.size, info.mode = len(data), 0o600\n                    archive.addfile(info, io.BytesIO(data))\n            output.flush()\n            os.fsync(output.fileno())\n        with tarfile.open(temporary, "r:gz") as archive:\n            for record in manifest["files"]:\n                if hashlib.sha256(archive.extractfile(record["path"]).read()).hexdigest() != record["sha256"]:\n                    raise RuntimeError("Privileged cache verification failed; old cache preserved.")\n        os.replace(temporary, destination / "system-wide.tar.gz")\n        temporary = None\n        fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            os.fsync(fd)\n        finally:\n            os.close(fd)\n    finally:\n        if temporary is not None:\n            temporary.unlink(missing_ok=True)\n    print(f"Privately captured {len(files)} configuration files across {len(details[\'accounts\'])} accounts (root plus local users); omissions: {len(details[\'omissions\'])}.")\n    if replace_user_timer:\n        old = Path(owner.pw_dir) / ".config/systemd/user/ubuntu-configuration-backup.timer"\n        if old.is_file() and not old.is_symlink() and "# Managed by ubuntu-configuration v1" in old.read_text():\n            subprocess.run(["systemctl", "--user", "disable", "--now", "ubuntu-configuration-backup.timer"], check=True)\n    if run_backup or install:\n        entrypoint = Path(owner.pw_dir) / "ubuntu-backup.py"\n        if not entrypoint.is_file():\n            entrypoint = kit / "ubuntu-backup.py"  # Compatibility with older recovered kits.\n        child = subprocess.run(["/usr/bin/python3", "-I", str(entrypoint), "--workspace", str(kit), "--non-interactive", "backup"], check=False)\n        if child.returncode not in (0, 3):\n            raise RuntimeError("Configuration backup exited with status " + str(child.returncode))\n        if child.returncode == 3:\n            raise SystemExit(3)\n    else:\n        print("Now run the normal backup command without sudo. Capture includes sensitive settings; it is NOT encrypted.")\n\n\nif __name__ == "__main__":\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument("--owner", type=int)\n    parser.add_argument("--workspace", type=Path)\n    parser.add_argument("--install-timer", action="store_true")\n    parser.add_argument("--replace-user-timer", action="store_true")\n    parser.add_argument("--run-backup", action="store_true")\n    options = parser.parse_args()\n    try:\n        main(options.install_timer, options.owner, options.workspace, options.run_backup, options.replace_user_timer)\n    except (RuntimeError, OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as exc:\n        print(f"Error: {exc}", file=sys.stderr)\n        sys.exit(1)\n'
@@ -3948,8 +3972,126 @@ class Cancelled(Exception):
     pass
 
 
+class OperationCancelled(Exception):
+    """Raised when a running backup or restore is cancelled by the user."""
+
+
+_CANCEL_EVENT = threading.Event()
+_CANCEL_CHILDREN = set()
+_CANCEL_LOCK = threading.Lock()
 _GUI_PROMPT_HANDLER = None
 _GUI_PROCESS_ACTIVE = False
+
+
+def _cancel_path():
+    return KIT / ".cancel"
+
+
+def _reset_operation_cancel():
+    """Clear any stale cancellation request before a new operation starts."""
+    _CANCEL_EVENT.clear()
+    with _CANCEL_LOCK:
+        _CANCEL_CHILDREN.clear()
+    try:
+        _cancel_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _finish_operation_cancel(keep_request=False):
+    _CANCEL_EVENT.clear()
+    with _CANCEL_LOCK:
+        _CANCEL_CHILDREN.clear()
+    if keep_request:
+        return
+    try:
+        _cancel_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _signal_process_group(process, signal_number):
+    try:
+        os.killpg(os.getpgid(process.pid), signal_number)
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_process(process):
+    if process.poll() is not None:
+        return
+    if not _signal_process_group(process, signal.SIGTERM):
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if not _signal_process_group(process, signal.SIGKILL):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _request_cancel():
+    """Ask every active worker to stop; the workspace file also reaches sudo workers."""
+    _CANCEL_EVENT.set()
+    try:
+        path = _cancel_path()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _cancel_requested():
+    if _CANCEL_EVENT.is_set():
+        return True
+    try:
+        return _cancel_path().is_file()
+    except OSError:
+        return False
+
+
+def _check_cancel():
+    if _cancel_requested():
+        raise OperationCancelled("Operation cancelled.")
+
+
+def run_cancellable(command):
+    """Run a child while polling for cancellation; terminate it when requested."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    with _CANCEL_LOCK:
+        _CANCEL_CHILDREN.add(process)
+    try:
+        while True:
+            _check_cancel()
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                _check_cancel()
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        with _CANCEL_LOCK:
+            _CANCEL_CHILDREN.discard(process)
+        if process.poll() is None:
+            _terminate_process(process)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def ask(prompt, default=None):
@@ -4222,7 +4364,7 @@ def capture_root(non_interactive=False, install=False, replace_user_timer=False,
         command.append("--install-system-timer")
     if replace_user_timer:
         command.append("--replace-user-timer")
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = run_cancellable(command)
     for line in result.stdout.splitlines():
         if hide_followup_hint and line.startswith("Now run the normal backup command without sudo."):
             continue
@@ -4303,6 +4445,10 @@ def show_status():
     print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots\n"
           f"Ubuntu: {release or 'unknown'} "
           f"({'supported' if support.get('supported') else 'outside tested range'})")
+    try:
+        print("Full /home engine: " + str(native_core_path()))
+    except ConfigError as exc:
+        print("Full /home engine: missing (" + str(exc) + ")")
     external = config["external_backup"]
     directory = None
     if not external:
@@ -4419,10 +4565,10 @@ def recovery_choices(kind):
 
 def choose_archive(kind=None):
     if kind is None:
-        print("1. Configuration backup or timeline")
-        print("2. Full /home timeline")
-        print("0. Cancel")
-        choice = ask("Recovery source", "1")
+        choice = choose("Recovery source", (
+            ("1", "Configuration backup or timeline"),
+            ("2", "Full /home timeline"),
+        ), "1")
         if choice == "0":
             return None
         if choice == "1":
@@ -4432,6 +4578,15 @@ def choose_archive(kind=None):
         else:
             raise ConfigError("Choose one of the listed recovery sources.")
     found = recovery_choices(kind)
+    choices = [(str(path), f"{path.name} ({origin})") for path, origin in found]
+    choices.append(("__path__", "Enter another path…"))
+    if _GUI_PROMPT_HANDLER is not None:
+        default = str(found[0][0]) if found else "__path__"
+        choice = choose("Archive", choices, default)
+        if choice == "__path__":
+            value = ask("Archive path (blank cancels)")
+            return Path(value).expanduser() if value else None
+        return Path(choice)
     if found:
         for number, (path, origin) in enumerate(found, 1):
             print(f"{number}. {path.name} ({origin})")
@@ -4469,11 +4624,20 @@ def wizard_recover(source=None):
         ("2", "Recover full /home (stage only; live /home is never changed)"),
         ("3", "Deploy a saved snapshot", "May install packages."),
     ), "1")
+    if choice == "0":
+        return
     if choice == "3":
         wizard_deploy(source)
         return
     if choice == "1":
-        path = source or choose_archive("config")
+        if source is not None:
+            path = source
+        else:
+            found = recovery_choices("config")
+            if not found:
+                raise ConfigError("No configuration backup or timeline was found.")
+            path = found[0][0]
+            print("Using latest configuration backup: " + str(path))
         if path is None:
             return
         if is_full_home(path):
@@ -4498,11 +4662,11 @@ def wizard_recover(source=None):
 
 
 def wizard_verify():
-    print("1. Bundled or latest workspace configuration")
-    print("2. Configuration backup or timeline")
-    print("3. Full /home timeline")
-    print("0. Cancel")
-    choice = ask("Verify", "1")
+    choice = choose("Verify", (
+        ("1", "Bundled or latest workspace configuration"),
+        ("2", "Configuration backup or timeline"),
+        ("3", "Full /home timeline"),
+    ), "1")
     if choice == "0":
         return
     if choice == "1":
@@ -4773,7 +4937,7 @@ def interactive_backup(package_scan=True):
         return None
 
 
-def backup_everything(native_capture=False, refresh_package_scan=True):
+def backup_everything(refresh_package_scan=True):
     """Single flow: privileged configuration, configuration backup, full /home."""
     global _STATUS_RUN, _LAST_HOME_WARNINGS
     try:
@@ -4803,11 +4967,16 @@ def backup_everything(native_capture=False, refresh_package_scan=True):
             _status_history("cancelled", message)
             print(message)
             return None
-        print("Package scan before backup: " + package_scan_summary())
+        _check_cancel()
+        summary = package_scan_summary()
+        if summary != NO_PRIVILEGED_CACHE:
+            print("Package scan before backup: " + summary)
         capture_root_package_scan(
             non_interactive=False, force=bool(refresh_package_scan))
+        _check_cancel()
         _write_status("running", "privileged", "Capturing system-wide configuration")
         capture_root(hide_followup_hint=True, package_scan=False)
+        _check_cancel()
         _write_status("running", "configuration", "Capturing configuration")
         path = interactive_backup(package_scan=False)
         if path is None:
@@ -4816,9 +4985,10 @@ def backup_everything(native_capture=False, refresh_package_scan=True):
             _status_history("cancelled", message)
             print(message)
             return None
+        _check_cancel()
         _write_status("running", "full_home", "Capturing full /home")
         print("Starting full /home capture.")
-        home_done = wizard_home_backup(_LAST_BACKUP_RUN_ID, native_capture)
+        home_done = wizard_home_backup(_LAST_BACKUP_RUN_ID)
         warnings = _LAST_BACKUP_WARNINGS
         home_warnings = _LAST_HOME_WARNINGS
         message = ("Backup operation complete: configuration and full /home."
@@ -4834,7 +5004,7 @@ def backup_everything(native_capture=False, refresh_package_scan=True):
         _status_history("complete", message, path, at=_LAST_BACKUP_RUN_ID)
         print(message)
         return path
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, OperationCancelled):
         message = "Backup cancelled; no partial backup was published."
         _write_status("cancelled", "cancelled", message)
         _status_history("cancelled", message, at=_LAST_BACKUP_RUN_ID)
@@ -4958,10 +5128,6 @@ def main():
     }
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
-    for command in ("backup", "backup-now"):
-        commands.choices[command].add_argument(
-            "--native-capture", action="store_true",
-            help="Use the native capture engine for full /home (experimental)")
     commands.choices["prepare-drive"].add_argument(
         "--allow-internal", action="store_true",
         help="Also offer non-removable internal disks (requires an INTERNAL confirmation)")
@@ -4972,7 +5138,6 @@ def main():
     worker.add_argument("--replace-user-timer", action="store_true")
     worker = commands.add_parser("_backup-home-worker")
     worker.add_argument("--run-id")
-    worker.add_argument("--native-capture", action="store_true")
     worker = commands.add_parser("_restore-package-files-worker")
     worker.add_argument("--plan", required=True, type=Path)
     worker = commands.add_parser("_capture-package-files-worker")
@@ -5026,7 +5191,7 @@ def main():
         namespace["main"](install=args.install_system_timer, replace_user_timer=args.replace_user_timer)
         return
     if args.command == "_backup-home-worker":
-        root_home_backup(workspace, args.run_id, args.native_capture)
+        root_home_backup(workspace, args.run_id)
         return
     if args.command == "_restore-package-files-worker":
         restore_package_files_worker(args.plan, workspace.absolute())
@@ -5036,6 +5201,9 @@ def main():
         return
     if os.geteuid() == 0:
         raise ConfigError("Run normally, not with sudo. The root-capture action invokes sudo separately.")
+    if args.command not in ("_backup-home-worker", "_capture-package-files-worker",
+                            "_capture-root-worker", "_restore-package-files-worker"):
+        _reset_operation_cancel()
     interactive = not args.non_interactive and sys.stdin.isatty()
     command = args.command or "menu"
     if command == "menu":
@@ -5057,11 +5225,11 @@ def main():
     allowed_cpus = restrict_backup_cpus()
     if command != "tray":
         _setup_logging()
-        print("Backup processes pinned to CPUs: " + ",".join(map(str, sorted(allowed_cpus))), file=sys.stderr)
+        print("Backup processes use CPUs: " + ",".join(map(str, sorted(allowed_cpus))), file=sys.stderr)
     if command == "menu":
         menu()
     elif command == "backup":
-        backup_everything(native_capture=args.native_capture) if interactive else backup()
+        backup_everything() if interactive else backup()
     elif command == "recover":
         if not interactive:
             raise ConfigError("Recovery needs an interactive terminal.")
@@ -5089,7 +5257,7 @@ def main():
             raise ConfigError("The manual backup action needs an interactive terminal.")
         signal.signal(signal.SIGTERM, signal.default_int_handler)
         signal.signal(signal.SIGHUP, signal.default_int_handler)
-        backup_everything(native_capture=args.native_capture)
+        backup_everything()
     elif command == "choose-drive":
         if not interactive:
             raise ConfigError("Drive selection needs an interactive terminal.")
@@ -5421,6 +5589,7 @@ def verify_selective_journal(directory, journal):
 
 
 def apply_selective_restore(plan, selected):
+    _check_cancel()
     source = Path(plan["source"])
     if hardware_comparison(source) != plan["hardware_comparison"]:
         raise ConfigError("Destination hardware/OS changed after preview; review a new adaptive restore plan.")
@@ -5444,6 +5613,7 @@ def apply_selective_restore(plan, selected):
     try:
         total = 0
         for entry in entries:
+            _check_cancel()
             state, before = selective_read(entry["path"])
             if state != entry["before"]:
                 raise ConfigError("Destination changed while preparing rollback copies.")
@@ -5626,9 +5796,6 @@ def wizard_selective_restore(source=None):
         print("Restore cancelled; no live changes.")
         return
     apply_selective_restore(plan, selected)
-import threading
-
-
 def hardware_comparison(source):
     changes = []
     path = Path(source) / "inventory/hardware.json"
@@ -5670,98 +5837,6 @@ def home_identity():
             "mounts": sorted(mounts, key=lambda entry: entry["mount"])}
 
 
-def tar_member_name(name):
-    pure = PurePosixPath(name)
-    if name in ("", "."):
-        return None
-    if pure.is_absolute() or ".." in pure.parts:
-        raise ConfigError(f"Unsafe tar member path: {name}")
-    parts = [part for part in pure.parts if part not in ("", ".")]
-    if not parts:
-        return None
-    return "/".join(parts)
-
-
-def tar_member_metadata(member):
-    headers = member.pax_headers or {}
-    return {key: value for key, value in headers.items()
-            if key.startswith(("SCHILY.", "LIBARCHIVE."))}
-
-
-def stream_hash(stream, count, hasher):
-    remaining = count
-    while remaining:
-        block = stream.read(min(1024 * 1024, remaining))
-        if not block:
-            raise ConfigError("Short read in full /home tar stream.")
-        hasher.update(block)
-        remaining -= len(block)
-
-
-def stream_object(stage_objects, stage_incoming, external_objects, stream, size, sparse, created):
-    """Hash one logical file, stage it locally, and return its external object path."""
-    with tempfile.NamedTemporaryFile(dir=stage_incoming, prefix=".object-", delete=False) as output:
-        temporary = Path(output.name)
-        hasher = hashlib.sha256()
-        try:
-            if sparse:
-                current = 0
-                for offset, length in sparse:
-                    offset, length = int(offset), int(length)
-                    if length < 0:
-                        raise ConfigError("Invalid sparse file layout in tar stream.")
-                    if length == 0:
-                        # GNU tar appends (0, 0) and other zero-length sentinels.
-                        continue
-                    if offset < current:
-                        raise ConfigError("Invalid sparse file layout in tar stream.")
-                    if offset > current:
-                        stream_hash(stream, offset - current, hasher)
-                    output.seek(offset)
-                    remaining = length
-                    while remaining:
-                        block = stream.read(min(1024 * 1024, remaining))
-                        if not block:
-                            raise ConfigError("Short sparse read in full /home tar stream.")
-                        output.write(block)
-                        hasher.update(block)
-                        remaining -= len(block)
-                    current = offset + length
-                if current < size:
-                    stream_hash(stream, size - current, hasher)
-                output.truncate(size)
-            else:
-                remaining = size
-                while remaining:
-                    block = stream.read(min(1024 * 1024, remaining))
-                    if not block:
-                        raise ConfigError("Short read in full /home tar stream.")
-                    output.write(block)
-                    hasher.update(block)
-                    remaining -= len(block)
-            output.flush()
-            # The local staging copy is disposable; it is flushed once after the bulk copy.
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-    sha256 = hasher.hexdigest()
-    external = object_path(external_objects, sha256)
-    try:
-        if external.is_symlink():
-            raise ConfigError("Refusing symlinked baseline object.")
-        if external.exists():
-            if not external.is_file() or external.stat().st_size != size:
-                raise ConfigError("Existing baseline object has the wrong size or type.")
-            return external, sha256
-        staged = []
-        publish_object(stage_objects, stage_incoming, temporary, sha256, size, staged, sync=False)
-        if staged:
-            created.append(external)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return external, sha256
-
-
 def remove_staging():
     """Remove the disposable staging tree, including root-owned remnants."""
     stage = KIT / "staging"
@@ -5771,79 +5846,6 @@ def remove_staging():
         shutil.rmtree(stage)
     elif stage.exists():
         stage.unlink()
-
-
-def prepare_staging(external_root):
-    """Create the disposable local staging area used before a bulk copy to the drive."""
-    stage = KIT / "staging"
-    if stage.is_symlink() or (stage.exists() and not stage.is_dir()):
-        raise ConfigError("Backup staging path is not a real directory: " + str(stage))
-    if stage.exists():
-        shutil.rmtree(stage)
-    stage.mkdir(mode=0o700)
-    try:
-        if stage.stat().st_dev == os.stat(external_root).st_dev:
-            raise ConfigError("Full /home staging must be on a different filesystem from the backup drive.")
-        free = shutil.disk_usage(stage).free
-        if free < STAGING_RESERVE_BYTES:
-            raise ConfigError(f"Only {free / 2**30:.1f} GiB free for staging; "
-                              f"at least {STAGING_RESERVE_BYTES / 2**30:.1f} GiB is required.")
-    except BaseException:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
-    return stage
-
-
-def copy_staged_objects(stage_objects, external_objects):
-    """Copy only new content-addressed objects to the drive, then flush once."""
-    shards = [entry for entry in stage_objects.iterdir() if entry.is_dir()]
-    if not shards:
-        return 0
-    copied = 0
-    total = 0
-    for shard in shards:
-        target_shard = ensure_private_directory(external_objects, shard.name)
-        for source in shard.iterdir():
-            if source.is_symlink() or not source.is_file():
-                raise ConfigError("Unexpected entry in staging: " + str(source))
-            target = target_shard / source.name
-            if target.is_symlink():
-                raise ConfigError("Refusing symlinked baseline object: " + str(target))
-            size = source.stat().st_size
-            if target.exists():
-                if not target.is_file() or target.stat().st_size != size:
-                    raise ConfigError("Existing baseline object has the wrong size or type.")
-                continue
-            temporary = target_shard / (".copy-" + uuid.uuid4().hex)
-            try:
-                copy_sparse_file(source, temporary, size)
-                os.chmod(temporary, 0o400)
-                os.replace(temporary, target)
-            finally:
-                temporary.unlink(missing_ok=True)
-            copied += 1
-            total += size
-            if copied % 4096 == 0:
-                print(f"Bulk copy: {copied} objects, {total / 2**30:.1f} GiB", file=sys.stderr, flush=True)
-    if copied:
-        os.sync()
-        print(f"Bulk copy complete: {copied} objects, {total / 2**30:.1f} GiB", file=sys.stderr, flush=True)
-    return copied
-
-
-def make_timeline_parent(tree, name):
-    parent = PurePosixPath(name).parent
-    if str(parent) == ".":
-        return tree
-    return ensure_private_directory(tree, *parent.parts)
-
-
-def clean_created_objects(created):
-    for path in created:
-        try:
-            path.unlink()
-        except OSError:
-            pass
 
 
 _STATUS_RUN = False
@@ -6153,42 +6155,6 @@ def _ensure_tray():
         pass
 
 
-class ProgressBar:
-    def __init__(self, label, width=28):
-        self.label = label
-        self.width = width
-        self.last = 0.0
-
-    def update(self, count, size, force=False):
-        import time
-        now = time.monotonic()
-        if not force and now - self.last < 0.2:
-            return
-        self.last = now
-        phase = int(now * 4) % (self.width * 2)
-        filled = phase if phase <= self.width else self.width * 2 - phase
-        bar = '#' * filled + '-' * (self.width - filled)
-        print(f"\r{self.label} [{bar}] {count} entries, {size / 1048576:.1f} MiB", end='', flush=True)
-
-    def finish(self, count, size):
-        print(f"\r{self.label} [{'#' * self.width}] {count} entries, {size / 1048576:.1f} MiB", flush=True)
-
-    def abort(self):
-        print(flush=True)
-
-
-class TailReader:
-    """Track tar's trailing zero padding; the root tar exit status is authoritative."""
-    def __init__(self, stream):
-        self.stream = stream
-        self.tail = b""
-
-    def read(self, size=-1):
-        data = self.stream.read(size)
-        self.tail = (self.tail + data)[-1024:]
-        return data
-
-
 def read_home_entries(timeline):
     with (timeline / "entries.ndjson").open() as stream:
         for line in stream:
@@ -6217,6 +6183,7 @@ def verify_home_timeline(timeline, hash_objects=True):
     count = 0
     logical = 0
     for entry in read_home_entries(timeline):
+        _check_cancel()
         count += 1
         name = entry.get("path")
         if not isinstance(name, str) or not safe_name(name):
@@ -6281,151 +6248,8 @@ def verify_home_timeline(timeline, hash_objects=True):
     return manifest
 
 
-def capture_home_archive(stream, root, identity, exclusions, snapshot=None):
-    """Consume a root tar stream as the normal user and publish a linked timeline."""
-    objects, incoming, timelines = baseline_directories(root, "home")
-    stage = prepare_staging(root)
-    stage_objects = ensure_private_directory(stage, "objects")
-    stage_incoming = ensure_private_directory(stage, "incoming")
-    print("Staging full /home on " + str(stage), file=sys.stderr)
-    temporary = Path(tempfile.mkdtemp(prefix=".home-timeline-", dir=timelines))
-    tree = ensure_private_directory(temporary, "tree")
-    entries_path = temporary / "entries.ndjson"
-    created = []
-    written = set()
-    warnings = []
-    count = 0
-    logical = 0
-    progress = ProgressBar("Full /home")
-    tracker = TailReader(stream)
-    try:
-        with entries_path.open("w") as entries, tarfile.open(fileobj=tracker, mode="r|") as archive:
-            for member in archive:
-                if count % 128 == 0 and shutil.disk_usage(stage).free < STAGING_RESERVE_BYTES:
-                    raise ConfigError("Local staging space is nearly exhausted; no timeline published.")
-                name = tar_member_name(member.name)
-                if name is None:
-                    continue
-                if name in written:
-                    raise ConfigError(f"Duplicate full /home path: {name}")
-                parent = make_timeline_parent(tree, name)
-                path = parent / PurePosixPath(name).name
-                if member.isdir():
-                    if path.is_symlink() or (path.exists() and not path.is_dir()):
-                        raise ConfigError(f"Full /home directory path is unsafe: {name}")
-                    if not path.exists():
-                        path.mkdir(mode=0o700)
-                elif path.is_symlink() or path.exists():
-                    raise ConfigError(f"Full /home path already exists in timeline: {name}")
-                base = {"path": name, "mode": member.mode, "uid": member.uid, "gid": member.gid,
-                        "mtime_ns": int(float(getattr(member, "mtime", 0)) * 1_000_000_000),
-                        "pax": tar_member_metadata(member)}
-                if member.isdir():
-                    entry = dict(base, type="dir")
-                elif member.issym():
-                    os.symlink(member.linkname, path)
-                    entry = dict(base, type="symlink", target=member.linkname)
-                elif member.islnk():
-                    target = tar_member_name(member.linkname)
-                    if target is None or target not in written:
-                        raise ConfigError(f"Full /home hardlink target is missing: {name}")
-                    symlink_relative(path, safe_join(tree, target, allow_final_symlink=True))
-                    entry = dict(base, type="hardlink", hardlink_to=target)
-                elif member.isfile():
-                    source = archive.extractfile(member)
-                    if source is None:
-                        raise ConfigError(f"Cannot read full /home file: {name}")
-                    sparse = [list(segment) for segment in member.sparse] if getattr(member, "sparse", None) else None
-                    destination, sha256 = stream_object(stage_objects, stage_incoming, objects,
-                                                        source, member.size, sparse, created)
-                    symlink_relative(path, destination)
-                    logical += member.size
-                    entry = dict(base, type="file", size=member.size, sha256=sha256, sparse=sparse)
-                else:
-                    entry = dict(base, type="special")
-                    warnings.append({"path": name, "type": str(member.type)})
-                entries.write(json.dumps(entry, separators=(",", ":")) + "\n")
-                written.add(name)
-                count += 1
-                progress.update(count, logical)
-            # Tar normally supplies every parent directory. Record any that it omitted.
-            for directory, dirs, _ in os.walk(tree, topdown=True, followlinks=False):
-                for child in sorted(dirs):
-                    path = Path(directory) / child
-                    relative = path.relative_to(tree).as_posix()
-                    if path.is_symlink():
-                        continue
-                    if relative not in written:
-                        entry = {"path": relative, "type": "dir", "mode": 0o700,
-                                 "uid": os.getuid(), "gid": os.getgid(), "mtime_ns": 0,
-                                 "pax": {}, "synthetic": True}
-                        entries.write(json.dumps(entry, separators=(",", ":")) + "\n")
-                        written.add(relative)
-                        count += 1
-        progress.finish(count, logical)
-        # A cut inside tar's trailing zero padding loses no file data; the root
-        # tar process exit status is the authoritative completeness check.
-        if len(tracker.tail) < 512 or tracker.tail[-512:] != b"\0" * 512:
-            raise ConfigError("Full /home tar stream ended before its end marker; no timeline published.")
-        manifest = {"format": FORMAT, "kind": "full-home-linked", "storage": LINKED_STORAGE,
-                    "created_at": timestamp(), "source": "/home", "identity": identity,
-                    "exclusions": exclusions, "entry_count": count, "logical_bytes": logical,
-                    "warnings": warnings[:200], "warning_count": len(warnings),
-                    "entries_sha256": digest(entries_path),
-                    "restore_policy": "Stage privately. Never overwrite live /home or replay UID/hardware bindings blindly."}
-        if snapshot:
-            manifest["snapshot"] = snapshot
-        write_json(temporary / "manifest.json", manifest)
-        if created:
-            print(f"Copying {len(created)} new objects from local staging to the backup drive...",
-                  file=sys.stderr)
-        copy_staged_objects(stage_objects, objects)
-        print("Verifying full /home baseline checksums...", file=sys.stderr)
-        verify_home_timeline(temporary)
-        return temporary, manifest, created, timelines
-    except BaseException:
-        progress.abort()
-        if temporary.exists():
-            shutil.rmtree(temporary)
-        clean_created_objects(created)
-        raise
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
-
-
-def copy_sparse_file(source, destination, size):
-    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
-    output_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        offset = 0
-        while offset < size:
-            try:
-                data = os.lseek(source_fd, offset, os.SEEK_DATA)
-            except OSError as exc:
-                if exc.errno == errno.ENXIO:
-                    break
-                raise
-            hole = min(os.lseek(source_fd, data, os.SEEK_HOLE), size)
-            while data < hole:
-                block = os.pread(source_fd, min(1024 * 1024, hole - data), data)
-                if not block:
-                    raise ConfigError("Short read while restoring a sparse file.")
-                written = 0
-                while written < len(block):
-                    progress = os.pwrite(output_fd, block[written:], data + written)
-                    if not progress:
-                        raise ConfigError("Short write while restoring a sparse file.")
-                    written += progress
-                data += len(block)
-            offset = hole
-        os.ftruncate(output_fd, size)
-    finally:
-        os.close(source_fd)
-        os.close(output_fd)
-
-
 def restore_home(path=None):
-    """Stage a verified full-/home linked snapshot; never write live /home."""
+    """Restore a verified full-/home snapshot into a private staging folder with ubackup-core."""
     if path is None:
         config = settings()
         if not config["external_backup"]:
@@ -6439,91 +6263,51 @@ def restore_home(path=None):
         print("Latest full /home timeline: " + str(path))
     else:
         path = Path(path).expanduser()
+    _check_cancel()
     manifest = verify_home_timeline(path)
+    _check_cancel()
+    core = native_core_path()
     mkdir(KIT / "restored")
     destination = Path(tempfile.mkdtemp(prefix="home-full-", dir=KIT / "restored"))
     objects = path.parent.parent.parent / "baseline/home/objects"
-    dir_modes = {}
-    hardlinks = []
-    hardlink_targets = {}
-    specials = []
+    report_path = destination.parent / (destination.name + "-restore.json")
+    command = [str(core), "restore",
+               "--entries", str(path / "entries.ndjson"),
+               "--objects", str(objects),
+               "--destination", str(destination),
+               "--report", str(report_path),
+               "--ignore-xattrs"]
     try:
-        for entry in read_home_entries(path):
-            name = entry["path"]
-            kind = entry["type"]
-            target = safe_join(destination, name, allow_final_symlink=kind != "dir")
-            if kind == "dir":
-                if target.exists() and not target.is_dir():
-                    raise ConfigError(f"Restore path changed type: {name}")
-                target.mkdir(mode=0o700, parents=True, exist_ok=True)
-                dir_modes[name] = entry.get("mode") or 0o700
-            elif kind == "symlink":
-                make_timeline_parent(destination, name)
-                if target.is_symlink() or target.exists():
-                    raise ConfigError(f"Restore path already exists: {name}")
-                os.symlink(entry["target"], target)
-            elif kind == "file":
-                make_timeline_parent(destination, name)
-                if target.is_symlink() or target.exists():
-                    raise ConfigError(f"Restore path already exists: {name}")
-                link = safe_join(path / "tree", name, allow_final_symlink=True)
-                object_file = (link.parent / os.readlink(link)).resolve()
-                if object_file != object_path(objects, entry["sha256"]).resolve():
-                    raise ConfigError(f"Restore link changed: {name}")
-                temporary = target.parent / (".restore-" + uuid.uuid4().hex)
-                try:
-                    if entry.get("sparse"):
-                        copy_sparse_file(object_file, temporary, entry["size"])
-                    else:
-                        shutil.copyfile(object_file, temporary)
-                    if digest(temporary) != entry["sha256"]:
-                        raise ConfigError(f"Restored file checksum mismatch: {name}")
-                    os.chmod(temporary, (entry.get("mode") or 0o600) & 0o777)
-                    os.replace(temporary, target)
-                finally:
-                    temporary.unlink(missing_ok=True)
-                if entry.get("mtime_ns"):
-                    os.utime(target, ns=(entry["mtime_ns"], entry["mtime_ns"]))
-            elif kind == "hardlink":
-                hardlinks.append((name, entry["hardlink_to"]))
-                hardlink_targets[name] = entry["hardlink_to"]
-            elif kind == "special":
-                specials.append(name)
-        for name, _ in hardlinks:
-            target = safe_join(destination, name, allow_final_symlink=True)
-            make_timeline_parent(destination, name)
-            if target.is_symlink() or target.exists():
-                raise ConfigError(f"Restore hardlink path already exists: {name}")
-        for name, link in hardlinks:
-            final = link
-            seen = set()
-            while final not in seen:
-                seen.add(final)
-                if final not in hardlink_targets:
-                    break
-                final = hardlink_targets[final]
-            source = safe_join(destination, final, allow_final_symlink=True)
-            if source.is_symlink() or not source.is_file():
-                raise ConfigError(f"Restore hardlink target is missing: {link}")
-            os.link(source, safe_join(destination, name, allow_final_symlink=True))
-        for name in sorted(dir_modes, key=lambda item: item.count("/"), reverse=True):
-            path_to_set = safe_join(destination, name)
-            os.chmod(path_to_set, dir_modes[name] & 0o777)
+        _check_cancel()
+        result = run_cancellable(command)
+        for line in result.stdout.splitlines():
+            print(line)
+        for line in result.stderr.splitlines():
+            print(line, file=sys.stderr)
+        if result.returncode != 0:
+            raise ConfigError("Native full /home restore failed with status " + str(result.returncode))
+        report = json.loads(report_path.read_text())
+        if not report.get("complete"):
+            raise ConfigError("Native full /home restore did not report completion.")
         notes = destination.parent / (destination.name + "-restore-notes.txt")
         notes.write_text(
-            "Full /home files were copied into this private staging folder.\n"
-            "Ownership, ACLs, extended attributes and original UID/GID were NOT applied.\n"
+            "Full /home files were restored by ubackup-core into this private staging folder.\n"
+            "Ownership, ACLs and extended attributes were NOT applied.\n"
+            "Permission bits and modification times were restored.\n"
             f"Source timeline: {path}\n"
-            f"Metadata: {path / 'entries.ndjson'}\n"
-            f"Special/runtime entries not recreated: {len(specials)}\n"
+            f"Restore report: {report_path}\n"
+            f"Entries restored: {report.get('entries', 0)}\n"
+            f"Special/runtime entries not recreated: {report.get('special_skipped', 0)}\n"
             "Review owners and hardware-bound settings before copying anything toward live /home.\n")
         print(f"Staged full /home snapshot into: {destination}")
+        print(f"Restore report: {report_path}")
         print(f"Restore notes: {notes}")
-        print("Live /home was not changed; ownership/ACLs require manual review.")
+        print("Live /home was not changed; ownership requires manual review.")
         return destination
     except BaseException:
         if destination.exists():
             shutil.rmtree(destination)
+        report_path.unlink(missing_ok=True)
         raise
 
 
@@ -6553,22 +6337,45 @@ def run_logged(command, log_path):
     with log_path.open("w") as log:
         log_path.chmod(0o600)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, bufsize=1)
+                                   text=True, bufsize=1, start_new_session=True)
+        with _CANCEL_LOCK:
+            _CANCEL_CHILDREN.add(process)
+        lines = queue.Queue()
+
+        def reader():
+            try:
+                for line in process.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        status = None
         try:
-            for line in process.stdout:
+            while True:
+                _check_cancel()
+                try:
+                    line = lines.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
                 sys.stderr.write(line)
                 sys.stderr.flush()
                 log.write(line)
                 log.flush()
             status = process.wait()
-        except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            raise
-    if status:
+            _check_cancel()
+        finally:
+            with _CANCEL_LOCK:
+                _CANCEL_CHILDREN.discard(process)
+            if process.poll() is None:
+                _terminate_process(process)
+            thread.join(timeout=2)
+            if process.stdout is not None:
+                process.stdout.close()
+    if status is not None and status:
         detail = log_path.read_text(errors="replace")[-2000:].strip()
         message = f"Full /home worker exited with status {status}. Log: {log_path}"
         if detail:
@@ -6576,24 +6383,9 @@ def run_logged(command, log_path):
         raise ConfigError(message)
 
 
-def run_home_worker_with_fallback(command, log_path, native_capture=False):
-    """Run the tar worker; on volatile-file failure retry with native capture."""
-    try:
-        run_logged(command, log_path)
-        return native_capture
-    except ConfigError as first_error:
-        if native_capture:
-            raise
-        try:
-            native_core_path()
-        except ConfigError:
-            raise first_error
-        print("Strict tar capture failed; retrying with the native capture engine. "
-              "This tolerates volatile app locks and changing files.", file=sys.stderr)
-        native_command = list(command) + ["--native-capture"]
-        run_logged(native_command, Path(log_path).with_name(
-            Path(log_path).stem + "-native.log"))
-        return True
+def run_home_worker(command, log_path):
+    """Run the mandatory native full-/home worker and report its failures."""
+    run_logged(command, log_path)
 
 
 def native_core_path():
@@ -6610,7 +6402,7 @@ def native_core_path():
         if path.is_file() and os.access(path, os.X_OK):
             return path
     raise ConfigError(
-        "Native capture core not found. Build native/ubackup-core or set UBUNTU_BACKUP_NATIVE.")
+        "The native backup core is required. Build it with 'make -C native' or set UBUNTU_BACKUP_NATIVE.")
 
 
 def native_home_command(source_home, directory, run_id, owner_uid, owner_gid,
@@ -6633,7 +6425,7 @@ def native_home_command(source_home, directory, run_id, owner_uid, owner_gid,
     return command
 
 
-def wizard_home_backup(run_id=None, native_capture=False):
+def wizard_home_backup(run_id=None):
     global _LAST_HOME_WARNINGS
     config = settings()
     if not config["external_backup"]:
@@ -6664,20 +6456,18 @@ def wizard_home_backup(run_id=None, native_capture=False):
         write_json(baseline, identity)
     print("Starting the sudo, read-only full /home capture.")
     run_id = run_id_value(run_id)
+    _check_cancel()
     command = ["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH),
                "--workspace", str(KIT), "_backup-home-worker", "--run-id", run_id]
-    if native_capture:
-        command.append("--native-capture")
-    native_capture = run_home_worker_with_fallback(
-        command, KIT / "logs" / ("home-worker-" + run_id + ".log"), native_capture)
-    if native_capture:
-        timeline = directory / "timeline" / "home" / ("home-full-" + run_id)
-        manifest = verify_path(timeline)
-        _LAST_HOME_WARNINGS = int(manifest.get("warning_count") or 0)
-        if _LAST_HOME_WARNINGS:
-            print(f"Native full /home timeline has {_LAST_HOME_WARNINGS} omission(s); "
-                  "review the capture report.", file=sys.stderr)
-        print(f"Full /home timeline verified: {timeline}")
+    run_home_worker(command, KIT / "logs" / ("home-worker-" + run_id + ".log"))
+    _check_cancel()
+    timeline = directory / "timeline" / "home" / ("home-full-" + run_id)
+    manifest = verify_home_timeline(timeline)
+    _LAST_HOME_WARNINGS = int(manifest.get("warning_count") or 0)
+    if _LAST_HOME_WARNINGS:
+        print(f"Native full /home timeline has {_LAST_HOME_WARNINGS} omission(s); "
+              "review the capture report.", file=sys.stderr)
+    print(f"Full /home timeline verified: {timeline}")
     return True
 
 
@@ -6995,7 +6785,7 @@ def home_backup_lock():
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def root_home_backup(workspace, run_id=None, native_capture=False):
+def root_home_backup(workspace, run_id=None):
     global KIT, HOME
     if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
         raise ConfigError("Use the confirmed normal-user full /home backup action.")
@@ -7007,10 +6797,10 @@ def root_home_backup(workspace, run_id=None, native_capture=False):
     if HOME not in KIT.parents or ".." in KIT.parts:
         raise ConfigError("Workspace must be inside the sudo caller's home.")
     with home_backup_lock():
-        return _root_home_backup_locked(workspace, run_id, native_capture)
+        return _root_home_backup_locked(workspace, run_id)
 
 
-def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
+def _root_home_backup_locked(workspace, run_id=None):
     global KIT, HOME
     if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
         raise ConfigError("Use the confirmed normal-user full /home backup action.")
@@ -7027,7 +6817,7 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
         raise ConfigError("Cannot clear stale full /home staging: " + str(exc)) from None
     config = settings()
     allowed_cpus = restrict_backup_cpus()
-    print("Backup worker pinned to CPUs: " + ",".join(map(str, sorted(allowed_cpus))), file=sys.stderr)
+    print("Backup worker uses CPUs: " + ",".join(map(str, sorted(allowed_cpus))), file=sys.stderr)
     if not config["external_backup"]:
         raise ConfigError("External backup drive has not been selected.")
     expected = json.loads((KIT / "config/home-backup-approval.json").read_text())
@@ -7059,92 +6849,30 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
     relative = KIT.relative_to("/home").as_posix()
     excluded = [relative + "/" + name for name in (
         "backups", ".previous-snapshot", "privileged-system", "privileged-package-scan",
-        "restored", "rollback", "profiles", "snapshot", "staging", ".home-snapshot")]
-    if native_capture:
-        try:
-            if marker_record(Path(directory)) is None:
-                raise ConfigError("Backup drive marker is missing or invalid.")
-            native_excluded = list(excluded)
-            for name in ("native-home-entries.ndjson", "native-home-report.json"):
-                native_excluded.append((KIT / name).relative_to("/home").as_posix())
-            command = native_home_command(
-                source_home, Path(directory), run_id, owner.pw_uid, owner.pw_gid,
-                actual, native_excluded)
-            result = subprocess.run(command, capture_output=True, text=True)
-            for line in result.stdout.splitlines():
-                print(line)
-            for line in result.stderr.splitlines():
-                print(line, file=sys.stderr)
-            if result.returncode not in (0, 3):
-                raise ConfigError("Native full /home capture failed with status " + str(result.returncode))
-            if result.returncode == 3:
-                print("Native full /home capture completed with omissions.", file=sys.stderr)
-            report = json.loads((KIT / "native-home-report.json").read_text())
-            print("Native full /home timeline: " + str(report.get("timeline")))
-            return
-        finally:
-            try:
-                remove_staging()
-            except OSError as exc:
-                print("Warning: could not remove full /home staging: " + str(exc), file=sys.stderr)
-            if snapshot is not None:
-                snapshot.close()
-            os.close(fd)
-    command = ["/usr/bin/tar", "--create", "--file=-", "--acls", "--xattrs", "--numeric-owner",
-               "--sparse", "--one-file-system", "--directory=" + str(source_home)]
-    for name in excluded:
-        command.append("--exclude=./" + name)
-    command.append(".")
+        "restored", "rollback", "profiles", "snapshot", "staging", ".home-snapshot", ".cancel")]
     try:
-        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except BaseException:
-        if snapshot is not None:
-            snapshot.close()
-        os.close(fd)
-        raise
-    os.setgroups([])
-    os.setgid(owner.pw_gid)
-    os.setuid(owner.pw_uid)
-    pinned = Path("/proc/self/fd") / str(fd)
-    errors = bytearray()
-    def drain():
-        for block in iter(lambda: child.stderr.read(8192), b""):
-            errors.extend(block)
-            del errors[:-65536]
-    thread = threading.Thread(target=drain, daemon=True)
-    thread.start()
-    temporary = None
-    created = []
-    try:
-        if marker_record(pinned) is None:
-            raise ConfigError("Pinned backup drive marker is missing or invalid.")
-        temporary, manifest, created, timelines = capture_home_archive(
-            child.stdout, pinned, actual, excluded,
-            snapshot=snapshot.metadata if snapshot is not None else None)
-        status = child.wait()
-        thread.join()
-        if status or errors:
-            raise ConfigError("Strict /home capture failed; old snapshots kept. Stop changing apps and retry. " + errors.decode(errors="replace")[-2000:])
-        result = timelines / ("home-full-" + run_id_value(run_id))
-        if result.exists() or result.is_symlink():
-            raise ConfigError("Full /home timeline already exists; refusing overwrite.")
-        temporary.rename(result)
-        temporary = None
-        fsync_directory(timelines)
-        print(f"Full /home verified (checksums): {manifest['entry_count']} entries, "
-              f"{len(created)} new objects.")
+        if marker_record(Path(directory)) is None:
+            raise ConfigError("Backup drive marker is missing or invalid.")
+        native_excluded = list(excluded)
+        for name in ("native-home-entries.ndjson", "native-home-report.json"):
+            native_excluded.append((KIT / name).relative_to("/home").as_posix())
+        command = native_home_command(
+            source_home, Path(directory), run_id, owner.pw_uid, owner.pw_gid,
+            actual, native_excluded)
+        _check_cancel()
+        result = run_cancellable(command)
+        for line in result.stdout.splitlines():
+            print(line)
+        for line in result.stderr.splitlines():
+            print(line, file=sys.stderr)
+        if result.returncode not in (0, 3):
+            raise ConfigError("Native full /home capture failed with status " + str(result.returncode))
+        if result.returncode == 3:
+            print("Native full /home capture completed with omissions.", file=sys.stderr)
+        report = json.loads((KIT / "native-home-report.json").read_text())
+        print("Native full /home timeline: " + str(report.get("timeline")))
+        return
     finally:
-        if child.poll() is None:
-            # The writer has dropped root and must not try to signal a root tar process.
-            # Closing its output pipe makes tar stop on SIGPIPE, including on disk-full errors.
-            child.stdout.close()
-            try:
-                child.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                print(f"Root reader {child.pid} has not exited; inspect it with sudo. Incomplete snapshot was not published.", file=sys.stderr)
-        if temporary is not None and temporary.exists():
-            shutil.rmtree(temporary)
-            clean_created_objects(created)
         try:
             remove_staging()
         except OSError as exc:
@@ -7153,7 +6881,8 @@ def _root_home_backup_locked(workspace, run_id=None, native_capture=False):
             snapshot.close()
         os.close(fd)
 
-def run_process_window(title, target):
+
+def run_process_window(title, target, cancellable=True):
     """Run a Python action in a GTK log window with GUI prompts and sudo askpass."""
     global _GUI_PROMPT_HANDLER, _GUI_PROCESS_ACTIVE
     import gi
@@ -7162,6 +6891,7 @@ def run_process_window(title, target):
     import queue
     if _GUI_PROCESS_ACTIVE:
         raise ConfigError("A backup or restore process window is already running.")
+    _reset_operation_cancel()
     _GUI_PROCESS_ACTIVE = True
 
     window = Gtk.Window(title="Ubuntu Backup — " + title)
@@ -7176,14 +6906,41 @@ def run_process_window(title, target):
     scroll = Gtk.ScrolledWindow()
     scroll.add(view)
     outer.pack_start(scroll, True, True, 0)
+    buffer = view.get_buffer()
+    autoscroll_mark = buffer.create_mark("autoscroll-end", buffer.get_end_iter(), False)
+    scroll_state = {"follow": True, "last": 0.0}
+
+    def on_scroll_changed(adjustment):
+        value = adjustment.get_value()
+        maximum = adjustment.get_upper() - adjustment.get_page_size()
+        if value >= maximum - 8:
+            scroll_state["follow"] = True
+        elif value < scroll_state["last"] - 1:
+            scroll_state["follow"] = False
+        scroll_state["last"] = value
+
+    scroll.get_vadjustment().connect("value-changed", on_scroll_changed)
     controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    output = queue.Queue()
+    state = {"active": True, "ok": False, "cancelled": False}
+
+    def cancel_clicked(_button):
+        cancel_button.set_sensitive(False)
+        cancel_button.set_label("Cancelling…")
+        _request_cancel()
+        output.put("\nCancellation requested; stopping safely…\n")
+
+    cancel_button = Gtk.Button(label="Cancel")
+    if cancellable:
+        cancel_button.connect("clicked", cancel_clicked)
+    else:
+        cancel_button.set_visible(False)
+    controls.pack_end(cancel_button, False, False, 0)
     close_button = Gtk.Button(label="Running…")
     close_button.set_sensitive(False)
     close_button.connect("clicked", lambda _button: window.destroy())
     controls.pack_end(close_button, False, False, 0)
     outer.pack_start(controls, False, False, 0)
-    output = queue.Queue()
-    state = {"active": True, "ok": False}
 
     class Writer:
         def write(self, text):
@@ -7195,9 +6952,10 @@ def run_process_window(title, target):
             pass
 
     def append(text):
-        buffer = view.get_buffer()
         buffer.insert(buffer.get_end_iter(), text)
-        view.scroll_to_mark(buffer.get_insert(), 0.0, True, 0.0, 1.0)
+        buffer.move_mark(autoscroll_mark, buffer.get_end_iter())
+        if scroll_state["follow"]:
+            view.scroll_to_mark(autoscroll_mark, 0.0, True, 0.0, 1.0)
 
     def drain():
         if not window.get_visible():
@@ -7209,16 +6967,22 @@ def run_process_window(title, target):
                 break
         return True
 
-    def finish(ok):
+    def finish(ok, cancelled):
         global _GUI_PROMPT_HANDLER, _GUI_PROCESS_ACTIVE
         state["active"] = False
         state["ok"] = ok
+        state["cancelled"] = cancelled
         _GUI_PROMPT_HANDLER = None
         _GUI_PROCESS_ACTIVE = False
         progress.set_fraction(1.0 if ok else 0.0)
         close_button.set_sensitive(True)
         close_button.set_label("Close")
-        append("\nProcess finished.\n" if ok else "\nProcess failed.\n")
+        cancel_button.set_sensitive(False)
+        cancel_button.set_visible(False)
+        if cancelled:
+            append("\nProcess cancelled.\n")
+        else:
+            append("\nProcess finished.\n" if ok else "\nProcess failed.\n")
         return False
 
     def pulse():
@@ -7337,24 +7101,44 @@ def run_process_window(title, target):
             os.environ["SUDO_ASKPASS_REQUIRE"] = "force"
         writer = Writer()
         ok = False
+        cancelled = False
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                 target()
             ok = True
+        except OperationCancelled as exc:
+            cancelled = True
+            output.put("\nCancelled: " + str(exc) + "\n")
+            try:
+                _write_status("cancelled", "cancelled", "Operation cancelled")
+                _status_history("cancelled", "Operation cancelled")
+            except BaseException:
+                pass
         except Cancelled as exc:
+            cancelled = True
             output.put("\nCancelled: " + str(exc) + "\n")
         except BaseException as exc:
             output.put(f"\n{type(exc).__name__}: {exc}\n")
         finally:
+            _finish_operation_cancel(keep_request=cancelled)
             _GUI_PROMPT_HANDLER = None
             for key, value in saved_env.items():
                 if value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-            GLib.idle_add(finish, ok)
+            GLib.idle_add(finish, ok, cancelled)
 
-    window.connect("delete-event", lambda _window, _event: state["active"])
+    def close_requested(_window, _event):
+        if state["active"]:
+            if cancellable:
+                cancel_button.set_sensitive(False)
+                cancel_button.set_label("Cancelling…")
+                _request_cancel()
+            return True
+        return False
+
+    window.connect("delete-event", close_requested)
     window.show_all()
     GLib.timeout_add(100, drain)
     GLib.timeout_add(250, pulse)
@@ -7405,7 +7189,6 @@ def run_tray():
         return data
 
     status_item = Gtk.MenuItem(label="Idle")
-    status_item.set_sensitive(False)
     backup_item = Gtk.MenuItem(label="Backup")
     history_item = Gtk.MenuItem(label="History")
     restore_option = Gtk.MenuItem(label="Restore")
@@ -7525,12 +7308,7 @@ def run_tray():
     def backup_action(_item=None):
         data = current_status()
         if data.get("state") == "running":
-            pid = data.get("pid")
-            if isinstance(pid, int):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
+            _request_cancel()
             return
         if not drive_ready(force=True):
             if drive_cache["error"]:
@@ -7550,6 +7328,10 @@ def run_tray():
             _status_history("started", "Recovery started")
             try:
                 wizard_recover()
+            except OperationCancelled:
+                _write_status("cancelled", "cancelled", "Recovery cancelled")
+                _status_history("cancelled", "Recovery cancelled")
+                raise
             except BaseException:
                 _write_status("failed", "failed", "Recovery failed")
                 _status_history("failed", "Recovery failed")
@@ -7645,7 +7427,8 @@ def run_tray():
         selected = options[chooser.get_active()][1] if options and chooser.get_active() >= 0 else None
         dialog.destroy()
         if response == 3:
-            run_process_window("Prepare drive", lambda: wizard_prepare_drive())
+            run_process_window("Prepare drive", lambda: wizard_prepare_drive(),
+                               cancellable=False)
             return
         try:
             if response == 2:
@@ -7754,6 +7537,20 @@ def run_tray():
         quit_window.present()
         return False
 
+    def dismiss_status(_item=None):
+        data = current_status()
+        state = data.get("state")
+        if state == "running":
+            show_status()
+            return False
+        message = data.get("message") or ""
+        if state != "idle" or message not in ("", "No backup running"):
+            _write_status("idle", "idle", "No backup running")
+            _status_history("idle", "Status dismissed")
+            refresh()
+        return False
+
+    status_item.connect("activate", dismiss_status)
     backup_item.connect("activate", backup_action)
     restore_option.connect("activate", restore_action)
     drive_option.connect("activate", show_drive_chooser)
@@ -7871,10 +7668,12 @@ def run_tray():
     def refresh():
         data = current_status()
         running = data.get("state") == "running"
-        label = data.get("message") or data.get("state", "idle")
-        label = label[:90]
+        message = data.get("message") or data.get("state", "idle")
+        label = message[:90]
         if status_item.get_label() != label:
             status_item.set_label(label)
+        status_item.set_visible(
+            data.get("state") != "idle" or message not in ("", "No backup running"))
         if running:
             toggle[0] = not toggle[0]
             set_icon("process-working-symbolic" if toggle[0] else "media-record-symbolic")
@@ -7900,6 +7699,10 @@ EMBEDDED_PROFILE_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
 if __name__ == "__main__":
     try:
         main()
+    except OperationCancelled as exc:
+        _finish_operation_cancel(keep_request=True)
+        print("\nCancelled. Completed actions, if any, are retained.", file=sys.stderr)
+        sys.exit(130)
     except Cancelled as exc:
         print(str(exc), file=sys.stderr)
     except KeyboardInterrupt:

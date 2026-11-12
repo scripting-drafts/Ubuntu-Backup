@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <openssl/evp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -118,6 +119,7 @@ static size_t omission_capacity;
 static HardLink *hardlinks[HL_BUCKETS];
 
 static void fatal(const char *format, ...) __attribute__((noreturn));
+static void remove_tree(const char *path);
 
 static void fatal(const char *format, ...) {
     va_list args;
@@ -127,6 +129,28 @@ static void fatal(const char *format, ...) {
     va_end(args);
     fputc('\n', stderr);
     exit(1);
+}
+
+static volatile sig_atomic_t cancelled = 0;
+static char *cancel_cleanup_path = NULL;
+
+static void handle_cancel(int signal_number) {
+    (void)signal_number;
+    cancelled = 1;
+}
+
+static void check_cancelled(void) {
+    if (!cancelled) {
+        return;
+    }
+    if (cancel_cleanup_path) {
+        char *path = cancel_cleanup_path;
+        cancel_cleanup_path = NULL;
+        remove_tree(path);
+        free(path);
+    }
+    fprintf(stderr, "ubackup-core: cancelled\n");
+    exit(130);
 }
 
 static void usage(void) {
@@ -512,6 +536,15 @@ static void entry_prefix(const char *path, const char *type, const struct stat *
             (long long)mtime_ns(info));
 }
 
+static void report_progress(void) {
+    if (entry_count == 0 || entry_count % 1000 != 0) {
+        return;
+    }
+    fprintf(stderr, "ubackup-core: %" PRIu64 " entries, %.1f MiB logical\n",
+            entry_count, (double)logical_bytes / (1024.0 * 1024.0));
+    fflush(stderr);
+}
+
 static void write_dir_entry(const char *path, const struct stat *info,
                             const Xattrs *xattrs) {
     entry_prefix(path, "dir", info);
@@ -519,6 +552,7 @@ static void write_dir_entry(const char *path, const struct stat *info,
     fputs("}\n", entries_file);
     entry_count++;
     dir_count++;
+    report_progress();
 }
 
 static void write_symlink_entry(const char *path, const struct stat *info, const char *target) {
@@ -528,6 +562,7 @@ static void write_symlink_entry(const char *path, const struct stat *info, const
     fputs("}\n", entries_file);
     entry_count++;
     symlink_count++;
+    report_progress();
 }
 
 static void write_hardlink_entry(const char *path, const struct stat *info, const char *target) {
@@ -537,6 +572,7 @@ static void write_hardlink_entry(const char *path, const struct stat *info, cons
     fputs("}\n", entries_file);
     entry_count++;
     hardlink_count++;
+    report_progress();
 }
 
 static void write_special_entry(const char *path, const struct stat *info) {
@@ -544,6 +580,7 @@ static void write_special_entry(const char *path, const struct stat *info) {
     fputs("}\n", entries_file);
     entry_count++;
     special_count++;
+    report_progress();
 }
 
 static void write_file_entry(const char *path, const struct stat *info, const char *sha256,
@@ -568,6 +605,7 @@ static void write_file_entry(const char *path, const struct stat *info, const ch
     entry_count++;
     file_count++;
     logical_bytes += (uint64_t)info->st_size;
+    report_progress();
 }
 
 typedef struct {
@@ -613,6 +651,7 @@ static void hasher_abort(Hasher *hasher) {
 
 static void hash_zeros(Hasher *hasher, uint64_t size) {
     while (size) {
+        check_cancelled();
         size_t chunk = size > sizeof(zero_block) ? sizeof(zero_block) : (size_t)size;
         hasher_update(hasher, zero_block, chunk);
         size -= chunk;
@@ -877,7 +916,9 @@ static bool file_changed(const struct stat *before, const struct stat *after) {
 
 static void process_file(int dirfd, const char *name, const char *relative,
                          const struct stat *listed) {
+    check_cancelled();
     for (int attempt = 0; attempt < 2; attempt++) {
+        check_cancelled();
         int fd = open_source_file(dirfd, name);
         if (fd < 0) {
             if (errno == ENOENT) {
@@ -956,6 +997,7 @@ static void process_file(int dirfd, const char *name, const char *relative,
                 uint64_t offset = segment.offset;
                 uint64_t remaining = segment.length;
                 while (remaining) {
+                    check_cancelled();
                     size_t chunk = remaining > IO_BUFFER ? IO_BUFFER : (size_t)remaining;
                     ssize_t got = pread(fd, buffer, chunk, (off_t)offset);
                     if (got < 0) {
@@ -991,6 +1033,7 @@ static void process_file(int dirfd, const char *name, const char *relative,
             }
             uint64_t total = 0;
             while (!read_error && total < (uint64_t)info.st_size) {
+                check_cancelled();
                 size_t chunk = (uint64_t)(info.st_size - (off_t)total) > IO_BUFFER
                     ? IO_BUFFER : (size_t)(info.st_size - (off_t)total);
                 ssize_t got = read(fd, buffer, chunk);
@@ -1115,6 +1158,7 @@ static char *read_link(int dirfd, const char *name) {
 }
 
 static void scan_directory(int directory_fd, const char *relative, int depth) {
+    check_cancelled();
     if (depth > MAX_DEPTH) {
         add_omission(relative, "depth", ENAMETOOLONG);
         close(directory_fd);
@@ -1131,6 +1175,7 @@ static void scan_directory(int directory_fd, const char *relative, int depth) {
     struct dirent *item;
     errno = 0;
     while ((item = readdir(directory)) != NULL) {
+        check_cancelled();
         if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0) {
             continue;
         }
@@ -1922,8 +1967,12 @@ static void copy_and_hash(int source_fd, int target_fd, uint64_t size,
             uint64_t offset = segment.offset;
             uint64_t remaining = segment.length;
             while (remaining) {
+                check_cancelled();
                 size_t chunk = remaining > IO_BUFFER ? IO_BUFFER : (size_t)remaining;
                 ssize_t got = pread(source_fd, buffer, chunk, (off_t)offset);
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
                 if (got <= 0) {
                     fatal("short read from object: %s", strerror(got < 0 ? errno : EIO));
                 }
@@ -1948,8 +1997,12 @@ static void copy_and_hash(int source_fd, int target_fd, uint64_t size,
         }
         uint64_t total = 0;
         while (total < size) {
+            check_cancelled();
             size_t chunk = size - total > IO_BUFFER ? IO_BUFFER : (size_t)(size - total);
             ssize_t got = read(source_fd, buffer, chunk);
+            if (got < 0 && errno == EINTR) {
+                continue;
+            }
             if (got <= 0) {
                 fatal("short read from object: %s", strerror(got < 0 ? errno : EIO));
             }
@@ -2193,6 +2246,11 @@ static void restore_one(const RestoreEntry *entry) {
     close(parent_fd);
     free(leaf);
     restore_entries++;
+    if (restore_entries % 1000 == 0) {
+        fprintf(stderr, "ubackup-core: restored %" PRIu64 " entries, %.1f MiB\n",
+                restore_entries, (double)restore_bytes / (1024.0 * 1024.0));
+        fflush(stderr);
+    }
 }
 
 static void restore_usage(void) {
@@ -2344,6 +2402,7 @@ static int restore_main(int argc, char **argv) {
     size_t line_number = 0;
     ssize_t length;
     while ((length = getline(&line, &capacity, input)) >= 0) {
+        check_cancelled();
         line_number++;
         char *content = line;
         while (isspace((unsigned char)*content)) {
@@ -2568,10 +2627,12 @@ static void publish_timeline(void) {
     if (errno != ENOENT) {
         fatal("cannot inspect timeline destination %s: %s", final, strerror(errno));
     }
+    check_cancelled();
     char *template = xasprintf("%s/.home-timeline-XXXXXX", options.timeline);
     if (!mkdtemp(template)) {
         fatal("cannot create timeline staging directory: %s", strerror(errno));
     }
+    cancel_cleanup_path = xstrdup(template);
     char *tree = xasprintf("%s/tree", template);
     ensure_dir(tree, 0700);
     int tree_fd = open(tree, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -2603,6 +2664,7 @@ static void publish_timeline(void) {
         if (!*content) {
             continue;
         }
+        check_cancelled();
         RestoreEntry entry;
         parse_restore_entry(content, line_number, &entry);
         char *leaf = NULL;
@@ -2707,12 +2769,15 @@ static void publish_timeline(void) {
     free(entries_copy);
     free(manifest_path);
 
+    check_cancelled();
     maybe_chown_tree(tree);
     close(tree_fd);
     maybe_chown_path(template);
     if (rename(template, final) != 0) {
         fatal("cannot publish timeline %s: %s", final, strerror(errno));
     }
+    free(cancel_cleanup_path);
+    cancel_cleanup_path = NULL;
     maybe_chown_path(final);
     fsync_directory(options.timeline);
     published_timeline = final;
@@ -2766,8 +2831,12 @@ static void copy_sparse_file_c(int source_fd, int target_fd, uint64_t size) {
             uint64_t offset = segments.items[index].offset;
             uint64_t remaining = segments.items[index].length;
             while (remaining) {
+                check_cancelled();
                 size_t chunk = remaining > IO_BUFFER ? IO_BUFFER : (size_t)remaining;
                 ssize_t got = pread(source_fd, buffer, chunk, (off_t)offset);
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
                 if (got <= 0) {
                     free(buffer);
                     free_segments(&segments);
@@ -2795,8 +2864,12 @@ static void copy_sparse_file_c(int source_fd, int target_fd, uint64_t size) {
         }
         uint64_t total = 0;
         while (total < size) {
+            check_cancelled();
             size_t chunk = size - total > IO_BUFFER ? IO_BUFFER : (size_t)(size - total);
             ssize_t got = read(source_fd, buffer, chunk);
+            if (got < 0 && errno == EINTR) {
+                continue;
+            }
             if (got <= 0) {
                 free(buffer);
                 fatal("short read from staged object: %s",
@@ -2829,6 +2902,7 @@ static void bulk_copy_stage(void) {
     }
     struct dirent *shard_entry;
     while ((shard_entry = readdir(stage_directory)) != NULL) {
+        check_cancelled();
         if (strcmp(shard_entry->d_name, ".") == 0 ||
             strcmp(shard_entry->d_name, "..") == 0 ||
             strcmp(shard_entry->d_name, INCOMING) == 0) {
@@ -2844,6 +2918,7 @@ static void bulk_copy_stage(void) {
         }
         struct dirent *object_entry;
         while ((object_entry = readdir(shard_directory)) != NULL) {
+            check_cancelled();
             if (strcmp(object_entry->d_name, ".") == 0 ||
                 strcmp(object_entry->d_name, "..") == 0) {
                 continue;
@@ -3064,15 +3139,18 @@ static int scan_main(int argc, char **argv) {
     ensure_object_dir(options.objects);
     open_entries();
     scan_directory(source_fd, "", 0);
+    check_cancelled();
     close_entries();
     if (options.stage) {
         drop_to_owner();
         bulk_copy_stage();
+        check_cancelled();
         sync_objects();
         remove_tree(options.stage);
     } else {
         sync_objects();
     }
+    check_cancelled();
     publish_timeline();
     write_report();
 
@@ -3093,6 +3171,14 @@ static int scan_main(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_cancel;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGHUP, &action, NULL);
     if (argc < 2) {
         usage();
     }

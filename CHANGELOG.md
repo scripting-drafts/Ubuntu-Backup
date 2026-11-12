@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- Autoscroll the Backup/Restore log window to new output; scrolling up pauses follow mode and returning to the bottom resumes it.
+- Make the tray summary status clickable: dismiss finished/failed/cancelled messages, remove the status row, and restore the default icon; running operations open Live status.
+- Add cooperative cancellation for backup and restore: GUI Cancel button, workspace cancel file for sudo workers, and SIGINT/SIGTERM handling in `ubackup-core`.
+- Make `ubackup-core` the only full `/home` backup and restore engine; remove the Python tar fallback and the Python restore copy loop.
+- Require the native core at install time and remove the `--native-capture` switch.
 - Nest package scan under the backup action and modified-package restore under the restore action.
 - Include package scan status/refresh in the backup flow and optional modified-package restore in the configuration recovery flow.
 - Hide package scan and modified-package restore from menus; they are now steps inside the Backup and Restore flows.

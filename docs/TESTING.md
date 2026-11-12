@@ -1,7 +1,7 @@
 # Testing
 
 - Full regression suite: `python3 -m unittest discover -s tests -v`
-- Native core: `make -C native`; tests build and exercise `native/ubackup-core`.
+- Native core: required; `make -C native` builds it, and tests exercise both scan and restore. CI installs `build-essential` and `libssl-dev`.
 - Shell checks: `shellcheck install.sh uninstall.sh refresh.sh drive.sh extension/*.sh`
 - Install round trip is covered by `InstallRoundTripTests` using an isolated temporary `HOME`.
 - Destructive drills must use temporary workspaces and a scratch drive.
