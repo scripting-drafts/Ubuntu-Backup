@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.2 - 2026-11-13
+- Declare the `org.ubuntu.Backup` session D-Bus slot so the strict snap tray can own its status service; fixes startup on X11/GNOME.
+
 ## v1.3.1 - 2026-11-13
 - Remove `ubuntu-backup-system@.timer` and its automatic enablement.
 - System capture and package scan are now strictly on-demand via `pkexec`,
