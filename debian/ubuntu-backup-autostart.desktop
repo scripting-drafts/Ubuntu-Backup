@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ubuntu Backup tray
+Comment=Backup status icon
+Exec=ubuntu-backup tray
+Icon=ubuntu-backup
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,14 @@
+tar-ignore=.git
+tar-ignore=data
+tar-ignore=dist
+tar-ignore=parts
+tar-ignore=prime
+tar-ignore=stage
+tar-ignore=__pycache__
+tar-ignore=native/ubackup-core
+tar-ignore=snap/dist
+tar-ignore=debian/.debhelper
+tar-ignore=debian/ubuntu-backup
+tar-ignore=debian/files
+tar-ignore=debian/debhelper-build-stamp
+tar-ignore=debian/*.substvars

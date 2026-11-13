@@ -1,0 +1,29 @@
+#!/bin/sh
+# Launch the GTK askpass helper with the snap's Python and GTK runtime.
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SNAP_ROOT="${SNAP:-$(dirname "$SELF_DIR")}"
+
+ARCH_TRIPLET=""
+for candidate in "$SNAP_ROOT"/usr/lib/*-linux-gnu; do
+    if [ -d "$candidate" ]; then
+        ARCH_TRIPLET="${candidate##*/}"
+        break
+    fi
+done
+if [ -z "$ARCH_TRIPLET" ]; then
+    echo "Ubuntu Backup askpass: cannot determine the snap library directory." >&2
+    exit 1
+fi
+
+export PYTHONHOME="/snap/core22/current/usr"
+export PYTHONPATH="$SNAP_ROOT/usr/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}"
+export GI_TYPELIB_PATH="$SNAP_ROOT/usr/lib/$ARCH_TRIPLET/girepository-1.0:$SNAP_ROOT/usr/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+export LD_LIBRARY_PATH="$SNAP_ROOT/usr/lib/$ARCH_TRIPLET:$SNAP_ROOT/usr/lib:/snap/core22/current/lib/$ARCH_TRIPLET:/snap/core22/current/usr/lib/$ARCH_TRIPLET${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="$SNAP_ROOT/usr/share:/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+export GSETTINGS_SCHEMA_DIR="$SNAP_ROOT/usr/share/glib-2.0/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+export GTK_EXE_PREFIX="$SNAP_ROOT/usr"
+export GTK_DATA_PREFIX="$SNAP_ROOT/usr"
+
+exec /snap/core22/current/usr/bin/python3 -s "$SNAP_ROOT/bin/ubuntu-backup-askpass.py" "$@"

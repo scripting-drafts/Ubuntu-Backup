@@ -84,6 +84,44 @@ class ConfigError(Exception):
     pass
 
 
+# Strict-confinement mode. The snap is published without classic confinement and
+# must never invoke sudo/pkexec or write outside its declared interfaces.
+SNAP_MODE = bool(os.environ.get("SNAP"))
+_SNAP_PRIVILEGED_EXECUTABLES = {"sudo", "pkexec"}
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+_ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+
+
+def _snap_command_is_privileged(command):
+    if not SNAP_MODE or isinstance(command, (str, bytes)) or not command:
+        return False
+    try:
+        return Path(str(command[0])).name in _SNAP_PRIVILEGED_EXECUTABLES
+    except (TypeError, ValueError):
+        return False
+
+
+def _snap_guard_run(command, *args, **kwargs):
+    if _snap_command_is_privileged(command):
+        raise ConfigError(
+            "This action needs the ubuntu-backup-system package; the strict snap "
+            "cannot run sudo or pkexec. Install the helper and use its System Capture action.")
+    return _ORIGINAL_SUBPROCESS_RUN(command, *args, **kwargs)
+
+
+def _snap_guard_popen(command, *args, **kwargs):
+    if _snap_command_is_privileged(command):
+        raise ConfigError(
+            "This action needs the ubuntu-backup-system package; the strict snap "
+            "cannot run sudo or pkexec. Install the helper and use its System Capture action.")
+    return _ORIGINAL_SUBPROCESS_POPEN(command, *args, **kwargs)
+
+
+if SNAP_MODE:
+    subprocess.run = _snap_guard_run
+    subprocess.Popen = _snap_guard_popen
+
+
 def timestamp():
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 
@@ -273,7 +311,11 @@ def regular_files(root):
 
 def read_os_release():
     result = {}
-    for line in Path("/etc/os-release").read_text().splitlines():
+    try:
+        lines = Path("/etc/os-release").read_text().splitlines()
+    except OSError:
+        return result
+    for line in lines:
         if "=" in line and not line.startswith("#"):
             key, value = line.split("=", 1)
             result[key] = value.strip('"')
@@ -375,6 +417,10 @@ def capture_command(args, report, timeout=45, empty_codes=()):
                                 env=environment, errors="replace")
     except subprocess.TimeoutExpired:
         report["warnings"].append(f"{args[0]} inventory timed out")
+        return ""
+    except OSError:
+        # A strict snap can see host executables on PATH but AppArmor denies exec.
+        report["unavailable_commands"].append(args[0])
         return ""
     if result.returncode in empty_codes:
         return ""
@@ -933,6 +979,10 @@ def wizard_restore_package_files(source=None):
 
 def restore_package_files(snapshot=None, apply=False, packages=None, paths=None, force=False):
     """Review or restore captured modified package files in place."""
+    if SNAP_MODE:
+        raise ConfigError(
+            "Restoring package files needs the ubuntu-backup-system helper; "
+            "the strict snap cannot use sudo or write package-managed paths.")
     source = Path(snapshot).expanduser().resolve() if snapshot else latest_config_snapshot()
     verify_path(source)
     manifest_path = source / "inventory/package-integrity.json"
@@ -1327,6 +1377,9 @@ def package_scan_summary():
 
 def capture_root_package_scan(non_interactive=False, force=False):
     """Run the privileged package-file scan through sudo."""
+    if SNAP_MODE:
+        print("Package-file scanning needs the ubuntu-backup-system helper; skipping in the strict snap.")
+        return False
     age = privileged_package_scan_age()
     if not force and age is not None and age <= (10 / 60):
         print("Using the privileged package scan from the last 10 minutes.")
@@ -1346,8 +1399,46 @@ def capture_root_package_scan(non_interactive=False, force=False):
     return True
 
 
+def collect_inventory_snap(destination, config, report):
+    """Minimal user-space inventory for the strict snap.
+
+    Host package/APT/service queries are intentionally skipped: the confined snap
+    cannot read /var/lib/dpkg, /var/log/apt, or execute host tools. The privileged
+    ubuntu-backup-system helper captures those separately into the workspace cache.
+    """
+    mkdir(destination)
+    os_info = read_os_release()
+    support = release_support(os_info)
+    write_json(destination / "hardware.json", hardware_inventory())
+    write_json(destination / "source-system.json", {
+        "os": os_info, "release_support": support,
+        "hostname": socket.gethostname(), "home": str(HOME),
+        "desktop": os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
+        "architecture": os.uname().machine,
+    })
+    tools = ("docker", "kubectl", "kind", "clusterctl", "helm", "python3", "node", "npm",
+             "dotnet", "java", "gcc", "code", "opencode", "tailscale", "wg", "nvidia-smi")
+    write_json(destination / "tool-paths.json", {tool: shutil.which(tool) for tool in tools})
+    write_json(destination / "inventory-mode.json", {
+        "mode": "strict-snap",
+        "host_package_inventory": False,
+        "privileged_cache": str(KIT / "privileged-system/system-wide.tar.gz"),
+    })
+    report["unavailable_commands"].extend(
+        ["dpkg", "apt-mark", "apt-cache", "snap", "flatpak", "systemctl"])
+    report["warnings"].append(
+        "Strict snap: host package/service inventory is unavailable; "
+        "install ubuntu-backup-system and run its System Capture action for root-owned configuration.")
+    # The base snap always reports core22; the host release comes from the helper
+    # cache, so do not raise a misleading "outside tested range" warning here.
+    report["snap_runtime"] = {"base": "core22", "host_release_from": "ubuntu-backup-system"}
+    return None
+
+
 def collect_inventory(destination, config, report):
     mkdir(destination)
+    if SNAP_MODE:
+        return collect_inventory_snap(destination, config, report)
     write_json(destination / "hardware.json", hardware_inventory())
     native_arch = capture_command(["dpkg", "--print-architecture"], report).strip()
     commands = {
@@ -2272,7 +2363,7 @@ def saved_package_names(source):
 def build_snapshot(destination, config):
     config = dict(config)
     config["exclude"] = sorted(set(config.get("exclude", []) + development_exclusions()))
-    if config.get("coverage") == "system-wide-configuration":
+    if config.get("coverage") == "system-wide-configuration" and not SNAP_MODE:
         config["home_include"] = sorted(set(config["home_include"] + configuration_home_paths(HOME)))
     # Development checkouts are captured as code, not inferred from installed packages.
     config["home_include"] = sorted(set(config["home_include"] + detect_development_roots(HOME, config)))
@@ -2280,7 +2371,15 @@ def build_snapshot(destination, config):
         # Children of a selected directory are already recursive. Avoid duplicate reads/copies.
         config["home_include"] = [name for name in config["home_include"] if not any(
             name.startswith(parent + "/") for parent in config["home_include"] if parent != name and "*" not in parent)]
-        config["system_reference_only"] = list(SYSTEM_CONFIG_ROOTS)
+        if not SNAP_MODE:
+            config["system_reference_only"] = list(SYSTEM_CONFIG_ROOTS)
+    if SNAP_MODE:
+        # The home interface excludes dotfiles; the privileged helper cache carries
+        # those. Never hand hidden paths to the confined copier.
+        config["home_include"] = [name for name in config["home_include"] if not name.startswith(".")]
+        config["home_reference_only"] = [name for name in config.get("home_reference_only", [])
+                                         if not name.startswith(".")]
+        config["system_reference_only"] = []
     report = {"warnings": [], "unavailable_commands": [], "symlinks_not_followed": [],
               "unreadable_files": [], "bytes_captured": 0}
     collect_inventory(destination / "inventory", config, report)
@@ -2324,7 +2423,10 @@ def build_snapshot(destination, config):
             report["warnings"].append("SYSTEM-WIDE COVERAGE INCOMPLETE: cache is stale or records omissions.")
     elif config.get("coverage") == "system-wide-configuration":
         report["system_wide_coverage"] = {"complete": False, "reason": "No privileged system-wide capture; other users/root-only files are missing."}
-        report["warnings"].append("SYSTEM-WIDE COVERAGE INCOMPLETE: use the confirmed sudo system-wide capture/scheduler.")
+        report["warnings"].append(
+            "SYSTEM-WIDE COVERAGE INCOMPLETE: install ubuntu-backup-system and run its "
+            "System Capture action." if SNAP_MODE else
+            "SYSTEM-WIDE COVERAGE INCOMPLETE: use the confirmed sudo system-wide capture/scheduler.")
     cache_manifest = KIT / "privileged-system/manifest.json"
     if cache_manifest.exists() and not wide_cache.exists():
         cached = json.loads(cache_manifest.read_text())
@@ -3048,6 +3150,10 @@ def mount_plan(device, mount_point=None):
 
 def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
     """Mount a prepared Linux filesystem at boot and give it to the current user."""
+    if SNAP_MODE:
+        raise ConfigError(
+            "Persistent fstab mounts need root. Mount the drive with Files/Disks "
+            "or use udisks, then select it in Ubuntu Backup.")
     plan = mount_plan(device, mount_point)
     if not sys.stdin.isatty():
         raise ConfigError("Mounting needs one sudo prompt; run './ubuntu-backup.py choose-drive' in a terminal.")
@@ -3092,6 +3198,8 @@ def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
 
 def _stop_mount_retry():
     """Stop polling once the drive is mounted; the timer re-arms at next login."""
+    if SNAP_MODE:
+        return
     subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
 
 
@@ -3140,6 +3248,15 @@ def mount_saved(check=False, quiet=False):
                     return "mounted"
                 time.sleep(0.25)
         return "failed"
+
+    if SNAP_MODE:
+        fallback = mount_by_label()
+        if fallback is not None:
+            return fallback
+        if check or not quiet:
+            print("Strict snap: no mounted backup marker; mount the drive first "
+                  "(Files/Disks or udisks), then retry.")
+        return "absent"
 
     entries = [entry for entry in fstab_entries() if entry["managed"]]
     if not entries:
@@ -3199,8 +3316,9 @@ def unmount_saved():
         raise ConfigError("More than one mounted filesystem carries a backup marker ("
                           + ", ".join(str(item["directory"]) for item in drives) + "); unmount them explicitly.")
     directory, filesystem_uuid = drives[0]["directory"], drives[0]["uuid"]
-    subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.service"], check=False)
-    subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
+    if not SNAP_MODE:
+        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.service"], check=False)
+        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
     os.sync()
     result = None
     if filesystem_uuid:
@@ -3454,7 +3572,7 @@ def set_external(mount_point, disable=False):
     write_json(KIT / "config/settings.json", config)
     print("External backup disabled; existing drive data was not removed." if disable else
           "Backup drive configured at its root. No disk was formatted; the next backup will also copy there.")
-    if not disable:
+    if not disable and not SNAP_MODE:
         stale = [entry for entry in fstab_entries()
                  if entry["managed"] and entry["uuid"] and entry["uuid"] != information["uuid"]]
         for entry in stale:
@@ -3939,6 +4057,10 @@ WantedBy=timers.target
 
 
 def install_timer():
+    if SNAP_MODE:
+        raise ConfigError(
+            "The strict snap cannot write ~/.config/systemd/user. "
+            "Use the ubuntu-backup-system timer for system capture, or start the tray at login.")
     directory = HOME / ".config/systemd/user"
     service, timer = systemd_units()
     for suffix in ("service", "timer"):
@@ -4212,6 +4334,8 @@ def system_integration_inventory():
 
 def capture_system_integration(destination):
     """Store managed timer/service/helper contents plus state for recovery."""
+    if SNAP_MODE:
+        return
     data = system_integration_inventory()
     for item in data["items"]:
         if not item.get("present"):
@@ -4238,6 +4362,10 @@ def capture_system_integration(destination):
 
 def restore_system_integration(snapshot):
     """Reinstall and synchronize captured system timer/helper; requires sudo."""
+    if SNAP_MODE:
+        raise ConfigError(
+            "Restoring system timer/helper files is provided by the ubuntu-backup-system package; "
+            "the strict snap cannot write /etc or /usr/local/libexec.")
     snapshot = Path(snapshot)
     metadata = snapshot / "inventory/system-integration.json"
     if metadata.is_file():
@@ -4308,7 +4436,8 @@ def build_snapshot(destination, config):
     except ValueError:
         pass
     report = _original_build_snapshot(destination, selected)
-    capture_system_integration(destination)
+    if not SNAP_MODE:
+        capture_system_integration(destination)
     write(destination / "kit" / SCRIPT_PATH.name, SCRIPT_PATH.read_bytes(), executable=True)
     refresh_manifest(destination)
     return report
@@ -4357,6 +4486,11 @@ def default_snapshot():
 
 def capture_root(non_interactive=False, install=False, replace_user_timer=False,
                  hide_followup_hint=False, package_scan=True):
+    if SNAP_MODE:
+        print("System-wide capture is provided by the ubuntu-backup-system package. "
+              "Install it and use the “Ubuntu Backup — System Capture” action; "
+              "the next strict-snap backup will include its cache.")
+        return None
     print("System-wide configuration and local accounts' settings will be read, including sensitive configuration.")
     command = ["sudo"] + (["-n"] if non_interactive else [])
     command += ["/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "_capture-root-worker"]
@@ -4391,13 +4525,28 @@ def systemd_units():
     calendar = settings().get("backup_calendar", "daily")
     if calendar not in ("daily", "weekly"):
         raise ConfigError("Backup calendar must be daily or weekly.")
+    if os.environ.get("SNAP"):
+        command = (
+            f"/snap/bin/{os.environ.get('SNAP_INSTANCE_NAME', 'ubackup')} "
+            f"--workspace {quote(KIT)} --non-interactive backup"
+        )
+    elif installed := shutil.which("ubuntu-backup"):
+        command = (
+            f"{quote(installed)} --workspace {quote(KIT)} "
+            f"--non-interactive backup"
+        )
+    else:
+        command = (
+            f"/usr/bin/python3 -I {quote(HOME / 'ubuntu-backup.py')} "
+            f"--workspace {quote(KIT)} --non-interactive backup"
+        )
     service = f"""{MARKER}
 [Unit]
 Description=Private Ubuntu configuration snapshot (single-file kit)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -I {quote(HOME / 'ubuntu-backup.py')} --workspace {quote(KIT)} --non-interactive backup
+ExecStart={command}
 SuccessExitStatus=3
 UMask=0077
 Nice=10
@@ -4421,6 +4570,10 @@ WantedBy=timers.target
 
 
 def install_timer():
+    if SNAP_MODE:
+        raise ConfigError(
+            "The strict snap cannot write ~/.config/systemd/user. "
+            "Use the ubuntu-backup-system timer for system capture, or start the tray at login.")
     installed = HOME / "ubuntu-backup.py"
     if SCRIPT_PATH != installed:
         if installed.exists() and SINGLE_FILE_MARKER not in installed.read_text()[:200]:
@@ -4431,6 +4584,10 @@ def install_timer():
 
 
 def disable_timer():
+    if SNAP_MODE:
+        raise ConfigError(
+            "The strict snap does not own a user systemd timer. "
+            "Disable the ubuntu-backup-system timer with systemctl instead.")
     path = HOME / ".config/systemd/user" / (UNIT + ".timer")
     if not path.is_file() or path.is_symlink() or MARKER not in path.read_text():
         raise ConfigError("No recognized backup timer to disable.")
@@ -4440,11 +4597,15 @@ def disable_timer():
 
 def show_status():
     config = settings()
-    support = release_support()
-    release = " ".join(value for value in (support.get("version"), support.get("name")) if value)
-    print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots\n"
-          f"Ubuntu: {release or 'unknown'} "
-          f"({'supported' if support.get('supported') else 'outside tested range'})")
+    if SNAP_MODE:
+        ubuntu_line = ("Ubuntu: snap runtime base "
+                       "(host release is captured by ubuntu-backup-system)")
+    else:
+        support = release_support()
+        release = " ".join(value for value in (support.get("version"), support.get("name")) if value)
+        ubuntu_line = (f"Ubuntu: {release or 'unknown'} "
+                       f"({'supported' if support.get('supported') else 'outside tested range'})")
+    print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots\n{ubuntu_line}")
     try:
         print("Full /home engine: " + str(native_core_path()))
     except ConfigError as exc:
@@ -4465,10 +4626,12 @@ def show_status():
         homes = directory / "timeline/home"
         print(f"External configuration timelines: {len(list(configuration.iterdir())) if configuration.is_dir() else 0}; "
               f"full /home timelines: {len(list(homes.iterdir())) if homes.is_dir() else 0}")
-    if shutil.which("systemctl"):
+    if shutil.which("systemctl") and not SNAP_MODE:
         result = subprocess.run(["systemctl", "--user", "is-enabled", UNIT + ".timer"],
                                 capture_output=True, text=True, timeout=10)
         print("Backup timer: " + (result.stdout.strip() or "unavailable"))
+    elif SNAP_MODE:
+        print("Backup timer: managed by the snap session/ubuntu-backup-system package")
     print("Config data and archives are private but NOT encrypted.")
 
 
@@ -4720,6 +4883,10 @@ def _format_candidates(include_internal=False):
 
 def format_drive(device_path, allow_internal=False, assume_yes=False):
     """Format one explicitly selected whole disk as ext4, never a partition."""
+    if SNAP_MODE:
+        raise ConfigError(
+            "Formatting needs root and raw block-device access. "
+            "Use the ubuntu-backup-system helper or the Files/Disks application.")
     if not sys.stdin.isatty():
         raise ConfigError("Formatting needs an interactive terminal.")
     path = Path(device_path)
@@ -5028,6 +5195,10 @@ def retention_value():
 
 
 def wizard_schedule():
+    if SNAP_MODE:
+        raise ConfigError(
+            "The strict snap has no user systemd timer. "
+            "Use the ubuntu-backup-system timer for system capture, or start the tray at login.")
     print("1. Daily")
     print("2. Weekly")
     print("3. Disable automatic backups")
@@ -5191,6 +5362,12 @@ def main():
         parser.print_help()
         return
     workspace = args.workspace or preferred_workspace()
+    if SNAP_MODE and args.command in (
+            "_capture-root-worker", "_backup-home-worker",
+            "_restore-package-files-worker", "_capture-package-files-worker"):
+        raise ConfigError(
+            "Privileged workers are provided by the ubuntu-backup-system package; "
+            "the strict snap cannot run them.")
     if args.command == "_capture-root-worker":
         namespace = {"__name__": "root_reference_worker", "__file__": str(workspace.absolute() / "scripts/capture-root-configs.py"), "SELF_SOURCE": EMBEDDED_ROOT_EXPORTER}
         exec(compile(EMBEDDED_ROOT_EXPORTER, "<embedded root-reference exporter>", "exec"), namespace)
@@ -5814,9 +5991,14 @@ def hardware_comparison(source):
             if saved.get(key) != current.get(key):
                 changes.append(key + " changed")
     info = Path(source) / "inventory/source-system.json"
-    old_os = json.loads(info.read_text()).get("os", {}) if info.is_file() else {}
-    if not old_os or old_os.get("VERSION_ID") != read_os_release().get("VERSION_ID"):
-        changes.append("Ubuntu version unknown/changed")
+    if SNAP_MODE:
+        # The snap sees only core22; never claim the host release matched.
+        changes.append("Ubuntu version not verifiable in the strict snap")
+        old_os = {}
+    else:
+        old_os = json.loads(info.read_text()).get("os", {}) if info.is_file() else {}
+        if not old_os or old_os.get("VERSION_ID") != read_os_release().get("VERSION_ID"):
+            changes.append("Ubuntu version unknown/changed")
     return {"changes": changes, "saved": saved, "current": current,
             "policy": "Portable preferences may be selected; hardware bindings, startup/scripts and all system references require manual adaptation when identities differ."}
 
@@ -6427,6 +6609,10 @@ def native_home_command(source_home, directory, run_id, owner_uid, owner_gid,
 
 def wizard_home_backup(run_id=None):
     global _LAST_HOME_WARNINGS
+    if SNAP_MODE:
+        print("Full /home capture is provided by the ubuntu-backup-system helper; "
+              "skipping it in the strict snap.")
+        return False
     config = settings()
     if not config["external_backup"]:
         print("Choose and mount the backup drive first (menu 4). No /home data was read or copied.")
@@ -6787,6 +6973,10 @@ def home_backup_lock():
 
 def root_home_backup(workspace, run_id=None):
     global KIT, HOME
+    if SNAP_MODE:
+        raise ConfigError(
+            "Full /home capture is provided by the ubuntu-backup-system helper; "
+            "the strict snap cannot request root.")
     if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
         raise ConfigError("Use the confirmed normal-user full /home backup action.")
     owner = pwd.getpwuid(int(os.environ["SUDO_UID"]))

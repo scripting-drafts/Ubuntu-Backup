@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ubuntu Backup
+GenericName=Backup Utility
+Comment=Back up system configuration, development environments, and home data
+Exec=ubackup tray
+Icon=ubuntu-backup
+Terminal=false
+Categories=Utility;System;
+Keywords=backup;restore;configuration;home;
+StartupNotify=true

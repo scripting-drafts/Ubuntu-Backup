@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.0 - 2026-11-13
+- Publish `ubackup` as a strict-confinement snap (no classic request) with `home`, `removable-media`, `udisks2`, and desktop/Mount-Observe plugs.
+- Snapshot mode disables every `sudo`/`pkexec` path, host package queries, user systemd timers, fstab edits, and raw-disk formatting.
+- Add the `ubuntu-backup-system` deb: root capture helper, `ubuntu-backup-system@.timer`, polkit action, and System Capture desktop entry. The deb owns its own files; the helper never self-installs into `/usr/local/libexec` or `/etc/systemd/system`.
+- The helper writes `privileged-system/system-wide.tar.gz` into the user's workspace as the user, using the existing verified cache format consumed by `build_snapshot`.
+- Keep the GUI tray autostart in the deb (`/etc/xdg/autostart`); the strict snap does not write `~/.config/autostart` or `~/.config/systemd/user`.
+- Add the `install` target to `native/Makefile` for the Snapcraft make plugin.
+
 ## v1.1.0 - 2026-11-12
 - Enforce a per-session tray singleton in `$XDG_RUNTIME_DIR/ubuntu-backup/tray.lock` (independent of the workspace), make loss of `org.ubuntu.Backup` fatal, align the desktop launcher with the autostart workspace, and log the selected tray backend.
 - Harden tray shutdown with `pidfd` signals, validate private lock directories and lock files, fail closed on a tampered lock path, refuse symlinked extension destinations, and publish extension updates atomically with `mv -T`.

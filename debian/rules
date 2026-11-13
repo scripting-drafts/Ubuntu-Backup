@@ -1,0 +1,44 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	$(MAKE) -C native clean
+
+override_dh_auto_build:
+	$(MAKE) -C native
+
+override_dh_auto_test:
+	$(MAKE) -C native test
+
+override_dh_auto_install:
+	install -Dm755 ubuntu-backup.py \
+		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubuntu-backup.py
+	install -Dm755 ubuntu-backup-askpass.py \
+		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubuntu-backup-askpass
+	install -Dm755 ubuntu-backup-askpass.py \
+		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubuntu-backup-askpass.py
+	install -Dm755 native/ubackup-core \
+		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubackup-core
+	install -Dm755 debian/ubuntu-backup-wrapper \
+		debian/ubuntu-backup/usr/bin/ubuntu-backup
+	install -Dm644 debian/ubuntu-backup.desktop \
+		debian/ubuntu-backup/usr/share/applications/ubuntu-backup.desktop
+	install -Dm644 debian/ubuntu-backup-autostart.desktop \
+		debian/ubuntu-backup/etc/xdg/autostart/ubuntu-backup-tray.desktop
+	install -Dm644 ubuntu-backup.svg \
+		debian/ubuntu-backup/usr/share/icons/hicolor/scalable/apps/ubuntu-backup.svg
+	# Privileged helper package: owns its own units; never self-installs.
+	install -Dm755 system/ubuntu-backup-system.py \
+		debian/ubuntu-backup-system/usr/libexec/ubuntu-backup/ubuntu-backup-system
+	install -Dm755 system/ubuntu-backup-system \
+		debian/ubuntu-backup-system/usr/bin/ubuntu-backup-system
+	install -Dm644 system/ubuntu-backup-system@.service \
+		debian/ubuntu-backup-system/lib/systemd/system/ubuntu-backup-system@.service
+	install -Dm644 system/ubuntu-backup-system@.timer \
+		debian/ubuntu-backup-system/lib/systemd/system/ubuntu-backup-system@.timer
+	install -Dm644 system/org.ubuntu.backup.policy \
+		debian/ubuntu-backup-system/usr/share/polkit-1/actions/org.ubuntu.backup.policy
+	install -Dm644 system/ubuntu-backup-system-capture.desktop \
+		debian/ubuntu-backup-system/usr/share/applications/ubuntu-backup-system-capture.desktop

@@ -1,0 +1,15 @@
+ubuntu-backup (1.2.0) jammy; urgency=medium
+
+  * Add a strict-confinement snap that runs entirely as the desktop user.
+  * Add the ubuntu-backup-system package: root capture helper, systemd timer,
+    polkit action, and a System Capture desktop entry.
+  * Keep the GUI tray autostart in the deb and write captures into the user's
+    workspace as the user, so the strict snap can consume them without sudo.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Fri, 13 Nov 2026 18:00:00 +0100
+
+ubuntu-backup (1.1.0) jammy; urgency=medium
+
+  * Initial Debian packaging for Ubuntu Backup.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Fri, 13 Nov 2026 12:00:00 +0100
