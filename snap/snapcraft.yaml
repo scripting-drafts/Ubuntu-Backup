@@ -1,7 +1,7 @@
 name: ubackup
 title: Ubuntu Backup
 base: core22
-version: '1.3.2'
+version: '1.3.3'
 
 summary: Back up Ubuntu configuration, development environments and home data
 
@@ -35,8 +35,6 @@ apps:
     command: bin/ubuntu-backup-launcher
     desktop: share/applications/ubuntu-backup.desktop
     autostart: ubuntu-backup.desktop
-    slots:
-      - ubuntu-backup-dbus
     plugs:
       - home
       - desktop
@@ -87,9 +85,3 @@ parts:
     build-packages:
       - build-essential
       - libssl-dev
-
-slots:
-  ubuntu-backup-dbus:
-    interface: dbus
-    bus: session
-    name: org.ubuntu.Backup

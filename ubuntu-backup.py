@@ -3196,6 +3196,30 @@ def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
     return str(plan["mount_point"])
 
 
+def udisks_mount_device(device):
+    """Mount a prepared filesystem through udisks2 (strict-snap safe)."""
+    path = device.get("path")
+    if not path:
+        raise ConfigError("No block device path to mount.")
+    if not shutil.which("udisksctl"):
+        raise ConfigError("udisksctl is unavailable inside the snap.")
+    result = subprocess.run(["udisksctl", "mount", "-b", str(path),
+                             "--no-user-interaction"],
+                            capture_output=True, text=True, timeout=60, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise ConfigError(f"Could not mount {path}" + (f": {detail}" if detail else "."))
+    for _attempt in range(10):
+        fresh = next((item for item in attached_drives() if item.get("path") == str(path)), None)
+        if fresh and fresh.get("mountpoints"):
+            return fresh["mountpoints"][0]
+        time.sleep(0.2)
+    match = re.search(r"\bat\s+(/\S+?)\.?\s*$", result.stdout.strip())
+    if match:
+        return match.group(1)
+    raise ConfigError("udisks mounted the device but no mount point was detected.")
+
+
 def _stop_mount_retry():
     """Stop polling once the drive is mounted; the timer re-arms at next login."""
     if SNAP_MODE:
@@ -5053,6 +5077,8 @@ def wizard_drive(mount_point=None, disable=False):
             devices.sort(key=lambda d: not (d["transport"] == "usb" or d["removable"]))
             if not devices:
                 print("No attached block devices detected. Connect a drive and choose rescan.")
+                if SNAP_MODE:
+                    print("If a drive is attached, connect: sudo snap connect ubackup:hardware-observe ubackup:mount-observe")
             for number, device in enumerate(devices, 1):
                 mounts = ", ".join(device["mountpoints"])
                 if not mounts:
@@ -5088,6 +5114,13 @@ def wizard_drive(mount_point=None, disable=False):
             if choice.isdigit() and 1 <= int(choice) <= len(devices):
                 selected = devices[int(choice) - 1]
                 if not selected["mountpoints"]:
+                    if SNAP_MODE:
+                        try:
+                            value = udisks_mount_device(selected)
+                        except (ConfigError, OSError, subprocess.SubprocessError) as exc:
+                            print(str(exc))
+                            continue
+                        break
                     preferred = default_mount_point(selected)
                     entry = fstab_entry(selected["uuid"]) if selected.get("uuid") else None
                     if entry:
@@ -7748,15 +7781,24 @@ def run_tray():
     def show_drive_chooser(_item=None, then_backup=False):
         options = []
         for device in attached_drives():
-            for mountpoint in device.get("mountpoints", []):
-                options.append((f"{mountpoint}  ({device.get('fstype') or 'unknown'}, {device.get('size', 0)} bytes)", mountpoint))
+            mounts = device.get("mountpoints", [])
+            if mounts:
+                for mountpoint in mounts:
+                    options.append((f"{mountpoint}  ({device.get('fstype') or 'unknown'}, {device.get('size', 0)} bytes)",
+                                    mountpoint, None))
+            elif (SNAP_MODE and device.get("fstype") in POSIX_FSTYPES
+                  and device.get("uuid") and device.get("path")):
+                options.append((f"{device['path']} (unmounted {device.get('fstype')}, "
+                                f"{device.get('size', 0)} bytes) — mount with udisks",
+                                device["path"], "mount"))
         dialog = Gtk.Dialog(title="Ubuntu Backup — choose backup drive", flags=Gtk.DialogFlags.MODAL)
         dialog.set_default_size(680, 180)
         dialog.set_keep_above(True)
         dialog.set_position(Gtk.WindowPosition.CENTER)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Forget current drive", 2)
-        dialog.add_button("Prepare new drive", 3)
+        if not SNAP_MODE:
+            dialog.add_button("Prepare new drive", 3)
         dialog.add_button("Use drive", Gtk.ResponseType.OK)
         box = dialog.get_content_area()
         box.set_spacing(8)
@@ -7767,22 +7809,26 @@ def run_tray():
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
             current_text = "configured but unavailable"
         box.add(Gtk.Label(label="Current: " + current_text, xalign=0))
-        box.add(Gtk.Label(label="Select an already-mounted filesystem. No disk is formatted or mounted.", xalign=0))
+        box.add(Gtk.Label(label=("Select a mounted filesystem, or an unmounted Linux filesystem "
+                                 "to mount with udisks. No disk is formatted.") if SNAP_MODE else
+                                 "Select an already-mounted filesystem. No disk is formatted or mounted.",
+                          xalign=0))
         chooser = Gtk.ComboBoxText()
-        for label, _mount in options:
+        for label, _target, _action in options:
             chooser.append_text(label)
         if options:
             chooser.set_active(0)
         else:
-            chooser.append_text("No mounted drives found")
+            chooser.append_text("No drives found — connect hardware-observe/mount-observe and mount the drive"
+                                if SNAP_MODE else "No mounted drives found")
             chooser.set_sensitive(False)
         box.add(chooser)
         box.show_all()
         dialog.present()
         response = dialog.run()
-        selected = options[chooser.get_active()][1] if options and chooser.get_active() >= 0 else None
+        selected = options[chooser.get_active()] if options and chooser.get_active() >= 0 else None
         dialog.destroy()
-        if response == 3:
+        if response == 3 and not SNAP_MODE:
             run_process_window("Prepare drive", lambda: wizard_prepare_drive(),
                                cancellable=False)
             return
@@ -7793,10 +7839,13 @@ def run_tray():
                 if current_status().get("state") != "running":
                     _write_status("idle", "drive", "Backup drive forgotten")
             elif response == Gtk.ResponseType.OK and selected:
-                set_external(selected)
+                _label, target, action = selected
+                if action == "mount":
+                    target = udisks_mount_device({"path": target})
+                set_external(target)
                 drive_cache["at"] = 0
                 if current_status().get("state") != "running":
-                    _write_status("idle", "drive", "Backup drive selected: " + selected)
+                    _write_status("idle", "drive", "Backup drive selected: " + target)
                 if then_backup:
                     GLib.idle_add(lambda: (backup_action(), False)[1])
             else:
@@ -7951,8 +8000,11 @@ def run_tray():
               file=sys.stderr)
         GLib.idle_add(Gtk.main_quit)
 
-    Gio.bus_own_name(Gio.BusType.SESSION, "org.ubuntu.Backup", Gio.BusNameOwnerFlags.NONE,
-                     tray_bus_acquired, tray_name_acquired, tray_name_lost)
+    if not SNAP_MODE:
+        # The optional host-extension service needs a reviewed D-Bus slot. The
+        # stock AppIndicator menu remains fully functional without it.
+        Gio.bus_own_name(Gio.BusType.SESSION, "org.ubuntu.Backup", Gio.BusNameOwnerFlags.NONE,
+                         tray_bus_acquired, tray_name_acquired, tray_name_lost)
 
     provider = None
     try:

@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.3 - 2026-11-13
+- Strict snap: list unmounted Linux filesystems and mount them via udisks2.
+- Remove the Prepare new drive action from the strict GUI; formatting remains deb-only.
+- Keep the stock AppIndicator menu without the optional host-extension D-Bus service.
+
 ## v1.3.2 - 2026-11-13
 - Declare the `org.ubuntu.Backup` session D-Bus slot so the strict snap tray can own its status service; fixes startup on X11/GNOME.
 
