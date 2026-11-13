@@ -9,6 +9,7 @@
 - Keep the GUI tray autostart in the deb (`/etc/xdg/autostart`); the strict snap does not write `~/.config/autostart` or `~/.config/systemd/user`.
 - The system deb adds an XDG autostart entry that launches the strict snap tray only when `ubackup` is installed.
 - Add the `install` target to `native/Makefile` for the Snapcraft make plugin.
+- Publish a signed APT repository for the debs at `https://scripting-drafts.github.io/Ubuntu-Backup/`.
 
 ## v1.1.0 - 2026-11-12
 - Enforce a per-session tray singleton in `$XDG_RUNTIME_DIR/ubuntu-backup/tray.lock` (independent of the workspace), make loss of `org.ubuntu.Backup` fatal, align the desktop launcher with the autostart workspace, and log the selected tray backend.

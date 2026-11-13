@@ -38,6 +38,13 @@ snap install ubackup
 sudo apt install ./ubuntu-backup-system_1.2.0_all.deb
 ```
 
+The debs are also available from the signed APT repository documented in
+[APT-REPO.md](APT-REPO.md):
+
+```bash
+sudo apt install ubuntu-backup-system
+```
+
 Install the `ubuntu-backup` GUI deb only when **not** using the snap; installing
 both creates two tray processes. Use `ubuntu-backup-system` alongside the snap.
 
