@@ -50,6 +50,33 @@ sudo apt install \
 
 ## Installation
 
+### APT repository
+
+Ubuntu Backup is available from the signed APT repository:
+
+```bash
+curl -fsSL https://scripting-drafts.github.io/Ubuntu-Backup/ubuntu-backup-archive-key.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/ubuntu-backup-archive-keyring.gpg
+
+echo 'deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main' \
+  | sudo tee /etc/apt/sources.list.d/ubuntu-backup.list
+
+sudo apt update
+sudo apt install ubuntu-backup
+```
+
+For the strict `ubackup` snap, install the privileged helper instead:
+
+```bash
+sudo apt install ubuntu-backup-system
+```
+
+Do not install the `ubuntu-backup` GUI deb and the snap together; that creates
+two tray processes. The repository key fingerprint is
+`D924602B5792EAFD32146E903DDA7A6E98513F34`.
+
+### Source installer
+
 Clone the repository and run the installer as your regular desktop user. Do **not** run the installer with `sudo`.
 
 ```bash
