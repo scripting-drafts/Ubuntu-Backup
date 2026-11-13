@@ -32,6 +32,9 @@ snap install ubackup
 sudo apt install ./ubuntu-backup-system_1.2.0_all.deb
 ```
 
+Install the `ubuntu-backup` GUI deb only when **not** using the snap; installing
+both creates two tray processes. Use `ubuntu-backup-system` alongside the snap.
+
 Connect the privileged plugs if the store has not auto-connected them:
 
 ```bash
@@ -52,8 +55,11 @@ ubuntu-backup-system capture
 Daily system capture (opt-in, per user):
 
 ```bash
-sudo systemctl enable --now ubuntu-backup-system@$USER.timer
+sudo systemctl enable --now ubuntu-backup-system@$(id -un).timer
 ```
+
+Use the username, not the numeric UID: the unit's `ReadWritePaths=/home/%i`
+resolves a username. Custom home locations need a drop-in.
 
 The GUI tray autostart is owned by the deb
 (`/etc/xdg/autostart/ubuntu-backup-tray.desktop`). A snap-only installation does
