@@ -518,7 +518,7 @@ def collect(owner_uid, accounts=None, system_roots=ROOTS, include_other_users=Fa
 def main(owner_uid=None, workspace=None, include_other_users=False, run_package_scan=True):
     os.umask(0o077)
     if os.geteuid() != 0:
-        raise RuntimeError("Run this helper through pkexec or the ubuntu-backup-system systemd timer.")
+        raise RuntimeError("Run this helper through pkexec or the ubuntu-backup-system request watcher.")
     identity = owner_uid if owner_uid is not None else (
         os.environ.get("SUDO_UID") or os.environ.get("PKEXEC_UID"))
     if identity is None:

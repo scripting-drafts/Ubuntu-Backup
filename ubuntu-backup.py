@@ -4063,9 +4063,8 @@ WantedBy=timers.target
 
 def install_timer():
     if SNAP_MODE:
-        raise ConfigError(
-            "The strict snap cannot write ~/.config/systemd/user. "
-            "Use the ubuntu-backup-system timer for system capture, or start the tray at login.")
+        print("The strict snap has no scheduled timer. System capture is on demand.")
+        return
     directory = HOME / ".config/systemd/user"
     service, timer = systemd_units()
     for suffix in ("service", "timer"):
@@ -4576,9 +4575,8 @@ WantedBy=timers.target
 
 def install_timer():
     if SNAP_MODE:
-        raise ConfigError(
-            "The strict snap cannot write ~/.config/systemd/user. "
-            "Use the ubuntu-backup-system timer for system capture, or start the tray at login.")
+        print("The strict snap has no scheduled timer. System capture is on demand.")
+        return
     installed = HOME / "ubuntu-backup.py"
     if SCRIPT_PATH != installed:
         if installed.exists() and SINGLE_FILE_MARKER not in installed.read_text()[:200]:
@@ -4590,9 +4588,8 @@ def install_timer():
 
 def disable_timer():
     if SNAP_MODE:
-        raise ConfigError(
-            "The strict snap does not own a user systemd timer. "
-            "Disable the ubuntu-backup-system timer with systemctl instead.")
+        print("The strict snap has no scheduled timer; nothing to disable.")
+        return
     path = HOME / ".config/systemd/user" / (UNIT + ".timer")
     if not path.is_file() or path.is_symlink() or MARKER not in path.read_text():
         raise ConfigError("No recognized backup timer to disable.")
@@ -4636,7 +4633,7 @@ def show_status():
                                 capture_output=True, text=True, timeout=10)
         print("Backup timer: " + (result.stdout.strip() or "unavailable"))
     elif SNAP_MODE:
-        print("Backup timer: managed by the snap session/ubuntu-backup-system package")
+        print("Backup timer: not used; system capture is on demand")
     print("Config data and archives are private but NOT encrypted.")
 
 
@@ -5238,10 +5235,9 @@ def retention_value():
 
 def wizard_schedule():
     if SNAP_MODE:
-        print("Scheduled system capture is managed by ubuntu-backup-system.")
-        print("The deb enables ubuntu-backup-system@<user>.timer when installed with sudo.")
-        print("Check on the host: systemctl status ubuntu-backup-system@$(id -un).timer")
-        print("Full /home capture and restore remain explicit deb actions.")
+        print("There is no scheduled system-capture timer.")
+        print("Use the System Capture desktop action or: ubuntu-backup-system capture")
+        print("From the snap: ubackup request-system --action capture")
         return
     print("1. Daily")
     print("2. Weekly")
@@ -5282,7 +5278,7 @@ def menu():
             print("2. Recover user configuration or stage full /home")
             print("3. Verify a snapshot, backup or timeline")
             print("4. Choose/mount backup drive")
-            print("5. Scheduled system capture status")
+            print("5. System capture status (on demand)")
             print("6. Request privileged system capture")
             print("7. Request privileged package scan")
             print("u. Undo restore")

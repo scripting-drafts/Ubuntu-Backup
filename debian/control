@@ -46,5 +46,6 @@ Description: privileged system capture helper for Ubuntu Backup
  the invoking user's Ubuntu Backup workspace. It is intended for the strict
  Ubuntu Backup snap and for the packaged GUI.
  .
- The helper runs only through pkexec or the ubuntu-backup-system@.timer systemd
- timer. It never edits /etc while capturing; restore actions remain explicit.
+ The helper runs only through pkexec or the request watcher. It never edits
+ /etc while capturing; restore actions remain explicit. There is no scheduled
+ root timer; capture is on-demand.

@@ -35,10 +35,6 @@ override_dh_auto_install:
 		debian/ubuntu-backup-system/usr/libexec/ubuntu-backup/ubuntu-backup-system
 	install -Dm755 system/ubuntu-backup-system \
 		debian/ubuntu-backup-system/usr/bin/ubuntu-backup-system
-	install -Dm644 system/ubuntu-backup-system@.service \
-		debian/ubuntu-backup-system/lib/systemd/system/ubuntu-backup-system@.service
-	install -Dm644 system/ubuntu-backup-system@.timer \
-		debian/ubuntu-backup-system/lib/systemd/system/ubuntu-backup-system@.timer
 	install -Dm644 system/org.ubuntu.backup.policy \
 		debian/ubuntu-backup-system/usr/share/polkit-1/actions/org.ubuntu.backup.policy
 	install -Dm644 system/ubuntu-backup-system-capture.desktop \

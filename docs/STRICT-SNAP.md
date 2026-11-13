@@ -8,7 +8,7 @@
 | Component | Runs as | Responsibility |
 |---|---|---|
 | `ubackup` snap | desktop user | tray, user configuration, development environments, external-drive copies, verification |
-| `ubuntu-backup-system` deb | root via systemd/pkexec | `/etc`, package state, full `/home` capture |
+| `ubuntu-backup-system` deb | root via pkexec/request watcher | `/etc`, package state, full `/home` capture |
 | `ubuntu-backup-core` deb | shared | application + native engine used by GUI and system helper |
 
 The deb writes a verified cache into the snap's workspace:
@@ -36,7 +36,7 @@ secure.
 
 ```bash
 snap install ubackup
-sudo apt install ./ubuntu-backup-system_1.3.0_all.deb
+sudo apt install ./ubuntu-backup-system_1.3.1_all.deb
 ```
 
 The debs are also available from the signed APT repository documented in
@@ -71,18 +71,8 @@ Or from a terminal:
 ubuntu-backup-system capture
 ```
 
-Daily system capture is enabled automatically for the user who runs the
-`sudo apt install` (the deb enables `ubuntu-backup-system@<user>.timer`).
-Root-only installs can enable it explicitly:
-
-```bash
-sudo systemctl enable --now ubuntu-backup-system@$(id -un).timer
-```
-
-Use the username, not the numeric UID: the unit's `ReadWritePaths=/home/%i`
-resolves a username. Custom home locations need a drop-in.
-
-On-demand capture and package scan from the snap:
+There is **no scheduled system-capture timer**. Capture and package scan are
+on-demand only. From the snap:
 
 ```bash
 ubackup request-system --action capture

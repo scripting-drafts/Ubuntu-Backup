@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.1 - 2026-11-13
+- Remove `ubuntu-backup-system@.timer` and its automatic enablement.
+- System capture and package scan are now strictly on-demand via `pkexec`,
+  the request watcher, the desktop actions, or the helper CLI.
+- Remove stale timer enablement symlinks on upgrade.
+
 ## v1.3.0 - 2026-11-13
 - Add `ubuntu-backup-core` with the shared application and native engine; the GUI and system helper both depend on it.
 - Auto-enable `ubuntu-backup-system@<sudo-user>.timer` during normal sudo installs; root-only installs still choose explicitly.
