@@ -18,7 +18,7 @@ import tempfile
 MARKER = "# Managed by ubuntu-configuration system capture v1"
 UNIT = "ubuntu-configuration-system"
 HELPER = Path("/usr/libexec/ubuntu-backup/ubuntu-backup-system")
-ROOTS = ("/etc", "/usr/local/etc", "/usr/local/libexec/ubuntu-configuration-system-capture.py")
+ROOTS = ("/etc", "/usr/local/etc")
 MAX_FILE, MAX_TOTAL = 64 * 1024 * 1024, 1024 * 1024 * 1024
 DATA_DIRS = {"cache", "caches", "gpucache", "code cache", "cacheddata", "cachedextensions", "cachedextensionvsixs",
              "crash reports", "crashpad", "logs", "history", "workspacestorage", "globalstorage",
@@ -30,8 +30,13 @@ HISTORIES = {".bash_history", ".python_history", ".scala_history", ".dotty_histo
              ".sudo_as_admin_successful", ".Xauthority", ".ICEauthority", ".DS_Store"}
 
 
-def collect(owner_uid, accounts=None, system_roots=ROOTS):
-    """Pinned descriptors, unlimited depth, no symlinks or nested mounts followed."""
+def collect(owner_uid, accounts=None, system_roots=ROOTS, include_other_users=False):
+    """Pinned descriptors, unlimited depth, no symlinks or nested mounts followed.
+
+    Other users' home directories (including /root) are excluded by default: the
+    capture is written into the invoking user's workspace, so including them
+    would copy third-party secrets across a privilege boundary.
+    """
     files, metadata, links, omissions, excluded = {}, {}, [], [], []
     total = 0
 
@@ -94,8 +99,13 @@ def collect(owner_uid, accounts=None, system_roots=ROOTS):
             os.close(parent)
     chosen = []
     for account in accounts if accounts is not None else pwd.getpwall():
-        if account.pw_uid not in (0, owner_uid) and not (1000 <= account.pw_uid < 65534 and account.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin")):
-            continue
+        if account.pw_uid != owner_uid:
+            if not include_other_users:
+                continue
+            if account.pw_uid not in (0,) and not (
+                    1000 <= account.pw_uid < 65534
+                    and account.pw_shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin")):
+                continue
         home = Path(account.pw_dir)
         if not home.is_dir() or home.is_symlink():
             omissions.append(f"Account {account.pw_uid}: home missing or symlinked")
@@ -132,7 +142,7 @@ def collect(owner_uid, accounts=None, system_roots=ROOTS):
     return files, {"accounts": chosen, "roots": list(system_roots), "omissions": omissions}
 
 
-def main(owner_uid=None, workspace=None):
+def main(owner_uid=None, workspace=None, include_other_users=False):
     os.umask(0o077)
     if os.geteuid() != 0:
         raise RuntimeError("Run this helper through pkexec or the ubuntu-backup-system systemd timer.")
@@ -150,10 +160,11 @@ def main(owner_uid=None, workspace=None):
            else Path(owner.pw_dir) / "Ubuntu-Backup" / "data")
     if Path(owner.pw_dir) not in kit.parents or ".." in kit.parts or kit.is_symlink():
         raise RuntimeError("The private workspace must be inside the backup owner's real home directory.")
-    files, details = collect(owner.pw_uid)
+    files, details = collect(owner.pw_uid, include_other_users=include_other_users)
     captured = dt.datetime.now(dt.timezone.utc).isoformat()
     manifest = {"format": "ubuntu-configuration-v1", "kind": "system-wide-configuration-cache", "created_at": captured,
-                "captured_at": captured, **details,
+                "captured_at": captured, "scope": ("system+owner" if not include_other_users
+                                                   else "system+owner+other-users"), **details,
                 "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                            "executable": False} for name, data in sorted(files.items())]}
     if sum(len(data) for data in files.values()) > MAX_TOTAL or len(json.dumps(manifest).encode()) > MAX_FILE:
@@ -195,7 +206,9 @@ def main(owner_uid=None, workspace=None):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    print(f"Privately captured {len(files)} configuration files across {len(details['accounts'])} accounts (root plus local users); omissions: {len(details['omissions'])}.")
+    print(f"Privately captured {len(files)} configuration files across "
+          f"{len(details['accounts'])} account(s), scope {manifest['scope']}; "
+          f"omissions: {len(details['omissions'])}.")
     print("Cache: " + str(destination / "system-wide.tar.gz"))
     print("The strict snap will include this cache on its next configuration backup. It is NOT encrypted.")
 
@@ -205,9 +218,12 @@ if __name__ == "__main__":
     parser.add_argument("command", nargs="?", choices=("capture",), default="capture")
     parser.add_argument("--owner", help="UID or username that owns the backup workspace")
     parser.add_argument("--workspace", type=Path)
+    parser.add_argument("--include-other-users", action="store_true",
+                        help="also copy other local users' and root's home configuration "
+                             "(privacy-sensitive; off by default)")
     options = parser.parse_args()
     try:
-        main(options.owner, options.workspace)
+        main(options.owner, options.workspace, options.include_other_users)
     except (RuntimeError, OSError, ValueError, KeyError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -19,6 +19,12 @@ The deb writes a verified cache into the snap's workspace:
 The snap reads that cache on the next backup. Root reads, owner writes: the
 helper drops to the invoking user before creating the archive.
 
+By default the helper captures `/etc`, `/usr/local/etc`, and **only the invoking
+user's** home configuration. Other users' homes (including `/root`) are omitted
+to avoid copying third-party secrets across a privilege boundary. Add
+`--include-other-users` to the helper command if an administrator explicitly
+needs them; the option is privacy-sensitive.
+
 ## Install
 
 ```bash
