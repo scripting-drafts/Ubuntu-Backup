@@ -25,6 +25,12 @@ to avoid copying third-party secrets across a privilege boundary. Add
 `--include-other-users` to the helper command if an administrator explicitly
 needs them; the option is privacy-sensitive.
 
+Sensitive root-only paths are also excluded from the cache: shadow/gshadow
+databases, SSH host private keys, TLS private keys, Wi-Fi/NetworkManager
+secrets, VPN secrets, Kerberos keytabs, and APT auth files. The remaining cache
+still contains private configuration; keep the workspace and backup drives
+secure.
+
 ## Install
 
 ```bash

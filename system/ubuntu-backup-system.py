@@ -28,6 +28,17 @@ HOME_PATHS = (".config", ".local/share/applications", ".local/share/fonts", ".lo
               ".gnupg/gpg.conf", ".gnupg/gpg-agent.conf", ".docker/config.json", ".aws/config")
 HISTORIES = {".bash_history", ".python_history", ".scala_history", ".dotty_history", ".lesshst", ".wget-hsts",
              ".sudo_as_admin_successful", ".Xauthority", ".ICEauthority", ".DS_Store"}
+SENSITIVE_PATHS = {
+    "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-",
+    "/etc/security/opasswd", "/etc/krb5.keytab", "/etc/ipsec.secrets",
+    "/etc/apt/auth.conf",
+}
+SENSITIVE_PREFIXES = (
+    "/etc/ssl/private", "/etc/pki/private", "/etc/letsencrypt/archive",
+    "/etc/letsencrypt/live", "/etc/ssh/ssh_host_",
+    "/etc/NetworkManager/system-connections", "/etc/wpa_supplicant",
+    "/etc/openvpn", "/etc/ceph", "/etc/libvirt/secrets",
+)
 
 
 def collect(owner_uid, accounts=None, system_roots=ROOTS, include_other_users=False):
@@ -44,6 +55,10 @@ def collect(owner_uid, accounts=None, system_roots=ROOTS, include_other_users=Fa
         nonlocal total
         if name.lower() in DATA_DIRS:
             excluded.append(prefix)
+            return
+        live = "/" + prefix.removeprefix("system/") if prefix.startswith("system/") else ""
+        if live in SENSITIVE_PATHS or (live and live.startswith(SENSITIVE_PREFIXES)):
+            excluded.append(prefix + " (sensitive; not captured)")
             return
         try:
             info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
