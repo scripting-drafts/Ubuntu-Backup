@@ -7586,8 +7586,31 @@ def run_tray():
     options_menu = Gtk.Menu()
     options_menu.append(drive_option)
     options_menu.append(purge_item)
+    if SNAP_MODE:
+        deb_only = (
+            ("Full /home capture (deb only)",
+             "Only available from ubuntu-backup-system. Run: ubuntu-backup-system home-capture"),
+            ("System configuration restore (deb only)",
+             "Only available from the ubuntu-backup / ubuntu-backup-system .deb packages."),
+            ("Package-file restore (deb only)",
+             "Only available from the ubuntu-backup / ubuntu-backup-system .deb packages."),
+            ("Format a drive (deb only)",
+             "Only available from the .deb packages or Files/Disks. The strict snap cannot format."),
+        )
+        options_menu.append(Gtk.SeparatorMenuItem())
+        for label, hint in deb_only:
+            item = Gtk.MenuItem(label=label)
+            item.set_sensitive(False)
+            item.set_tooltip_text(hint)
+            options_menu.append(item)
     options_item = Gtk.MenuItem(label="Options")
     options_item.set_submenu(options_menu)
+    if SNAP_MODE:
+        options_item.set_tooltip_text(
+            "Greyed actions are available only from the ubuntu-backup .deb packages.")
+        drive_option.set_tooltip_text(
+            "Select a mounted drive or mount an unmounted Linux drive with udisks. "
+            "Formatting is deb-only.")
     menu = Gtk.Menu()
     for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), history_item,
                  restore_option, options_item):
@@ -7797,8 +7820,13 @@ def run_tray():
         dialog.set_position(Gtk.WindowPosition.CENTER)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Forget current drive", 2)
-        if not SNAP_MODE:
-            dialog.add_button("Prepare new drive", 3)
+        prepare_button = dialog.add_button(
+            "Prepare new drive (deb only)" if SNAP_MODE else "Prepare new drive", 3)
+        if SNAP_MODE:
+            prepare_button.set_sensitive(False)
+            prepare_button.set_tooltip_text(
+                "Formatting is only available from the .deb packages or Files/Disks. "
+                "The strict snap cannot format a drive.")
         dialog.add_button("Use drive", Gtk.ResponseType.OK)
         box = dialog.get_content_area()
         box.set_spacing(8)
@@ -7823,6 +7851,13 @@ def run_tray():
                                 if SNAP_MODE else "No mounted drives found")
             chooser.set_sensitive(False)
         box.add(chooser)
+        if SNAP_MODE:
+            note = Gtk.Label(
+                label="Formatting, fstab mounts and system restore are only available "
+                      "from the ubuntu-backup .deb packages.",
+                xalign=0, wrap=True)
+            note.set_max_width_chars(72)
+            box.add(note)
         box.show_all()
         dialog.present()
         response = dialog.run()

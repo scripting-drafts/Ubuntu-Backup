@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.4 - 2026-11-13
+- Grey out deb-only tray and drive actions in the strict snap and add hover explanations.
+- Keep Prepare new drive visible but disabled; formatting remains deb-only.
+
 ## v1.3.3 - 2026-11-13
 - Strict snap: list unmounted Linux filesystems and mount them via udisks2.
 - Remove the Prepare new drive action from the strict GUI; formatting remains deb-only.
