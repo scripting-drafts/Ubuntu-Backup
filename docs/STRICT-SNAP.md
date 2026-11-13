@@ -59,7 +59,13 @@ Connect the privileged plugs if the store has not auto-connected them:
 ```bash
 sudo snap connect ubackup:removable-media
 sudo snap connect ubackup:udisks2
+sudo snap connect ubackup:hardware-observe
+sudo snap connect ubackup:mount-observe
 ```
+
+The last two are required for `lsblk`/`findmnt` enumeration. The strict snap lists
+unmounted Linux filesystems and mounts them through udisks2; formatting remains
+deb-only.
 
 ## Capture
 
