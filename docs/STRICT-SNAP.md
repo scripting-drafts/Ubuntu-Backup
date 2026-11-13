@@ -41,6 +41,10 @@ sudo apt install ./ubuntu-backup-system_1.2.0_all.deb
 Install the `ubuntu-backup` GUI deb only when **not** using the snap; installing
 both creates two tray processes. Use `ubuntu-backup-system` alongside the snap.
 
+The system package also installs
+`/etc/xdg/autostart/ubuntu-backup-snap-tray.desktop`. It starts
+`snap run ubackup tray` at login only when the snap is present.
+
 Connect the privileged plugs if the store has not auto-connected them:
 
 ```bash

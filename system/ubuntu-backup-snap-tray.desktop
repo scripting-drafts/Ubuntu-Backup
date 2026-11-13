@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ubuntu Backup tray
+Comment=Backup status icon (strict snap)
+Exec=/usr/libexec/ubuntu-backup/ubuntu-backup-snap-tray
+Icon=drive-harddisk
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -7,6 +7,7 @@
 - The helper writes `privileged-system/system-wide.tar.gz` into the user's workspace as the user, using the existing verified cache format consumed by `build_snapshot`.
 - The helper captures `/etc`, `/usr/local/etc`, and only the invoking user's home by default; `--include-other-users` is an explicit privacy-sensitive opt-in.
 - Keep the GUI tray autostart in the deb (`/etc/xdg/autostart`); the strict snap does not write `~/.config/autostart` or `~/.config/systemd/user`.
+- The system deb adds an XDG autostart entry that launches the strict snap tray only when `ubackup` is installed.
 - Add the `install` target to `native/Makefile` for the Snapcraft make plugin.
 
 ## v1.1.0 - 2026-11-12
