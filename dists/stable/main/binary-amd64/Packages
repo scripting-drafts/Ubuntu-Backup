@@ -1,14 +1,14 @@
 Package: ubuntu-backup
-Version: 1.3.0
+Version: 1.3.1
 Architecture: all
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
 Installed-Size: 23
-Depends: ubuntu-backup-core (= 1.3.0), python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, libayatana-appindicator3-1, gir1.2-ayatanaappindicator3-0.1
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup_1.3.0_all.deb
-Size: 3598
-MD5sum: 46766e13054a00a3d4a6f4e113002437
-SHA1: 63f30bd3ccc75a509b5046f033cdba8da6103474
-SHA256: 042c3c91541a307aecfd94524da890b98930d658732eeef7114596adee761eb8
+Depends: ubuntu-backup-core (= 1.3.1), python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, libayatana-appindicator3-1, gir1.2-ayatanaappindicator3-0.1
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup_1.3.1_all.deb
+Size: 3706
+MD5sum: 0d667586272b594207f79e0018422463
+SHA1: a2fc21889e9ae3040c99b623e1aa1f6c4d845f24
+SHA256: ac00fc309b7f7ee9e1bb216de7828b2f164fcfb726865ac85989e11a6dbe8435
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
@@ -22,16 +22,16 @@ Description: configuration and full-home backup utility for Ubuntu
 
 Package: ubuntu-backup-core
 Source: ubuntu-backup
-Version: 1.3.0
+Version: 1.3.1
 Architecture: amd64
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
-Installed-Size: 527
+Installed-Size: 526
 Depends: libc6 (>= 2.34), libssl3 (>= 3.0.0~~alpha1), python3
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup-core_1.3.0_amd64.deb
-Size: 107688
-MD5sum: 047467a04305525ba49bcad3891a411c
-SHA1: 5d06648f08a0d688d0c44e6347124b72bcd429c2
-SHA256: f482ae4da160fac481d52e30dbc741b66db84f36ece0031fbee4dedbdc37e9f0
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup-core_1.3.1_amd64.deb
+Size: 107684
+MD5sum: 1c32d0183ee7ae371309311690f6e615
+SHA1: c6d6ee144fe030dcdfc97c74c244a3c8758839b9
+SHA256: 3a12a75ae1b745d211501a8e613c39eae748b855f85dcf4531e48ed1ede1a82e
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
@@ -42,17 +42,17 @@ Description: shared application and native core for Ubuntu Backup
 
 Package: ubuntu-backup-system
 Source: ubuntu-backup
-Version: 1.3.0
+Version: 1.3.1
 Architecture: all
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
-Installed-Size: 69
-Depends: ubuntu-backup-core (= 1.3.0), init-system-helpers (>= 1.52), python3, pkexec | policykit-1
+Installed-Size: 65
+Depends: ubuntu-backup-core (= 1.3.1), init-system-helpers (>= 1.52), python3, pkexec | policykit-1
 Suggests: ubuntu-backup
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup-system_1.3.0_all.deb
-Size: 13148
-MD5sum: dae102af24365322365915fdcaa19eae
-SHA1: 63980df3c71e47d13878d288e0423e729a9c5c64
-SHA256: 85f8e646b8e2e9756edfaa13315deb96a3986170c874523c392dd5375a19aeed
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup-system_1.3.1_all.deb
+Size: 12834
+MD5sum: af42bc76219082ee993d33e50b05d1f2
+SHA1: ce374185f7c56e28ae2a4cb014e921e5bb433263
+SHA256: c513f58a9ee52531be61e8c7ff82be21260d35635e44417c594df4bbcbe9dff6
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
@@ -61,6 +61,7 @@ Description: privileged system capture helper for Ubuntu Backup
  the invoking user's Ubuntu Backup workspace. It is intended for the strict
  Ubuntu Backup snap and for the packaged GUI.
  .
- The helper runs only through pkexec or the ubuntu-backup-system@.timer systemd
- timer. It never edits /etc while capturing; restore actions remain explicit.
+ The helper runs only through pkexec or the request watcher. It never edits
+ /etc while capturing; restore actions remain explicit. There is no scheduled
+ root timer; capture is on-demand.
 
