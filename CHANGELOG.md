@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.5 - 2026-11-13
+- Explain missing snap interface connections when a mounted drive is unreadable.
+- Stage canberra-gtk3-module to silence the cosmetic GTK warning.
+
 ## v1.3.4 - 2026-11-13
 - Grey out deb-only tray and drive actions in the strict snap and add hover explanations.
 - Keep Prepare new drive visible but disabled; formatting remains deb-only.

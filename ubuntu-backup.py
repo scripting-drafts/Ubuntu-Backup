@@ -3551,9 +3551,15 @@ def set_external(mount_point, disable=False):
                 try:
                     entries = list(directory.iterdir())
                 except OSError as exc:
+                    hint = ""
+                    if SNAP_MODE:
+                        hint = ("Connect the snap interfaces first: "
+                                "sudo snap connect ubackup:removable-media && "
+                                "sudo snap connect ubackup:udisks2. ")
                     raise ConfigError(
-                        "Cannot inspect the mounted backup directory. "
-                        f"Take ownership first: sudo chown {os.geteuid()}:{os.getegid()} {directory} "
+                        "Cannot inspect the mounted backup directory. " + hint +
+                        f"If the mount root is genuinely root-owned: "
+                        f"sudo chown {os.geteuid()}:{os.getegid()} {directory} "
                         f"({exc})") from None
             # A freshly formatted ext4 root normally contains only lost+found.
             adoptable = all(entry.name == "lost+found" and entry.is_dir() and not entry.is_symlink()

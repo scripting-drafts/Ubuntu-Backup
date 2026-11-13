@@ -1,3 +1,10 @@
+ubuntu-backup (1.3.5) jammy; urgency=medium
+
+  * Align the deb packages with the strict snap 1.3.5 UI and drive handling.
+  * Explain missing snap interface connections in the shared app.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Fri, 13 Nov 2026 22:20:00 +0100
+
 ubuntu-backup (1.3.1) jammy; urgency=medium
 
   * Remove the ubuntu-backup-system@.timer and its automatic enablement.
