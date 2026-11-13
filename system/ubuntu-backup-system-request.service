@@ -1,0 +1,6 @@
+[Unit]
+Description=Process an Ubuntu Backup privileged request
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pkexec /usr/libexec/ubuntu-backup/ubuntu-backup-system process-request --request %h/Ubuntu-Backup/data/system/requests/request.json

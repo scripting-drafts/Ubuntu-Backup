@@ -7,9 +7,19 @@ Standards-Version: 4.6.2
 Rules-Requires-Root: no
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
 
-Package: ubuntu-backup
+Package: ubuntu-backup-core
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends},
+ python3
+Description: shared application and native core for Ubuntu Backup
+ Provides the main Ubuntu Backup application, the privileged-worker entry
+ points, and the native full-/home engine used by both the GUI and the system
+ helper packages.
+
+Package: ubuntu-backup
+Architecture: all
+Depends: ubuntu-backup-core (= ${binary:Version}),
+ ${misc:Depends},
  python3,
  python3-gi,
  python3-gi-cairo,
@@ -26,8 +36,10 @@ Description: configuration and full-home backup utility for Ubuntu
 
 Package: ubuntu-backup-system
 Architecture: all
-Depends: ${misc:Depends},
- python3
+Depends: ubuntu-backup-core (= ${binary:Version}),
+ ${misc:Depends},
+ python3,
+ pkexec | policykit-1
 Suggests: ubuntu-backup
 Description: privileged system capture helper for Ubuntu Backup
  Captures root-owned and other-user configuration into a verified cache inside

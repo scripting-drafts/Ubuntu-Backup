@@ -9,6 +9,22 @@ if [ "$1" = configure ]; then
         rm -f "$old_autostart"
     fi
     systemctl daemon-reload >/dev/null 2>&1 || true
+    # Enable the daily capture for the user who invoked apt/sudo. Root-only
+    # installs still need an explicit user choice.
+    owner="${SUDO_USER:-}"
+    if [ -z "$owner" ] && [ -n "${PKEXEC_UID:-}" ]; then
+        owner="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f1)"
+    fi
+    if [ -z "$owner" ] || [ "$owner" = root ]; then
+        for home in /home/*; do
+            [ -d "$home/Ubuntu-Backup/data" ] || continue
+            owner="${home##*/}"
+            break
+        done
+    fi
+    if [ -n "$owner" ] && [ "$owner" != root ]; then
+        systemctl enable --now "ubuntu-backup-system@$owner.timer" >/dev/null 2>&1 || true
+    fi
 fi
 
 #DEBHELPER#

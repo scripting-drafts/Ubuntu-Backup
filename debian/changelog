@@ -1,3 +1,12 @@
+ubuntu-backup (1.3.0) jammy; urgency=medium
+
+  * Add ubuntu-backup-core (shared app + native engine) used by GUI and system helper.
+  * Auto-enable the daily system-capture timer for the installing sudo user.
+  * Add package-file scan, request queue, and full /home capture helper actions.
+  * Keep system restore, package restore, fstab and formatting explicitly deb-only.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Fri, 13 Nov 2026 19:15:00 +0100
+
 ubuntu-backup (1.2.1) jammy; urgency=medium
 
   * Move tray autostart into the strict snap via snapd's autostart key and a

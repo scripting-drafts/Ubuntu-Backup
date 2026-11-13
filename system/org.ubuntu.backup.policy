@@ -7,8 +7,8 @@
   <vendor_url>https://github.com/scripting-drafts/Ubuntu-Backup</vendor_url>
 
   <action id="org.ubuntu.backup.capture">
-    <description>Capture system-wide configuration</description>
-    <message>Authentication is required to capture system-wide configuration for Ubuntu Backup.</message>
+    <description>Perform a privileged Ubuntu Backup operation</description>
+    <message>Authentication is required for Ubuntu Backup to read or restore system data.</message>
     <defaults>
       <allow_active>auth_admin_keep</allow_active>
       <allow_inactive>auth_admin_keep</allow_inactive>

@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.3.0 - 2026-11-13
+- Add `ubuntu-backup-core` with the shared application and native engine; the GUI and system helper both depend on it.
+- Auto-enable `ubuntu-backup-system@<sudo-user>.timer` during normal sudo installs; root-only installs still choose explicitly.
+- Add package-file scanning to the helper and run it during system capture.
+- Add a fixed-schema request queue (`capture`, `package-scan`), a globally enabled user path unit, and `pkexec` processing.
+- Add `home-capture` to the helper and a desktop action; it uses the shared app/native engine.
+- Make the strict snap UI configuration-only and remove formatting, package restore, system restore and deploy from its recovery/menu paths (deb-only, explicit).
+- Keep `request-system` and `capture-root` as request commands in the snap.
+
 ## v1.2.1 - 2026-11-13
 - Move tray autostart into the strict snap using snapd's `autostart:` key; the app writes `$SNAP_USER_DATA/.config/autostart/ubuntu-backup.desktop` on first run.
 - Remove the deb-side strict-snap tray wrapper and XDG autostart. The GUI deb keeps its own `/etc/xdg/autostart/ubuntu-backup-tray.desktop`.

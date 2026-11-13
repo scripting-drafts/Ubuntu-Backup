@@ -3835,6 +3835,11 @@ def package_drift(snapshot, status):
 
 
 def deploy(args):
+    if SNAP_MODE and (args.packages or args.snaps or args.flatpaks
+                      or args.desktop_settings or args.build):
+        raise ConfigError(
+            "Package, snap, flatpak, desktop and build deployment are deb-only; "
+            "the strict snap only deploys user files.")
     source = Path(args.snapshot).expanduser().resolve() if args.snapshot else default_snapshot()
     manifest = verify_tree(source)
     records = [record for record in manifest["files"] if record["path"].startswith("home/")]
@@ -4782,6 +4787,35 @@ def is_full_home(path):
 
 
 def wizard_recover(source=None):
+    if SNAP_MODE:
+        choice = choose("Recovery", (
+            ("1", "Recover user configuration (stage; no system/package changes)"),
+            ("2", "Stage full /home (never changes live /home)"),
+        ), "1")
+        if choice == "0":
+            return
+        if choice == "1":
+            if source is not None:
+                path = source
+            else:
+                found = recovery_choices("config")
+                if not found:
+                    raise ConfigError("No configuration backup or timeline was found.")
+                path = found[0][0]
+                print("Using latest configuration backup: " + str(path))
+            if is_full_home(path):
+                restore_home(path)
+                return
+            destination = restore(path)
+            print("User configuration staged at: " + str(destination))
+            print("System configuration, packages, fstab and disk changes are deb-only; nothing system-wide was applied.")
+            return
+        if choice == "2":
+            path = source or choose_archive("home")
+            if path is not None:
+                restore_home(path)
+            return
+        raise ConfigError("Choose one of the listed recovery actions.")
     choice = choose("Recovery", (
         ("1", "Recover configuration (stage a backup, then optionally deploy)"),
         ("2", "Recover full /home (stage only; live /home is never changed)"),
@@ -5032,7 +5066,8 @@ def wizard_drive(mount_point=None, disable=False):
                       f"UUID {device['uuid'] or 'none'}) — {mounts}")
             print("s. Skip external backup for now; keep previous target")
             print("r. Rescan after connecting a drive   p. Enter an already-mounted path")
-            print("f. Format a new removable/USB drive (ERASES ALL DATA)")
+            if not SNAP_MODE:
+                print("f. Format a new removable/USB drive (ERASES ALL DATA)")
             print("d. Disable/forget saved target (separate confirmation)")
             choice = ask("Choice", "s").lower()
             if choice in ("", "s", "0"):
@@ -5041,6 +5076,9 @@ def wizard_drive(mount_point=None, disable=False):
             if choice == "r":
                 continue
             if choice == "f":
+                if SNAP_MODE:
+                    print("Formatting is deb-only; use Files/Disks. Nothing was changed.")
+                    continue
                 if wizard_prepare_drive():
                     return True
                 continue
@@ -5106,6 +5144,10 @@ def interactive_backup(package_scan=True):
 
 def backup_everything(refresh_package_scan=True):
     """Single flow: privileged configuration, configuration backup, full /home."""
+    if SNAP_MODE:
+        # The strict snap only owns user-space configuration. System capture is
+        # refreshed by the deb helper; full /home is an explicit deb action.
+        return backup()
     global _STATUS_RUN, _LAST_HOME_WARNINGS
     try:
         signal.signal(signal.SIGTERM, signal.default_int_handler)
@@ -5196,9 +5238,11 @@ def retention_value():
 
 def wizard_schedule():
     if SNAP_MODE:
-        raise ConfigError(
-            "The strict snap has no user systemd timer. "
-            "Use the ubuntu-backup-system timer for system capture, or start the tray at login.")
+        print("Scheduled system capture is managed by ubuntu-backup-system.")
+        print("The deb enables ubuntu-backup-system@<user>.timer when installed with sudo.")
+        print("Check on the host: systemctl status ubuntu-backup-system@$(id -un).timer")
+        print("Full /home capture and restore remain explicit deb actions.")
+        return
     print("1. Daily")
     print("2. Weekly")
     print("3. Disable automatic backups")
@@ -5232,21 +5276,33 @@ def wizard_schedule():
 def menu():
     while True:
         print()
-        print("Ubuntu backup — configuration and full /home")
-        print("1. Back up this machine now (configuration and full /home)")
-        print("2. Full recovery (configuration or full /home)")
-        print("3. Verify a snapshot, backup or timeline")
-        print("4. Choose backup drive (or leave unset)")
-        print("5. Automatic backup and privileged-capture schedule")
-        print("6. Format a new backup drive (ERASES ALL DATA)")
-        print("u. Undo restore")
-        print("0. Exit")
+        if SNAP_MODE:
+            print("Ubuntu backup — strict snap (user configuration)")
+            print("1. Back up configuration now (system cache when available)")
+            print("2. Recover user configuration or stage full /home")
+            print("3. Verify a snapshot, backup or timeline")
+            print("4. Choose/mount backup drive")
+            print("5. Scheduled system capture status")
+            print("6. Request privileged system capture")
+            print("7. Request privileged package scan")
+            print("u. Undo restore")
+            print("0. Exit")
+        else:
+            print("Ubuntu backup — configuration and full /home")
+            print("1. Back up this machine now (configuration and full /home)")
+            print("2. Full recovery (configuration or full /home)")
+            print("3. Verify a snapshot, backup or timeline")
+            print("4. Choose backup drive (or leave unset)")
+            print("5. Automatic backup and privileged-capture schedule")
+            print("6. Format a new backup drive (ERASES ALL DATA)")
+            print("u. Undo restore")
+            print("0. Exit")
         choice = ask("Choice", "0").lower()
         try:
             if choice == "0":
                 return
             if choice == "1":
-                backup_everything()
+                backup() if SNAP_MODE else backup_everything()
             elif choice == "2":
                 wizard_recover()
             elif choice == "3":
@@ -5256,7 +5312,12 @@ def menu():
             elif choice == "5":
                 wizard_schedule()
             elif choice == "6":
-                wizard_prepare_drive()
+                if SNAP_MODE:
+                    request_system("capture")
+                else:
+                    wizard_prepare_drive()
+            elif choice == "7" and SNAP_MODE:
+                request_system("package-scan")
             elif choice == "u":
                 wizard_undo_restore()
             else:
@@ -5264,6 +5325,26 @@ def menu():
         except (ConfigError, OSError, ValueError, KeyError, TypeError, tarfile.TarError,
                 EOFError, RuntimeError, subprocess.CalledProcessError) as exc:
             print(f"Action failed: {exc}", file=sys.stderr)
+
+
+def request_system(action):
+    """Write a fixed-schema request for the deb helper; never executes it."""
+    if not SNAP_MODE:
+        raise ConfigError("Privileged requests are only used by the strict snap.")
+    if action not in ("capture", "package-scan"):
+        raise ConfigError("Unsupported privileged request action.")
+    spool = HOME / "Ubuntu-Backup" / "data" / "system" / "requests"
+    mkdir(spool)
+    write_json(spool / "request.json", {
+        "format": "ubuntu-backup-request-v1",
+        "action": action,
+        "owner": os.geteuid(),
+        "workspace": str(KIT.absolute()),
+        "requested_at": timestamp(),
+    })
+    print(f"Requested privileged {action.replace('-', ' ')}.")
+    print("The ubuntu-backup-system watcher should ask for administrator approval.")
+    print("If no prompt appears, install ubuntu-backup-system or use its desktop action.")
 
 
 def install_snap_autostart():
@@ -5323,7 +5404,9 @@ def main():
     descriptions = {
         "menu": "Open the interactive menu (default)", "backup": "Capture a verified backup",
         "status": "Show workspace, drive and scheduler status",
-        "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
+        "capture-root": "Capture system-wide configuration using sudo",
+        "request-system": "Ask ubuntu-backup-system to capture or package-scan",
+        "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
         "backup-now": "Run the combined backup in this terminal",
         "recover": "Restore configuration or full /home (interactive)",
@@ -5339,6 +5422,8 @@ def main():
         help="Also offer non-removable internal disks (requires an INTERNAL confirmation)")
     commands.choices["mount-saved"].add_argument("--check", action="store_true", help="Report state only; mount nothing")
     commands.choices["mount-saved"].add_argument("--quiet", action="store_true", help="Silence the routine no-op states")
+    commands.choices["request-system"].add_argument(
+        "--action", choices=("capture", "package-scan"), default="capture")
     worker = commands.add_parser("_capture-root-worker")
     worker.add_argument("--install-system-timer", action="store_true")
     worker.add_argument("--replace-user-timer", action="store_true")
@@ -5462,7 +5547,10 @@ def main():
         else:
             restore_package_files(args.snapshot, args.apply, args.package, args.path, args.force)
     elif command == "capture-package-files":
-        capture_root_package_scan(non_interactive=not interactive, force=args.force)
+        if SNAP_MODE:
+            request_system("package-scan")
+        else:
+            capture_root_package_scan(non_interactive=not interactive, force=args.force)
     elif command == "tray":
         return run_tray()
     elif command == "backup-now":
@@ -5485,8 +5573,12 @@ def main():
         else:
             deploy(args)  # --apply is an explicit noninteractive choice; default remains a dry run.
     elif command == "capture-root":
-        if not interactive or confirm("Use sudo to read the two whitelisted system references?"):
+        if SNAP_MODE:
+            request_system("capture")
+        elif not interactive or confirm("Use sudo to read the two whitelisted system references?"):
             capture_root(not interactive)
+    elif command == "request-system":
+        request_system(args.action)
     elif command == "disable-timer":
         if not interactive or confirm("Disable the backup timer, retaining all archives?"):
             disable_timer()

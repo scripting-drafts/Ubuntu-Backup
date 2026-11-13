@@ -13,14 +13,15 @@ override_dh_auto_test:
 	$(MAKE) -C native test
 
 override_dh_auto_install:
+	# Shared app + native core (used by GUI and system helper).
 	install -Dm755 ubuntu-backup.py \
-		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubuntu-backup.py
+		debian/ubuntu-backup-core/usr/lib/ubuntu-backup/ubuntu-backup.py
 	install -Dm755 ubuntu-backup-askpass.py \
-		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubuntu-backup-askpass
+		debian/ubuntu-backup-core/usr/lib/ubuntu-backup/ubuntu-backup-askpass
 	install -Dm755 ubuntu-backup-askpass.py \
-		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubuntu-backup-askpass.py
+		debian/ubuntu-backup-core/usr/lib/ubuntu-backup/ubuntu-backup-askpass.py
 	install -Dm755 native/ubackup-core \
-		debian/ubuntu-backup/usr/lib/ubuntu-backup/ubackup-core
+		debian/ubuntu-backup-core/usr/lib/ubuntu-backup/ubackup-core
 	install -Dm755 debian/ubuntu-backup-wrapper \
 		debian/ubuntu-backup/usr/bin/ubuntu-backup
 	install -Dm644 debian/ubuntu-backup.desktop \
@@ -42,3 +43,12 @@ override_dh_auto_install:
 		debian/ubuntu-backup-system/usr/share/polkit-1/actions/org.ubuntu.backup.policy
 	install -Dm644 system/ubuntu-backup-system-capture.desktop \
 		debian/ubuntu-backup-system/usr/share/applications/ubuntu-backup-system-capture.desktop
+	install -Dm644 system/ubuntu-backup-system-home-capture.desktop \
+		debian/ubuntu-backup-system/usr/share/applications/ubuntu-backup-system-home-capture.desktop
+	install -Dm644 system/ubuntu-backup-system-request.path \
+		debian/ubuntu-backup-system/usr/lib/systemd/user/ubuntu-backup-system-request.path
+	install -Dm644 system/ubuntu-backup-system-request.service \
+		debian/ubuntu-backup-system/usr/lib/systemd/user/ubuntu-backup-system-request.service
+	install -d debian/ubuntu-backup-system/etc/systemd/user/default.target.wants
+	ln -sf /usr/lib/systemd/user/ubuntu-backup-system-request.path \
+		debian/ubuntu-backup-system/etc/systemd/user/default.target.wants/ubuntu-backup-system-request.path

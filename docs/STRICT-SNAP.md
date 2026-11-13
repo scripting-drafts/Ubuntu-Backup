@@ -8,7 +8,8 @@
 | Component | Runs as | Responsibility |
 |---|---|---|
 | `ubackup` snap | desktop user | tray, user configuration, development environments, external-drive copies, verification |
-| `ubuntu-backup-system` deb | root via systemd/pkexec | `/etc`, other users' dotfiles, package state, full `/home`, system restore |
+| `ubuntu-backup-system` deb | root via systemd/pkexec | `/etc`, package state, full `/home` capture |
+| `ubuntu-backup-core` deb | shared | application + native engine used by GUI and system helper |
 
 The deb writes a verified cache into the snap's workspace:
 
@@ -35,7 +36,7 @@ secure.
 
 ```bash
 snap install ubackup
-sudo apt install ./ubuntu-backup-system_1.2.1_all.deb
+sudo apt install ./ubuntu-backup-system_1.3.0_all.deb
 ```
 
 The debs are also available from the signed APT repository documented in
@@ -70,7 +71,9 @@ Or from a terminal:
 ubuntu-backup-system capture
 ```
 
-Daily system capture (opt-in, per user):
+Daily system capture is enabled automatically for the user who runs the
+`sudo apt install` (the deb enables `ubuntu-backup-system@<user>.timer`).
+Root-only installs can enable it explicitly:
 
 ```bash
 sudo systemctl enable --now ubuntu-backup-system@$(id -un).timer
@@ -78,6 +81,23 @@ sudo systemctl enable --now ubuntu-backup-system@$(id -un).timer
 
 Use the username, not the numeric UID: the unit's `ReadWritePaths=/home/%i`
 resolves a username. Custom home locations need a drop-in.
+
+On-demand capture and package scan from the snap:
+
+```bash
+ubackup request-system --action capture
+ubackup request-system --action package-scan
+```
+
+This writes a fixed request file; the deb's user path unit asks for
+administrator approval through `pkexec`, then runs the helper. Full `/home`
+capture is an explicit deb action:
+
+```bash
+ubuntu-backup-system home-capture
+```
+
+or **Ubuntu Backup — Full /home Capture** from the application menu.
 
 The strict snap owns its tray autostart through snapd. The separate
 `ubuntu-backup` GUI deb keeps its own
@@ -89,10 +109,10 @@ two trays.
 - The strict snap does not capture dotfiles or `/etc` itself; install the deb
   for system-wide coverage. Without it, the snapshot records an explicit
   `SYSTEM-WIDE COVERAGE INCOMPLETE` warning.
-- Full `/home` capture/restore, package-file restore, fstab/boot mounts, and
-  drive formatting are deb-only operations. The snap reports this rather than
-  invoking a privileged command.
-- The helper's systemd unit uses `ReadWritePaths=/home`; custom home locations
-  outside `/home` need a unit drop-in.
+- Full `/home` **restore**, package-file restore, system `/etc` restore,
+  fstab/boot mounts, and drive formatting are explicit deb-only operations.
+  The strict snap UI does not offer them.
+- The helper's systemd unit uses `ReadWritePaths=/home/%i`; custom home
+  locations outside `/home` need a unit drop-in.
 - `ubuntu-backup-system` is a Debian/Ubuntu artifact. Other distributions get
   the user-space snap only.

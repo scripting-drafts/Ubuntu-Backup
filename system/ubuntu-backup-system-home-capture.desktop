@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Ubuntu Backup — Full /home Capture
+Comment=Capture the full /home tree with administrator approval (requires a configured backup drive)
+Exec=pkexec /usr/libexec/ubuntu-backup/ubuntu-backup-system home-capture
+Icon=drive-harddisk
+Terminal=true
+Categories=System;
+Keywords=backup;home;capture;
+StartupNotify=true
