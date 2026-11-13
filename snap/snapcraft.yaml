@@ -1,7 +1,7 @@
 name: ubackup
 title: Ubuntu Backup
 base: core22
-version: '1.2.0'
+version: '1.2.1'
 
 summary: Back up Ubuntu configuration, development environments and home data
 
@@ -34,6 +34,7 @@ apps:
   ubackup:
     command: bin/ubuntu-backup-launcher
     desktop: share/applications/ubuntu-backup.desktop
+    autostart: ubuntu-backup.desktop
     plugs:
       - home
       - desktop

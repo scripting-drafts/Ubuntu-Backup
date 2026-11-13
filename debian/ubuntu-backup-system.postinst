@@ -2,6 +2,12 @@
 set -e
 
 if [ "$1" = configure ]; then
+    # 1.2.1 moved strict-snap autostart into snapd. Remove the obsolete
+    # package-managed XDG entry, including on same-version reinstall.
+    old_autostart=/etc/xdg/autostart/ubuntu-backup-snap-tray.desktop
+    if [ -f "$old_autostart" ] && grep -q 'ubuntu-backup-snap-tray' "$old_autostart" 2>/dev/null; then
+        rm -f "$old_autostart"
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 

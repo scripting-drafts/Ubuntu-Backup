@@ -1,0 +1,1 @@
+rm_conffile /etc/xdg/autostart/ubuntu-backup-snap-tray.desktop 1.2.1

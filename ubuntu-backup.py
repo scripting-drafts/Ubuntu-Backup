@@ -5266,6 +5266,35 @@ def menu():
             print(f"Action failed: {exc}", file=sys.stderr)
 
 
+def install_snap_autostart():
+    """Install the per-user snap autostart file when running in the snap.
+
+    It lives in $SNAP_USER_DATA, never in the host's ~/.config/autostart, so it
+    stays inside strict confinement. snapd's user session agent reads it and
+    launches the app wrapper with the Exec= arguments (``tray``).
+    """
+    if not SNAP_MODE:
+        return
+    user_data = os.environ.get("SNAP_USER_DATA")
+    if not user_data:
+        return
+    path = Path(user_data) / ".config/autostart/ubuntu-backup.desktop"
+    if path.is_symlink() or path.exists():
+        return
+    content = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Ubuntu Backup\n"
+        "Comment=Backup status icon\n"
+        "Exec=ubackup tray\n"
+        "Icon=ubuntu-backup\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+    mkdir(path.parent)
+    write(path, content)
+
+
 def preferred_workspace():
     parent = SCRIPT_PATH.parent
     if (parent / "config/settings.json").is_file() or (parent.parent / "manifest.json").is_file():
@@ -5399,6 +5428,7 @@ def main():
         print("Snapshots may contain secrets; they are NOT encrypted.")
         workspace = Path(ask("Private workspace folder", str(workspace)))
     private_workspace(workspace)
+    install_snap_autostart()
     if command in ("mount-saved", "unmount-saved"):
         state = (mount_saved(check=args.check, quiet=args.quiet) if command == "mount-saved"
                  else unmount_saved())

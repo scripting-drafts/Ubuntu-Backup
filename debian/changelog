@@ -1,3 +1,12 @@
+ubuntu-backup (1.2.1) jammy; urgency=medium
+
+  * Move tray autostart into the strict snap via snapd's autostart key and a
+    per-user desktop file in $SNAP_USER_DATA.
+  * Remove the deb-side strict-snap tray autostart and wrapper.
+  * Keep the GUI deb's own /etc/xdg/autostart entry.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Fri, 13 Nov 2026 18:30:00 +0100
+
 ubuntu-backup (1.2.0) jammy; urgency=medium
 
   * Add a strict-confinement snap that runs entirely as the desktop user.

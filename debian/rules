@@ -42,7 +42,3 @@ override_dh_auto_install:
 		debian/ubuntu-backup-system/usr/share/polkit-1/actions/org.ubuntu.backup.policy
 	install -Dm644 system/ubuntu-backup-system-capture.desktop \
 		debian/ubuntu-backup-system/usr/share/applications/ubuntu-backup-system-capture.desktop
-	install -Dm755 system/ubuntu-backup-snap-tray \
-		debian/ubuntu-backup-system/usr/libexec/ubuntu-backup/ubuntu-backup-snap-tray
-	install -Dm644 system/ubuntu-backup-snap-tray.desktop \
-		debian/ubuntu-backup-system/etc/xdg/autostart/ubuntu-backup-snap-tray.desktop

@@ -35,7 +35,7 @@ secure.
 
 ```bash
 snap install ubackup
-sudo apt install ./ubuntu-backup-system_1.2.0_all.deb
+sudo apt install ./ubuntu-backup-system_1.2.1_all.deb
 ```
 
 The debs are also available from the signed APT repository documented in
@@ -48,9 +48,10 @@ sudo apt install ubuntu-backup-system
 Install the `ubuntu-backup` GUI deb only when **not** using the snap; installing
 both creates two tray processes. Use `ubuntu-backup-system` alongside the snap.
 
-The system package also installs
-`/etc/xdg/autostart/ubuntu-backup-snap-tray.desktop`. It starts
-`snap run ubackup tray` at login only when the snap is present.
+The strict snap declares `autostart: ubuntu-backup.desktop` and creates
+`$SNAP_USER_DATA/.config/autostart/ubuntu-backup.desktop` on first run. snapd's
+user session agent starts `ubackup tray` at login. It never writes the host's
+`~/.config/autostart` and is removed with the snap.
 
 Connect the privileged plugs if the store has not auto-connected them:
 
@@ -78,9 +79,10 @@ sudo systemctl enable --now ubuntu-backup-system@$(id -un).timer
 Use the username, not the numeric UID: the unit's `ReadWritePaths=/home/%i`
 resolves a username. Custom home locations need a drop-in.
 
-The GUI tray autostart is owned by the deb
-(`/etc/xdg/autostart/ubuntu-backup-tray.desktop`). A snap-only installation does
-not write `~/.config/autostart`; start the tray from the application menu.
+The strict snap owns its tray autostart through snapd. The separate
+`ubuntu-backup` GUI deb keeps its own
+`/etc/xdg/autostart/ubuntu-backup-tray.desktop`; install only one GUI to avoid
+two trays.
 
 ## Boundaries and limitations
 

@@ -46,6 +46,7 @@
 !debian/ubuntu-backup-autostart.desktop
 !debian/ubuntu-backup-system.postinst
 !debian/ubuntu-backup-system.postrm
+!debian/ubuntu-backup-system.maintscript
 !system/
 !system/*
 !docs/STRICT-SNAP.md

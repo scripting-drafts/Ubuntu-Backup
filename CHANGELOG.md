@@ -1,13 +1,18 @@
 # Changelog
 
+## v1.2.1 - 2026-11-13
+- Move tray autostart into the strict snap using snapd's `autostart:` key; the app writes `$SNAP_USER_DATA/.config/autostart/ubuntu-backup.desktop` on first run.
+- Remove the deb-side strict-snap tray wrapper and XDG autostart. The GUI deb keeps its own `/etc/xdg/autostart/ubuntu-backup-tray.desktop`.
+- Bump the snap and deb version to 1.2.1.
+
 ## v1.2.0 - 2026-11-13
 - Publish `ubackup` as a strict-confinement snap (no classic request) with `home`, `removable-media`, `udisks2`, and desktop/Mount-Observe plugs.
 - Snapshot mode disables every `sudo`/`pkexec` path, host package queries, user systemd timers, fstab edits, and raw-disk formatting.
 - Add the `ubuntu-backup-system` deb: root capture helper, `ubuntu-backup-system@.timer`, polkit action, and System Capture desktop entry. The deb owns its own files; the helper never self-installs into `/usr/local/libexec` or `/etc/systemd/system`.
 - The helper writes `privileged-system/system-wide.tar.gz` into the user's workspace as the user, using the existing verified cache format consumed by `build_snapshot`.
 - The helper captures `/etc`, `/usr/local/etc`, and only the invoking user's home by default; `--include-other-users` is an explicit privacy-sensitive opt-in.
-- Keep the GUI tray autostart in the deb (`/etc/xdg/autostart`); the strict snap does not write `~/.config/autostart` or `~/.config/systemd/user`.
-- The system deb adds an XDG autostart entry that launches the strict snap tray only when `ubackup` is installed.
+- Declare snapd autostart for `ubackup` and create the per-user file in `$SNAP_USER_DATA/.config/autostart`; the strict snap never writes the host's `~/.config/autostart` or `~/.config/systemd/user`.
+- Remove the deb-side strict-snap tray autostart; the GUI deb keeps its own `/etc/xdg/autostart` entry.
 - Add the `install` target to `native/Makefile` for the Snapcraft make plugin.
 - Publish a signed APT repository for the debs at `https://scripting-drafts.github.io/Ubuntu-Backup/`.
 
