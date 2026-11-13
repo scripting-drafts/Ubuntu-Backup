@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Ubuntu Backup APT repository</title></head>
+<body>
+<h1>Ubuntu Backup APT repository</h1>
+<p>Signed <code>stable</code> repository for the Ubuntu Backup debs.</p>
+<pre>
+curl -fsSL https://scripting-drafts.github.io/Ubuntu-Backup/ubuntu-backup-archive-key.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/ubuntu-backup-archive-keyring.gpg
+echo 'deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main' \
+  | sudo tee /etc/apt/sources.list.d/ubuntu-backup.list
+sudo apt update
+sudo apt install ubuntu-backup-system
+</pre>
+<p>Key fingerprint: <code>D924602B5792EAFD32146E903DDA7A6E98513F34</code></p>
+<p><a href="README.md">README</a></p>
+</body>
+</html>

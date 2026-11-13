@@ -1,0 +1,3 @@
+Ubuntu Backup APT repository
+
+deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main

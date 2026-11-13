@@ -1,0 +1,20 @@
+Architectures: amd64
+Codename: stable
+Components: main
+Date: Fri, 13 Nov 2026 17:16:29 +0000
+Description: Ubuntu Backup APT repository
+Label: Ubuntu Backup
+Origin: Ubuntu Backup
+Suite: stable
+MD5Sum:
+ 889caec7afcfd891651ec47f74cf0dc6             2033 main/binary-amd64/Packages
+ 0e94c00e1e95a5181e7759437a36dc60             1045 main/binary-amd64/Packages.gz
+SHA1:
+ e489d119ebe6f0ee7e0bd3bc836519f78211204e             2033 main/binary-amd64/Packages
+ e7781bcfff6382c339414e609974ca4837c03ecb             1045 main/binary-amd64/Packages.gz
+SHA256:
+ d9d32af243323fd194226a689bb07a1ff466c1c7a35cb3db6b0ea7d4c32c228a             2033 main/binary-amd64/Packages
+ ef668eed0b98c1b91cb3d699f515400fdda1cb928c618c84bb28946a2f3caf2c             1045 main/binary-amd64/Packages.gz
+SHA512:
+ 4f46ae615ed296e5d34cac99b1d3a57e09a9391a9d44778249b07c5bcf030aeca8cf95ba38cda61f5f85cefbfc2070de972b6ca653eb5934b427ab7dfe146064             2033 main/binary-amd64/Packages
+ 8d45cc769b37c455baaa084d69e33e73bf9c112baeac757132130b40527fd20bbc4669a64d2d744e9495e47c5c815b22604429fe64d6c386f2d86531ecad5349             1045 main/binary-amd64/Packages.gz
