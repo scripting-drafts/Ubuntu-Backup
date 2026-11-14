@@ -156,7 +156,13 @@ The local workspace is normally created at:
 
 ```text
 ~/Ubuntu-Backup/data/
+  snapshot/    last verified configuration snapshot
+  backups/     local dated backups
+  restored/    staged configuration and full-/home restores
 ```
+
+Staged restores are written under `~/Ubuntu-Backup/data/restored/`; they are
+review copies and are never applied over a live `/home`.
 
 Keep the workspace's settings, snapshots/timelines, and rollback journals together. Do not manually move or edit individual timeline components unless you understand the storage layout.
 

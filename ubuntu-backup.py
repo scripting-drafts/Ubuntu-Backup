@@ -4442,7 +4442,8 @@ def show_status():
     config = settings()
     support = release_support()
     release = " ".join(value for value in (support.get("version"), support.get("name")) if value)
-    print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots\n"
+    print(f"Workspace: {KIT}\nStaged restores: {KIT / 'restored'}\n"
+          f"Retention: {config['keep_snapshots']} snapshots\n"
           f"Ubuntu: {release or 'unknown'} "
           f"({'supported' if support.get('supported') else 'outside tested range'})")
     try:
