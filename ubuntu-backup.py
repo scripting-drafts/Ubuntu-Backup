@@ -5457,19 +5457,31 @@ def main():
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     descriptions = {
         "menu": "Open the interactive menu (default)",
-        "backup": "Capture a verified backup (full /home is APT-only)",
+        "backup": "Capture a verified backup",
         "status": "Show workspace, drive and scheduler status",
-        "capture-root": "Request system-wide capture (requires .deb helper)",
-        "request-system": "Request a .deb helper action (requires ubuntu-backup-system)",
-        "disable-timer": "Not used by the strict snap; no timer exists",
+        "capture-root": "Capture system-wide configuration using sudo",
+        "request-system": "Ask ubuntu-backup-system to capture or package-scan",
+        "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
-        "backup-now": "Run the combined backup in this terminal (full /home is APT-only)",
-        "recover": "Restore user configuration or stage full /home (system restore is APT-only)",
-        "choose-drive": "Select/mount a backup drive (format/boot mount is APT-only)",
-        "prepare-drive": "Format a drive as ext4 (APT-only; not available in the strict snap)",
-        "mount-saved": "Mount the fstab-declared drive (fstab is APT-only; udisks works in snap)",
+        "backup-now": "Run the combined backup in this terminal",
+        "recover": "Restore configuration or full /home (interactive)",
+        "choose-drive": "Select a backup drive; can add a boot mount",
+        "prepare-drive": "Format a drive as ext4 and select it; internal disks need --allow-internal",
+        "mount-saved": "Mount the fstab-declared backup drive and verify its on-disk marker",
         "unmount-saved": "Unmount the marked backup drive; keeps the boot entry",
     }
+    if SNAP_MODE:
+        descriptions.update({
+            "backup": "Capture a verified backup (full /home is APT-only)",
+            "capture-root": "Request system-wide capture (requires .deb helper)",
+            "request-system": "Request a .deb helper action (requires ubuntu-backup-system)",
+            "disable-timer": "Not used by the strict snap; no timer exists",
+            "backup-now": "Run the combined backup in this terminal (full /home is APT-only)",
+            "recover": "Restore user configuration or stage full /home (system restore is APT-only)",
+            "choose-drive": "Select/mount a backup drive (format/boot mount is APT-only)",
+            "prepare-drive": "Format a drive as ext4 (APT-only; not available in the strict snap)",
+            "mount-saved": "Mount the fstab-declared drive (fstab is APT-only; udisks works in snap)",
+        })
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
     commands.choices["prepare-drive"].add_argument(
@@ -5488,7 +5500,9 @@ def main():
     worker.add_argument("--plan", required=True, type=Path)
     worker = commands.add_parser("_capture-package-files-worker")
     sub = commands.add_parser("restore-package-files",
-                              help="Restore modified package files in place (APT only)")
+                              help=("Restore modified package files in place (APT only)"
+                                    if SNAP_MODE else
+                                    "Review or restore captured modified package files in place"))
     sub.add_argument("snapshot", nargs="?", type=Path)
     sub.add_argument("--apply", action="store_true", help="Write in place using sudo; default is a dry run")
     sub.add_argument("--package", action="append", default=[], help="Restore only this package (repeatable)")
@@ -5499,12 +5513,16 @@ def main():
     sub.add_argument("--wizard", action="store_true",
                      help="Review interactively in a terminal before applying")
     sub = commands.add_parser("capture-package-files",
-                              help="Capture modified package files (requires .deb helper)")
+                              help=("Capture modified package files (requires .deb helper)"
+                                    if SNAP_MODE else
+                                    "Capture modified package files using sudo"))
     sub.add_argument("--force", action="store_true",
                      help="Run a fresh scan even if a recent cache exists")
     sub = commands.add_parser("restore-home", help="Stage a full /home linked snapshot into a private folder; no live changes")
     sub.add_argument("timeline", nargs="?", type=Path)
-    sub = commands.add_parser("install-timer", help="Enable unattended backups (not used by strict snap)")
+    sub = commands.add_parser("install-timer", help=(
+        "Enable unattended backups (not used by strict snap)"
+        if SNAP_MODE else "Enable daily/weekly unattended backups"))
     sub.add_argument("--calendar", choices=("daily", "weekly"))
     for command in ("verify", "restore"):
         sub = commands.add_parser(command, help="Verify a snapshot/archive" if command == "verify" else "Recover into a new directory")
@@ -5517,19 +5535,23 @@ def main():
     group.add_argument("--archive", type=Path)
     sub = commands.add_parser("undo-restore", help="Review and undo unchanged steps from a selective restore")
     sub.add_argument("journal", nargs="?", type=Path)
-    sub = commands.add_parser("set-external", help="Choose a backup drive; boot mount is APT-only")
+    sub = commands.add_parser("set-external", help=(
+        "Choose a backup drive; boot mount is APT-only"
+        if SNAP_MODE else "Choose a backup drive; can add a boot mount, never formats disks"))
     sub.add_argument("mount_point", nargs="?")
     sub.add_argument("--disable", action="store_true")
-    sub = commands.add_parser("deploy", help="Preview/apply a saved configuration (package/snap/desktop options are APT-only)")
+    sub = commands.add_parser("deploy", help=(
+        "Preview/apply a saved configuration (package/snap/desktop options are APT-only)"
+        if SNAP_MODE else "Preview/apply a saved configuration; dry-run by default"))
     sub.add_argument("--snapshot")
     deploy_help = {
         "apply": "Apply the reviewed plan",
         "overwrite": "Replace conflicting home files",
-        "packages": "Install APT packages (APT only)",
-        "snaps": "Install snap apps (APT only)",
-        "flatpaks": "Install flatpaks (APT only)",
-        "desktop-settings": "Import desktop settings (APT only)",
-        "build": "Rebuild captured binaries (APT only)",
+        "packages": "Install APT packages" + (" (APT only)" if SNAP_MODE else ""),
+        "snaps": "Install snap apps" + (" (APT only)" if SNAP_MODE else ""),
+        "flatpaks": "Install flatpaks" + (" (APT only)" if SNAP_MODE else ""),
+        "desktop-settings": "Import desktop settings" + (" (APT only)" if SNAP_MODE else ""),
+        "build": "Rebuild captured binaries" + (" (APT only)" if SNAP_MODE else ""),
     }
     for option in ("apply", "overwrite", "packages", "snaps", "flatpaks", "desktop-settings", "build"):
         sub.add_argument("--" + option, action="store_true", help=deploy_help[option])
