@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for Ubuntu Backup privileged requests
+
+[Path]
+PathExists=%h/Ubuntu-Backup/data/system/requests/request.json
+Unit=ubuntu-backup-system-request.service
+
+[Install]
+WantedBy=default.target

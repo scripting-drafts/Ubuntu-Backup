@@ -38,6 +38,9 @@ HOME = Path.home()
 FORMAT = "ubuntu-configuration-v1"
 UNIT = "ubuntu-configuration-backup"
 MARKER = "# Managed by ubuntu-configuration v1"
+DEB_REPO_URL = "https://github.com/scripting-drafts/Ubuntu-Backup#apt-repository"
+APT_ONLY_HINT = "Only available from the ubuntu-backup .deb packages. " + DEB_REPO_URL
+APT_HELPER_HINT = ("Requires the ubuntu-backup-system .deb package. " + DEB_REPO_URL)
 WORKSPACE_README = '# Ubuntu configuration and backup\n\n- Live tool: `~/ubuntu-backup.py` (private, self-contained, not encrypted).\n- Workspace: keep its settings, snapshots/timelines and rollback journals.\n- Run `./ubuntu-backup.py` for the menu; `./ubuntu-backup.py --help` shows full docs.\n- One backup action captures configuration, development code and full `/home`; identical files are stored once.\n- Each development change records its time, content version and package/library references; reapply follows dependency order and never pins versions.\n- Full recovery stages configuration or full `/home`; live `/home` is never overwritten.\n- External copies use dated symlink timelines over shared baselines.\n- Full `/home` capture is manual, external-drive only, requires sudo approval, and is not auto-pruned.\n- Snapshots contain secrets and are not encrypted. Do not publish them.\n'
 ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
@@ -82,6 +85,44 @@ KIT_FILES = ("README.md", ".gitignore", "backup.sh", "deploy.sh", "restore.sh",
 
 class ConfigError(Exception):
     pass
+
+
+# Strict-confinement mode. The snap is published without classic confinement and
+# must never invoke sudo/pkexec or write outside its declared interfaces.
+SNAP_MODE = bool(os.environ.get("SNAP"))
+_SNAP_PRIVILEGED_EXECUTABLES = {"sudo", "pkexec"}
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+_ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+
+
+def _snap_command_is_privileged(command):
+    if not SNAP_MODE or isinstance(command, (str, bytes)) or not command:
+        return False
+    try:
+        return Path(str(command[0])).name in _SNAP_PRIVILEGED_EXECUTABLES
+    except (TypeError, ValueError):
+        return False
+
+
+def _snap_guard_run(command, *args, **kwargs):
+    if _snap_command_is_privileged(command):
+        raise ConfigError(
+            "This action needs the ubuntu-backup-system package; the strict snap "
+            "cannot run sudo or pkexec. Install the helper and use its System Capture action.")
+    return _ORIGINAL_SUBPROCESS_RUN(command, *args, **kwargs)
+
+
+def _snap_guard_popen(command, *args, **kwargs):
+    if _snap_command_is_privileged(command):
+        raise ConfigError(
+            "This action needs the ubuntu-backup-system package; the strict snap "
+            "cannot run sudo or pkexec. Install the helper and use its System Capture action.")
+    return _ORIGINAL_SUBPROCESS_POPEN(command, *args, **kwargs)
+
+
+if SNAP_MODE:
+    subprocess.run = _snap_guard_run
+    subprocess.Popen = _snap_guard_popen
 
 
 def timestamp():
@@ -273,7 +314,11 @@ def regular_files(root):
 
 def read_os_release():
     result = {}
-    for line in Path("/etc/os-release").read_text().splitlines():
+    try:
+        lines = Path("/etc/os-release").read_text().splitlines()
+    except OSError:
+        return result
+    for line in lines:
         if "=" in line and not line.startswith("#"):
             key, value = line.split("=", 1)
             result[key] = value.strip('"')
@@ -375,6 +420,10 @@ def capture_command(args, report, timeout=45, empty_codes=()):
                                 env=environment, errors="replace")
     except subprocess.TimeoutExpired:
         report["warnings"].append(f"{args[0]} inventory timed out")
+        return ""
+    except OSError:
+        # A strict snap can see host executables on PATH but AppArmor denies exec.
+        report["unavailable_commands"].append(args[0])
         return ""
     if result.returncode in empty_codes:
         return ""
@@ -933,6 +982,8 @@ def wizard_restore_package_files(source=None):
 
 def restore_package_files(snapshot=None, apply=False, packages=None, paths=None, force=False):
     """Review or restore captured modified package files in place."""
+    if SNAP_MODE:
+        raise ConfigError("Package-file restore: " + APT_ONLY_HINT)
     source = Path(snapshot).expanduser().resolve() if snapshot else latest_config_snapshot()
     verify_path(source)
     manifest_path = source / "inventory/package-integrity.json"
@@ -1327,6 +1378,9 @@ def package_scan_summary():
 
 def capture_root_package_scan(non_interactive=False, force=False):
     """Run the privileged package-file scan through sudo."""
+    if SNAP_MODE:
+        print("Package-file scanning: " + APT_HELPER_HINT)
+        return False
     age = privileged_package_scan_age()
     if not force and age is not None and age <= (10 / 60):
         print("Using the privileged package scan from the last 10 minutes.")
@@ -1346,8 +1400,46 @@ def capture_root_package_scan(non_interactive=False, force=False):
     return True
 
 
+def collect_inventory_snap(destination, config, report):
+    """Minimal user-space inventory for the strict snap.
+
+    Host package/APT/service queries are intentionally skipped: the confined snap
+    cannot read /var/lib/dpkg, /var/log/apt, or execute host tools. The privileged
+    ubuntu-backup-system helper captures those separately into the workspace cache.
+    """
+    mkdir(destination)
+    os_info = read_os_release()
+    support = release_support(os_info)
+    write_json(destination / "hardware.json", hardware_inventory())
+    write_json(destination / "source-system.json", {
+        "os": os_info, "release_support": support,
+        "hostname": socket.gethostname(), "home": str(HOME),
+        "desktop": os.environ.get("XDG_CURRENT_DESKTOP", "unknown"),
+        "architecture": os.uname().machine,
+    })
+    tools = ("docker", "kubectl", "kind", "clusterctl", "helm", "python3", "node", "npm",
+             "dotnet", "java", "gcc", "code", "opencode", "tailscale", "wg", "nvidia-smi")
+    write_json(destination / "tool-paths.json", {tool: shutil.which(tool) for tool in tools})
+    write_json(destination / "inventory-mode.json", {
+        "mode": "strict-snap",
+        "host_package_inventory": False,
+        "privileged_cache": str(KIT / "privileged-system/system-wide.tar.gz"),
+    })
+    report["unavailable_commands"].extend(
+        ["dpkg", "apt-mark", "apt-cache", "snap", "flatpak", "systemctl"])
+    report["warnings"].append(
+        "Strict snap: host package/service inventory is unavailable; "
+        "install ubuntu-backup-system and run its System Capture action for root-owned configuration.")
+    # The base snap always reports core22; the host release comes from the helper
+    # cache, so do not raise a misleading "outside tested range" warning here.
+    report["snap_runtime"] = {"base": "core22", "host_release_from": "ubuntu-backup-system"}
+    return None
+
+
 def collect_inventory(destination, config, report):
     mkdir(destination)
+    if SNAP_MODE:
+        return collect_inventory_snap(destination, config, report)
     write_json(destination / "hardware.json", hardware_inventory())
     native_arch = capture_command(["dpkg", "--print-architecture"], report).strip()
     commands = {
@@ -2272,7 +2364,7 @@ def saved_package_names(source):
 def build_snapshot(destination, config):
     config = dict(config)
     config["exclude"] = sorted(set(config.get("exclude", []) + development_exclusions()))
-    if config.get("coverage") == "system-wide-configuration":
+    if config.get("coverage") == "system-wide-configuration" and not SNAP_MODE:
         config["home_include"] = sorted(set(config["home_include"] + configuration_home_paths(HOME)))
     # Development checkouts are captured as code, not inferred from installed packages.
     config["home_include"] = sorted(set(config["home_include"] + detect_development_roots(HOME, config)))
@@ -2280,7 +2372,15 @@ def build_snapshot(destination, config):
         # Children of a selected directory are already recursive. Avoid duplicate reads/copies.
         config["home_include"] = [name for name in config["home_include"] if not any(
             name.startswith(parent + "/") for parent in config["home_include"] if parent != name and "*" not in parent)]
-        config["system_reference_only"] = list(SYSTEM_CONFIG_ROOTS)
+        if not SNAP_MODE:
+            config["system_reference_only"] = list(SYSTEM_CONFIG_ROOTS)
+    if SNAP_MODE:
+        # The home interface excludes dotfiles; the privileged helper cache carries
+        # those. Never hand hidden paths to the confined copier.
+        config["home_include"] = [name for name in config["home_include"] if not name.startswith(".")]
+        config["home_reference_only"] = [name for name in config.get("home_reference_only", [])
+                                         if not name.startswith(".")]
+        config["system_reference_only"] = []
     report = {"warnings": [], "unavailable_commands": [], "symlinks_not_followed": [],
               "unreadable_files": [], "bytes_captured": 0}
     collect_inventory(destination / "inventory", config, report)
@@ -2324,7 +2424,10 @@ def build_snapshot(destination, config):
             report["warnings"].append("SYSTEM-WIDE COVERAGE INCOMPLETE: cache is stale or records omissions.")
     elif config.get("coverage") == "system-wide-configuration":
         report["system_wide_coverage"] = {"complete": False, "reason": "No privileged system-wide capture; other users/root-only files are missing."}
-        report["warnings"].append("SYSTEM-WIDE COVERAGE INCOMPLETE: use the confirmed sudo system-wide capture/scheduler.")
+        report["warnings"].append(
+            "SYSTEM-WIDE COVERAGE INCOMPLETE: install ubuntu-backup-system and run its "
+            "System Capture action." if SNAP_MODE else
+            "SYSTEM-WIDE COVERAGE INCOMPLETE: use the confirmed sudo system-wide capture/scheduler.")
     cache_manifest = KIT / "privileged-system/manifest.json"
     if cache_manifest.exists() and not wide_cache.exists():
         cached = json.loads(cache_manifest.read_text())
@@ -3048,6 +3151,10 @@ def mount_plan(device, mount_point=None):
 
 def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
     """Mount a prepared Linux filesystem at boot and give it to the current user."""
+    if SNAP_MODE:
+        raise ConfigError(
+            "Boot/fstab mounts are APT-only; ad-hoc mounts use udisks. "
+            + APT_ONLY_HINT)
     plan = mount_plan(device, mount_point)
     if not sys.stdin.isatty():
         raise ConfigError("Mounting needs one sudo prompt; run './ubuntu-backup.py choose-drive' in a terminal.")
@@ -3090,8 +3197,34 @@ def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
     return str(plan["mount_point"])
 
 
+def udisks_mount_device(device):
+    """Mount a prepared filesystem through udisks2 (strict-snap safe)."""
+    path = device.get("path")
+    if not path:
+        raise ConfigError("No block device path to mount.")
+    if not shutil.which("udisksctl"):
+        raise ConfigError("udisksctl is unavailable inside the snap.")
+    result = subprocess.run(["udisksctl", "mount", "-b", str(path),
+                             "--no-user-interaction"],
+                            capture_output=True, text=True, timeout=60, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise ConfigError(f"Could not mount {path}" + (f": {detail}" if detail else "."))
+    for _attempt in range(10):
+        fresh = next((item for item in attached_drives() if item.get("path") == str(path)), None)
+        if fresh and fresh.get("mountpoints"):
+            return fresh["mountpoints"][0]
+        time.sleep(0.2)
+    match = re.search(r"\bat\s+(/\S+?)\.?\s*$", result.stdout.strip())
+    if match:
+        return match.group(1)
+    raise ConfigError("udisks mounted the device but no mount point was detected.")
+
+
 def _stop_mount_retry():
     """Stop polling once the drive is mounted; the timer re-arms at next login."""
+    if SNAP_MODE:
+        return
     subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
 
 
@@ -3140,6 +3273,16 @@ def mount_saved(check=False, quiet=False):
                     return "mounted"
                 time.sleep(0.25)
         return "failed"
+
+    if SNAP_MODE:
+        fallback = mount_by_label()
+        if fallback is not None:
+            return fallback
+        if check or not quiet:
+            print("Strict snap: no mounted backup marker; mount the drive first "
+                  "(Files/Disks or udisks), then retry. fstab/boot mounts are APT-only. "
+                  + APT_ONLY_HINT)
+        return "absent"
 
     entries = [entry for entry in fstab_entries() if entry["managed"]]
     if not entries:
@@ -3199,8 +3342,9 @@ def unmount_saved():
         raise ConfigError("More than one mounted filesystem carries a backup marker ("
                           + ", ".join(str(item["directory"]) for item in drives) + "); unmount them explicitly.")
     directory, filesystem_uuid = drives[0]["directory"], drives[0]["uuid"]
-    subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.service"], check=False)
-    subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
+    if not SNAP_MODE:
+        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.service"], check=False)
+        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "ubuntu-backup-mount.timer"], check=False)
     os.sync()
     result = None
     if filesystem_uuid:
@@ -3409,9 +3553,15 @@ def set_external(mount_point, disable=False):
                 try:
                     entries = list(directory.iterdir())
                 except OSError as exc:
+                    hint = ""
+                    if SNAP_MODE:
+                        hint = ("Connect the snap interfaces first: "
+                                "sudo snap connect ubackup:removable-media && "
+                                "sudo snap connect ubackup:udisks2. ")
                     raise ConfigError(
-                        "Cannot inspect the mounted backup directory. "
-                        f"Take ownership first: sudo chown {os.geteuid()}:{os.getegid()} {directory} "
+                        "Cannot inspect the mounted backup directory. " + hint +
+                        f"If the mount root is genuinely root-owned: "
+                        f"sudo chown {os.geteuid()}:{os.getegid()} {directory} "
                         f"({exc})") from None
             # A freshly formatted ext4 root normally contains only lost+found.
             adoptable = all(entry.name == "lost+found" and entry.is_dir() and not entry.is_symlink()
@@ -3454,7 +3604,7 @@ def set_external(mount_point, disable=False):
     write_json(KIT / "config/settings.json", config)
     print("External backup disabled; existing drive data was not removed." if disable else
           "Backup drive configured at its root. No disk was formatted; the next backup will also copy there.")
-    if not disable:
+    if not disable and not SNAP_MODE:
         stale = [entry for entry in fstab_entries()
                  if entry["managed"] and entry["uuid"] and entry["uuid"] != information["uuid"]]
         for entry in stale:
@@ -3537,7 +3687,14 @@ def _backup_impl(skip_external=False, package_scan=True):
             _check_cancel()
             report = build_snapshot(stage, config)
             _check_cancel()
-            _LAST_BACKUP_WARNINGS = len(report.get("unreadable_files", []))
+            unreadable = report.get("unreadable_files", [])
+            if SNAP_MODE:
+                # Non-owned files under $HOME are a strict-confinement limitation,
+                # not a user-actionable backup warning. Keep them in the report,
+                # but do not mark the tray icon or exit status as warning.
+                unreadable = [entry for entry in unreadable
+                              if entry.get("uid") in (None, os.geteuid())]
+            _LAST_BACKUP_WARNINGS = len(unreadable)
             verify_tree(stage)
             keep_local = bool(config.get("keep_local_backups", False))
             external_enabled = not skip_external and config["external_backup"] is not None
@@ -3567,6 +3724,13 @@ def _backup_impl(skip_external=False, package_scan=True):
             if _LAST_BACKUP_WARNINGS:
                 print(f"Unreadable paths: {_LAST_BACKUP_WARNINGS} "
                       "(see inventory/unreadable-files.json)")
+            if SNAP_MODE and (not report.get("system_wide_coverage", {}).get("complete")
+                              or "privileged_package_scan" not in report):
+                print("System-wide capture and package scanning are only available "
+                      "from the ubuntu-backup-system .deb package.")
+                print("Install it with: sudo apt install ubuntu-backup-system")
+                print("Then capture with: ubuntu-backup-system capture")
+                print("APT instructions: " + DEB_REPO_URL)
             if skip_external:
                 print("External copy skipped for this run; saved target was not changed.")
             elif config["external_backup"] is None:
@@ -3717,6 +3881,11 @@ def package_drift(snapshot, status):
 
 
 def deploy(args):
+    if SNAP_MODE and (args.packages or args.snaps or args.flatpaks
+                      or args.desktop_settings or args.build):
+        raise ConfigError(
+            "Package, snap, flatpak, desktop and build deployment are APT-only; "
+            "the strict snap only deploys user files. " + APT_ONLY_HINT)
     source = Path(args.snapshot).expanduser().resolve() if args.snapshot else default_snapshot()
     manifest = verify_tree(source)
     records = [record for record in manifest["files"] if record["path"].startswith("home/")]
@@ -3939,6 +4108,9 @@ WantedBy=timers.target
 
 
 def install_timer():
+    if SNAP_MODE:
+        print("The strict snap has no scheduled timer. System capture is on demand.")
+        return
     directory = HOME / ".config/systemd/user"
     service, timer = systemd_units()
     for suffix in ("service", "timer"):
@@ -4212,6 +4384,8 @@ def system_integration_inventory():
 
 def capture_system_integration(destination):
     """Store managed timer/service/helper contents plus state for recovery."""
+    if SNAP_MODE:
+        return
     data = system_integration_inventory()
     for item in data["items"]:
         if not item.get("present"):
@@ -4238,6 +4412,8 @@ def capture_system_integration(destination):
 
 def restore_system_integration(snapshot):
     """Reinstall and synchronize captured system timer/helper; requires sudo."""
+    if SNAP_MODE:
+        raise ConfigError("System timer/helper restore: " + APT_ONLY_HINT)
     snapshot = Path(snapshot)
     metadata = snapshot / "inventory/system-integration.json"
     if metadata.is_file():
@@ -4308,7 +4484,8 @@ def build_snapshot(destination, config):
     except ValueError:
         pass
     report = _original_build_snapshot(destination, selected)
-    capture_system_integration(destination)
+    if not SNAP_MODE:
+        capture_system_integration(destination)
     write(destination / "kit" / SCRIPT_PATH.name, SCRIPT_PATH.read_bytes(), executable=True)
     refresh_manifest(destination)
     return report
@@ -4357,6 +4534,11 @@ def default_snapshot():
 
 def capture_root(non_interactive=False, install=False, replace_user_timer=False,
                  hide_followup_hint=False, package_scan=True):
+    if SNAP_MODE:
+        print("System-wide capture: " + APT_HELPER_HINT)
+        print("Install it and use the “Ubuntu Backup — System Capture” action; "
+              "the next strict-snap backup will include its cache.")
+        return None
     print("System-wide configuration and local accounts' settings will be read, including sensitive configuration.")
     command = ["sudo"] + (["-n"] if non_interactive else [])
     command += ["/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT), "_capture-root-worker"]
@@ -4391,13 +4573,28 @@ def systemd_units():
     calendar = settings().get("backup_calendar", "daily")
     if calendar not in ("daily", "weekly"):
         raise ConfigError("Backup calendar must be daily or weekly.")
+    if os.environ.get("SNAP"):
+        command = (
+            f"/snap/bin/{os.environ.get('SNAP_INSTANCE_NAME', 'ubackup')} "
+            f"--workspace {quote(KIT)} --non-interactive backup"
+        )
+    elif installed := shutil.which("ubuntu-backup"):
+        command = (
+            f"{quote(installed)} --workspace {quote(KIT)} "
+            f"--non-interactive backup"
+        )
+    else:
+        command = (
+            f"/usr/bin/python3 -I {quote(HOME / 'ubuntu-backup.py')} "
+            f"--workspace {quote(KIT)} --non-interactive backup"
+        )
     service = f"""{MARKER}
 [Unit]
 Description=Private Ubuntu configuration snapshot (single-file kit)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -I {quote(HOME / 'ubuntu-backup.py')} --workspace {quote(KIT)} --non-interactive backup
+ExecStart={command}
 SuccessExitStatus=3
 UMask=0077
 Nice=10
@@ -4421,6 +4618,9 @@ WantedBy=timers.target
 
 
 def install_timer():
+    if SNAP_MODE:
+        print("The strict snap has no scheduled timer. System capture is on demand.")
+        return
     installed = HOME / "ubuntu-backup.py"
     if SCRIPT_PATH != installed:
         if installed.exists() and SINGLE_FILE_MARKER not in installed.read_text()[:200]:
@@ -4431,6 +4631,9 @@ def install_timer():
 
 
 def disable_timer():
+    if SNAP_MODE:
+        print("The strict snap has no scheduled timer; nothing to disable.")
+        return
     path = HOME / ".config/systemd/user" / (UNIT + ".timer")
     if not path.is_file() or path.is_symlink() or MARKER not in path.read_text():
         raise ConfigError("No recognized backup timer to disable.")
@@ -4440,11 +4643,16 @@ def disable_timer():
 
 def show_status():
     config = settings()
-    support = release_support()
-    release = " ".join(value for value in (support.get("version"), support.get("name")) if value)
-    print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots\n"
-          f"Ubuntu: {release or 'unknown'} "
-          f"({'supported' if support.get('supported') else 'outside tested range'})")
+    if SNAP_MODE:
+        ubuntu_line = ("Ubuntu: snap runtime base "
+                       "(host release is captured by ubuntu-backup-system)")
+    else:
+        support = release_support()
+        release = " ".join(value for value in (support.get("version"), support.get("name")) if value)
+        ubuntu_line = (f"Ubuntu: {release or 'unknown'} "
+                       f"({'supported' if support.get('supported') else 'outside tested range'})")
+    print(f"Workspace: {KIT}\nStaged restores: {KIT / 'restored'}\n"
+          f"Retention: {config['keep_snapshots']} snapshots\n{ubuntu_line}")
     try:
         print("Full /home engine: " + str(native_core_path()))
     except ConfigError as exc:
@@ -4465,10 +4673,12 @@ def show_status():
         homes = directory / "timeline/home"
         print(f"External configuration timelines: {len(list(configuration.iterdir())) if configuration.is_dir() else 0}; "
               f"full /home timelines: {len(list(homes.iterdir())) if homes.is_dir() else 0}")
-    if shutil.which("systemctl"):
+    if shutil.which("systemctl") and not SNAP_MODE:
         result = subprocess.run(["systemctl", "--user", "is-enabled", UNIT + ".timer"],
                                 capture_output=True, text=True, timeout=10)
         print("Backup timer: " + (result.stdout.strip() or "unavailable"))
+    elif SNAP_MODE:
+        print("Backup timer: not used; system capture is on demand")
     print("Config data and archives are private but NOT encrypted.")
 
 
@@ -4619,6 +4829,39 @@ def is_full_home(path):
 
 
 def wizard_recover(source=None):
+    if SNAP_MODE:
+        choice = choose("Recovery", (
+            ("1", "Recover user configuration (stage; no system/package changes)",
+             "Warning: system-wide capture, package files, fstab and disk changes are APT-only. "
+             + DEB_REPO_URL),
+            ("2", "Stage full /home (never changes live /home)",
+             "Warning: live full /home restore and root capture are APT-only. "
+             + DEB_REPO_URL),
+        ), "1")
+        if choice == "0":
+            return
+        if choice == "1":
+            if source is not None:
+                path = source
+            else:
+                found = recovery_choices("config")
+                if not found:
+                    raise ConfigError("No configuration backup or timeline was found.")
+                path = found[0][0]
+                print("Using latest configuration backup: " + str(path))
+            if is_full_home(path):
+                restore_home(path)
+                return
+            destination = restore(path)
+            print("User configuration staged at: " + str(destination))
+            print("System configuration, packages, fstab and disk changes are deb-only; nothing system-wide was applied.")
+            return
+        if choice == "2":
+            path = source or choose_archive("home")
+            if path is not None:
+                restore_home(path)
+            return
+        raise ConfigError("Choose one of the listed recovery actions.")
     choice = choose("Recovery", (
         ("1", "Recover configuration (stage a backup, then optionally deploy)"),
         ("2", "Recover full /home (stage only; live /home is never changed)"),
@@ -4720,6 +4963,9 @@ def _format_candidates(include_internal=False):
 
 def format_drive(device_path, allow_internal=False, assume_yes=False):
     """Format one explicitly selected whole disk as ext4, never a partition."""
+    if SNAP_MODE:
+        raise ConfigError(
+            "Formatting is APT-only, or use Files/Disks. " + APT_ONLY_HINT)
     if not sys.stdin.isatty():
         raise ConfigError("Formatting needs an interactive terminal.")
     path = Path(device_path)
@@ -4855,6 +5101,8 @@ def wizard_drive(mount_point=None, disable=False):
             devices.sort(key=lambda d: not (d["transport"] == "usb" or d["removable"]))
             if not devices:
                 print("No attached block devices detected. Connect a drive and choose rescan.")
+                if SNAP_MODE:
+                    print("If a drive is attached, connect: sudo snap connect ubackup:hardware-observe ubackup:mount-observe")
             for number, device in enumerate(devices, 1):
                 mounts = ", ".join(device["mountpoints"])
                 if not mounts:
@@ -4865,7 +5113,8 @@ def wizard_drive(mount_point=None, disable=False):
                       f"UUID {device['uuid'] or 'none'}) — {mounts}")
             print("s. Skip external backup for now; keep previous target")
             print("r. Rescan after connecting a drive   p. Enter an already-mounted path")
-            print("f. Format a new removable/USB drive (ERASES ALL DATA)")
+            if not SNAP_MODE:
+                print("f. Format a new removable/USB drive (ERASES ALL DATA)")
             print("d. Disable/forget saved target (separate confirmation)")
             choice = ask("Choice", "s").lower()
             if choice in ("", "s", "0"):
@@ -4874,6 +5123,9 @@ def wizard_drive(mount_point=None, disable=False):
             if choice == "r":
                 continue
             if choice == "f":
+                if SNAP_MODE:
+                    print("Formatting is deb-only; use Files/Disks. Nothing was changed.")
+                    continue
                 if wizard_prepare_drive():
                     return True
                 continue
@@ -4886,6 +5138,13 @@ def wizard_drive(mount_point=None, disable=False):
             if choice.isdigit() and 1 <= int(choice) <= len(devices):
                 selected = devices[int(choice) - 1]
                 if not selected["mountpoints"]:
+                    if SNAP_MODE:
+                        try:
+                            value = udisks_mount_device(selected)
+                        except (ConfigError, OSError, subprocess.SubprocessError) as exc:
+                            print(str(exc))
+                            continue
+                        break
                     preferred = default_mount_point(selected)
                     entry = fstab_entry(selected["uuid"]) if selected.get("uuid") else None
                     if entry:
@@ -4939,6 +5198,10 @@ def interactive_backup(package_scan=True):
 
 def backup_everything(refresh_package_scan=True):
     """Single flow: privileged configuration, configuration backup, full /home."""
+    if SNAP_MODE:
+        # The strict snap only owns user-space configuration. System capture is
+        # refreshed by the deb helper; full /home is an explicit deb action.
+        return backup()
     global _STATUS_RUN, _LAST_HOME_WARNINGS
     try:
         signal.signal(signal.SIGTERM, signal.default_int_handler)
@@ -5028,6 +5291,11 @@ def retention_value():
 
 
 def wizard_schedule():
+    if SNAP_MODE:
+        print("There is no scheduled system-capture timer.")
+        print("Use the System Capture desktop action or: ubuntu-backup-system capture")
+        print("From the snap: ubackup request-system --action capture")
+        return
     print("1. Daily")
     print("2. Weekly")
     print("3. Disable automatic backups")
@@ -5061,21 +5329,34 @@ def wizard_schedule():
 def menu():
     while True:
         print()
-        print("Ubuntu backup — configuration and full /home")
-        print("1. Back up this machine now (configuration and full /home)")
-        print("2. Full recovery (configuration or full /home)")
-        print("3. Verify a snapshot, backup or timeline")
-        print("4. Choose backup drive (or leave unset)")
-        print("5. Automatic backup and privileged-capture schedule")
-        print("6. Format a new backup drive (ERASES ALL DATA)")
-        print("u. Undo restore")
-        print("0. Exit")
+        if SNAP_MODE:
+            print("Ubuntu backup — strict snap (user configuration)")
+            print("1. Back up configuration (full /home capture is APT-only)")
+            print("2. Recover user configuration or stage full /home "
+                  "(system/package restore is APT-only)")
+            print("3. Verify a snapshot, backup or timeline")
+            print("4. Choose/mount backup drive (format/boot mount is APT-only)")
+            print("5. System capture status (requires .deb helper)")
+            print("6. Request privileged system capture (requires .deb helper)")
+            print("7. Request privileged package scan (requires .deb helper)")
+            print("u. Undo restore")
+            print("0. Exit")
+        else:
+            print("Ubuntu backup — configuration and full /home")
+            print("1. Back up this machine now (configuration and full /home)")
+            print("2. Full recovery (configuration or full /home)")
+            print("3. Verify a snapshot, backup or timeline")
+            print("4. Choose backup drive (or leave unset)")
+            print("5. Automatic backup and privileged-capture schedule")
+            print("6. Format a new backup drive (ERASES ALL DATA)")
+            print("u. Undo restore")
+            print("0. Exit")
         choice = ask("Choice", "0").lower()
         try:
             if choice == "0":
                 return
             if choice == "1":
-                backup_everything()
+                backup() if SNAP_MODE else backup_everything()
             elif choice == "2":
                 wizard_recover()
             elif choice == "3":
@@ -5085,7 +5366,12 @@ def menu():
             elif choice == "5":
                 wizard_schedule()
             elif choice == "6":
-                wizard_prepare_drive()
+                if SNAP_MODE:
+                    request_system("capture")
+                else:
+                    wizard_prepare_drive()
+            elif choice == "7" and SNAP_MODE:
+                request_system("package-scan")
             elif choice == "u":
                 wizard_undo_restore()
             else:
@@ -5093,6 +5379,55 @@ def menu():
         except (ConfigError, OSError, ValueError, KeyError, TypeError, tarfile.TarError,
                 EOFError, RuntimeError, subprocess.CalledProcessError) as exc:
             print(f"Action failed: {exc}", file=sys.stderr)
+
+
+def request_system(action):
+    """Write a fixed-schema request for the deb helper; never executes it."""
+    if not SNAP_MODE:
+        raise ConfigError("Privileged requests are only used by the strict snap.")
+    if action not in ("capture", "package-scan"):
+        raise ConfigError("Unsupported privileged request action.")
+    spool = HOME / "Ubuntu-Backup" / "data" / "system" / "requests"
+    mkdir(spool)
+    write_json(spool / "request.json", {
+        "format": "ubuntu-backup-request-v1",
+        "action": action,
+        "owner": os.geteuid(),
+        "workspace": str(KIT.absolute()),
+        "requested_at": timestamp(),
+    })
+    print(f"Requested privileged {action.replace('-', ' ')}.")
+    print("The ubuntu-backup-system watcher should ask for administrator approval.")
+    print("If no prompt appears: " + APT_HELPER_HINT)
+
+
+def install_snap_autostart():
+    """Install the per-user snap autostart file when running in the snap.
+
+    It lives in $SNAP_USER_DATA, never in the host's ~/.config/autostart, so it
+    stays inside strict confinement. snapd's user session agent reads it and
+    launches the app wrapper with the Exec= arguments (``tray``).
+    """
+    if not SNAP_MODE:
+        return
+    user_data = os.environ.get("SNAP_USER_DATA")
+    if not user_data:
+        return
+    path = Path(user_data) / ".config/autostart/ubuntu-backup.desktop"
+    if path.is_symlink() or path.exists():
+        return
+    content = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Ubuntu Backup\n"
+        "Comment=Backup status icon\n"
+        "Exec=ubackup tray\n"
+        "Icon=ubuntu-backup\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+    mkdir(path.parent)
+    write(path, content)
 
 
 def preferred_workspace():
@@ -5121,9 +5456,12 @@ def main():
     parser.add_argument("--non-interactive", action="store_true", help="Never ask questions; use explicit command/options")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     descriptions = {
-        "menu": "Open the interactive menu (default)", "backup": "Capture a verified backup",
+        "menu": "Open the interactive menu (default)",
+        "backup": "Capture a verified backup",
         "status": "Show workspace, drive and scheduler status",
-        "capture-root": "Capture system-wide configuration using sudo", "disable-timer": "Stop scheduling; keep archives",
+        "capture-root": "Capture system-wide configuration using sudo",
+        "request-system": "Ask ubuntu-backup-system to capture or package-scan",
+        "disable-timer": "Stop scheduling; keep archives",
         "tray": "Show the backup status icon",
         "backup-now": "Run the combined backup in this terminal",
         "recover": "Restore configuration or full /home (interactive)",
@@ -5132,6 +5470,18 @@ def main():
         "mount-saved": "Mount the fstab-declared backup drive and verify its on-disk marker",
         "unmount-saved": "Unmount the marked backup drive; keeps the boot entry",
     }
+    if SNAP_MODE:
+        descriptions.update({
+            "backup": "Capture a verified backup (full /home is APT-only)",
+            "capture-root": "Request system-wide capture (requires .deb helper)",
+            "request-system": "Request a .deb helper action (requires ubuntu-backup-system)",
+            "disable-timer": "Not used by the strict snap; no timer exists",
+            "backup-now": "Run the combined backup in this terminal (full /home is APT-only)",
+            "recover": "Restore user configuration or stage full /home (system restore is APT-only)",
+            "choose-drive": "Select/mount a backup drive (format/boot mount is APT-only)",
+            "prepare-drive": "Format a drive as ext4 (APT-only; not available in the strict snap)",
+            "mount-saved": "Mount the fstab-declared drive (fstab is APT-only; udisks works in snap)",
+        })
     for command, description in descriptions.items():
         commands.add_parser(command, help=description)
     commands.choices["prepare-drive"].add_argument(
@@ -5139,6 +5489,8 @@ def main():
         help="Also offer non-removable internal disks (requires an INTERNAL confirmation)")
     commands.choices["mount-saved"].add_argument("--check", action="store_true", help="Report state only; mount nothing")
     commands.choices["mount-saved"].add_argument("--quiet", action="store_true", help="Silence the routine no-op states")
+    commands.choices["request-system"].add_argument(
+        "--action", choices=("capture", "package-scan"), default="capture")
     worker = commands.add_parser("_capture-root-worker")
     worker.add_argument("--install-system-timer", action="store_true")
     worker.add_argument("--replace-user-timer", action="store_true")
@@ -5148,7 +5500,9 @@ def main():
     worker.add_argument("--plan", required=True, type=Path)
     worker = commands.add_parser("_capture-package-files-worker")
     sub = commands.add_parser("restore-package-files",
-                              help="Review or restore captured modified non-conffile package files in place")
+                              help=("Restore modified package files in place (APT only)"
+                                    if SNAP_MODE else
+                                    "Review or restore captured modified package files in place"))
     sub.add_argument("snapshot", nargs="?", type=Path)
     sub.add_argument("--apply", action="store_true", help="Write in place using sudo; default is a dry run")
     sub.add_argument("--package", action="append", default=[], help="Restore only this package (repeatable)")
@@ -5159,12 +5513,16 @@ def main():
     sub.add_argument("--wizard", action="store_true",
                      help="Review interactively in a terminal before applying")
     sub = commands.add_parser("capture-package-files",
-                              help="Capture modified package files using sudo")
+                              help=("Capture modified package files (requires .deb helper)"
+                                    if SNAP_MODE else
+                                    "Capture modified package files using sudo"))
     sub.add_argument("--force", action="store_true",
                      help="Run a fresh scan even if a recent cache exists")
     sub = commands.add_parser("restore-home", help="Stage a full /home linked snapshot into a private folder; no live changes")
     sub.add_argument("timeline", nargs="?", type=Path)
-    sub = commands.add_parser("install-timer", help="Enable daily/weekly unattended backups")
+    sub = commands.add_parser("install-timer", help=(
+        "Enable unattended backups (not used by strict snap)"
+        if SNAP_MODE else "Enable daily/weekly unattended backups"))
     sub.add_argument("--calendar", choices=("daily", "weekly"))
     for command in ("verify", "restore"):
         sub = commands.add_parser(command, help="Verify a snapshot/archive" if command == "verify" else "Recover into a new directory")
@@ -5177,13 +5535,26 @@ def main():
     group.add_argument("--archive", type=Path)
     sub = commands.add_parser("undo-restore", help="Review and undo unchanged steps from a selective restore")
     sub.add_argument("journal", nargs="?", type=Path)
-    sub = commands.add_parser("set-external", help="Choose a backup drive; can add a boot mount, never formats disks")
+    sub = commands.add_parser("set-external", help=(
+        "Choose a backup drive; boot mount is APT-only"
+        if SNAP_MODE else "Choose a backup drive; can add a boot mount, never formats disks"))
     sub.add_argument("mount_point", nargs="?")
     sub.add_argument("--disable", action="store_true")
-    sub = commands.add_parser("deploy", help="Preview/apply a saved configuration; dry-run by default")
+    sub = commands.add_parser("deploy", help=(
+        "Preview/apply a saved configuration (package/snap/desktop options are APT-only)"
+        if SNAP_MODE else "Preview/apply a saved configuration; dry-run by default"))
     sub.add_argument("--snapshot")
+    deploy_help = {
+        "apply": "Apply the reviewed plan",
+        "overwrite": "Replace conflicting home files",
+        "packages": "Install APT packages" + (" (APT only)" if SNAP_MODE else ""),
+        "snaps": "Install snap apps" + (" (APT only)" if SNAP_MODE else ""),
+        "flatpaks": "Install flatpaks" + (" (APT only)" if SNAP_MODE else ""),
+        "desktop-settings": "Import desktop settings" + (" (APT only)" if SNAP_MODE else ""),
+        "build": "Rebuild captured binaries" + (" (APT only)" if SNAP_MODE else ""),
+    }
     for option in ("apply", "overwrite", "packages", "snaps", "flatpaks", "desktop-settings", "build"):
-        sub.add_argument("--" + option, action="store_true")
+        sub.add_argument("--" + option, action="store_true", help=deploy_help[option])
     args = parser.parse_args()
     if args.show_help:
         print(EMBEDDED_README)
@@ -5191,6 +5562,12 @@ def main():
         parser.print_help()
         return
     workspace = args.workspace or preferred_workspace()
+    if SNAP_MODE and args.command in (
+            "_capture-root-worker", "_backup-home-worker",
+            "_restore-package-files-worker", "_capture-package-files-worker"):
+        raise ConfigError(
+            "Privileged workers are provided by the ubuntu-backup-system package; "
+            "the strict snap cannot run them.")
     if args.command == "_capture-root-worker":
         namespace = {"__name__": "root_reference_worker", "__file__": str(workspace.absolute() / "scripts/capture-root-configs.py"), "SELF_SOURCE": EMBEDDED_ROOT_EXPORTER}
         exec(compile(EMBEDDED_ROOT_EXPORTER, "<embedded root-reference exporter>", "exec"), namespace)
@@ -5222,6 +5599,7 @@ def main():
         print("Snapshots may contain secrets; they are NOT encrypted.")
         workspace = Path(ask("Private workspace folder", str(workspace)))
     private_workspace(workspace)
+    install_snap_autostart()
     if command in ("mount-saved", "unmount-saved"):
         state = (mount_saved(check=args.check, quiet=args.quiet) if command == "mount-saved"
                  else unmount_saved())
@@ -5255,7 +5633,10 @@ def main():
         else:
             restore_package_files(args.snapshot, args.apply, args.package, args.path, args.force)
     elif command == "capture-package-files":
-        capture_root_package_scan(non_interactive=not interactive, force=args.force)
+        if SNAP_MODE:
+            request_system("package-scan")
+        else:
+            capture_root_package_scan(non_interactive=not interactive, force=args.force)
     elif command == "tray":
         return run_tray()
     elif command == "backup-now":
@@ -5278,8 +5659,12 @@ def main():
         else:
             deploy(args)  # --apply is an explicit noninteractive choice; default remains a dry run.
     elif command == "capture-root":
-        if not interactive or confirm("Use sudo to read the two whitelisted system references?"):
+        if SNAP_MODE:
+            request_system("capture")
+        elif not interactive or confirm("Use sudo to read the two whitelisted system references?"):
             capture_root(not interactive)
+    elif command == "request-system":
+        request_system(args.action)
     elif command == "disable-timer":
         if not interactive or confirm("Disable the backup timer, retaining all archives?"):
             disable_timer()
@@ -5814,9 +6199,14 @@ def hardware_comparison(source):
             if saved.get(key) != current.get(key):
                 changes.append(key + " changed")
     info = Path(source) / "inventory/source-system.json"
-    old_os = json.loads(info.read_text()).get("os", {}) if info.is_file() else {}
-    if not old_os or old_os.get("VERSION_ID") != read_os_release().get("VERSION_ID"):
-        changes.append("Ubuntu version unknown/changed")
+    if SNAP_MODE:
+        # The snap sees only core22; never claim the host release matched.
+        changes.append("Ubuntu version not verifiable in the strict snap")
+        old_os = {}
+    else:
+        old_os = json.loads(info.read_text()).get("os", {}) if info.is_file() else {}
+        if not old_os or old_os.get("VERSION_ID") != read_os_release().get("VERSION_ID"):
+            changes.append("Ubuntu version unknown/changed")
     return {"changes": changes, "saved": saved, "current": current,
             "policy": "Portable preferences may be selected; hardware bindings, startup/scripts and all system references require manual adaptation when identities differ."}
 
@@ -6427,6 +6817,9 @@ def native_home_command(source_home, directory, run_id, owner_uid, owner_gid,
 
 def wizard_home_backup(run_id=None):
     global _LAST_HOME_WARNINGS
+    if SNAP_MODE:
+        print("Full /home capture: " + APT_HELPER_HINT)
+        return False
     config = settings()
     if not config["external_backup"]:
         print("Choose and mount the backup drive first (menu 4). No /home data was read or copied.")
@@ -6787,6 +7180,8 @@ def home_backup_lock():
 
 def root_home_backup(workspace, run_id=None):
     global KIT, HOME
+    if SNAP_MODE:
+        raise ConfigError("Full /home capture: " + APT_HELPER_HINT)
     if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
         raise ConfigError("Use the confirmed normal-user full /home backup action.")
     owner = pwd.getpwuid(int(os.environ["SUDO_UID"]))
@@ -7205,7 +7600,8 @@ def run_tray():
     import ctypes
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gio, GLib, Gtk
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
 
     def read_status():
         return _read_tray_status()
@@ -7247,6 +7643,15 @@ def run_tray():
     options_menu.append(purge_item)
     options_item = Gtk.MenuItem(label="Options")
     options_item.set_submenu(options_menu)
+    if SNAP_MODE:
+        drive_option.set_tooltip_text(
+            "Select a mounted drive or mount an unmounted Linux drive with udisks. "
+            "Formatting and boot mounts are APT-only. " + APT_ONLY_HINT)
+        backup_item.set_tooltip_text(
+            "Configuration backup. Full /home capture is APT-only. " + APT_HELPER_HINT)
+        restore_option.set_tooltip_text(
+            "User configuration and /home staging are available; system/package restore is APT-only. "
+            + APT_ONLY_HINT)
     menu = Gtk.Menu()
     for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), history_item,
                  restore_option, options_item):
@@ -7440,16 +7845,35 @@ def run_tray():
     def show_drive_chooser(_item=None, then_backup=False):
         options = []
         for device in attached_drives():
-            for mountpoint in device.get("mountpoints", []):
-                options.append((f"{mountpoint}  ({device.get('fstype') or 'unknown'}, {device.get('size', 0)} bytes)", mountpoint))
+            mounts = device.get("mountpoints", [])
+            if mounts:
+                for mountpoint in mounts:
+                    options.append((f"{mountpoint}  ({device.get('fstype') or 'unknown'}, {device.get('size', 0)} bytes)",
+                                    mountpoint, None))
+            elif (SNAP_MODE and device.get("fstype") in POSIX_FSTYPES
+                  and device.get("uuid") and device.get("path")):
+                options.append((f"{device['path']} (unmounted {device.get('fstype')}, "
+                                f"{device.get('size', 0)} bytes) — mount with udisks",
+                                device["path"], "mount"))
+        no_drives = SNAP_MODE and not options
         dialog = Gtk.Dialog(title="Ubuntu Backup — choose backup drive", flags=Gtk.DialogFlags.MODAL)
-        dialog.set_default_size(680, 180)
+        dialog.set_default_size(720, 380 if no_drives else 180)
         dialog.set_keep_above(True)
         dialog.set_position(Gtk.WindowPosition.CENTER)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Forget current drive", 2)
-        dialog.add_button("Prepare new drive", 3)
-        dialog.add_button("Use drive", Gtk.ResponseType.OK)
+        prepare_button = dialog.add_button(
+            "Prepare new drive (deb only)" if SNAP_MODE else "Prepare new drive", 3)
+        if SNAP_MODE:
+            prepare_button.set_sensitive(False)
+            prepare_button.set_tooltip_text(
+                "Formatting is only available from the .deb packages or Files/Disks. "
+                "The strict snap cannot format a drive.")
+        if no_drives:
+            dialog.add_button("Retry", 4)
+        use_button = dialog.add_button("Use drive", Gtk.ResponseType.OK)
+        if no_drives:
+            use_button.set_sensitive(False)
         box = dialog.get_content_area()
         box.set_spacing(8)
         box.set_border_width(12)
@@ -7459,22 +7883,98 @@ def run_tray():
         except (ConfigError, OSError, ValueError, KeyError, subprocess.SubprocessError):
             current_text = "configured but unavailable"
         box.add(Gtk.Label(label="Current: " + current_text, xalign=0))
-        box.add(Gtk.Label(label="Select an already-mounted filesystem. No disk is formatted or mounted.", xalign=0))
+        box.add(Gtk.Label(label=("Select a mounted filesystem, or an unmounted Linux filesystem "
+                                 "to mount with udisks. No disk is formatted.") if SNAP_MODE else
+                                 "Select an already-mounted filesystem. No disk is formatted or mounted.",
+                          xalign=0))
         chooser = Gtk.ComboBoxText()
-        for label, _mount in options:
+        for label, _target, _action in options:
             chooser.append_text(label)
         if options:
             chooser.set_active(0)
         else:
-            chooser.append_text("No mounted drives found")
+            chooser.append_text("No drives found — connect hardware-observe/mount-observe and mount the drive"
+                                if SNAP_MODE else "No mounted drives found")
             chooser.set_sensitive(False)
         box.add(chooser)
+        selection_warning = Gtk.Label(xalign=0, wrap=True)
+        selection_warning.set_max_width_chars(72)
+
+        def update_selection_warning(_chooser=None):
+            if not SNAP_MODE:
+                selection_warning.hide()
+                return
+            index = chooser.get_active()
+            if not (0 <= index < len(options)):
+                selection_warning.set_text("")
+                return
+            _label, _target, action = options[index]
+            if action == "mount":
+                selection_warning.set_text(
+                    "Warning: Use drive will mount this filesystem through udisks2. "
+                    "Formatting is APT-only. " + APT_ONLY_HINT)
+            else:
+                selection_warning.set_text(
+                    "Warning: boot/fstab mounts and formatting are APT-only. "
+                    + APT_ONLY_HINT)
+            selection_warning.show()
+
+        chooser.connect("changed", update_selection_warning)
+        box.add(selection_warning)
+        update_selection_warning()
+        commands = "\n".join((
+            "sudo snap connect ubackup:hardware-observe",
+            "sudo snap connect ubackup:mount-observe",
+            "sudo snap connect ubackup:removable-media",
+            "sudo snap connect ubackup:udisks2",
+        ))
+        if no_drives:
+            frame = Gtk.Frame(label="Snap permissions required")
+            frame_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            frame_box.set_border_width(8)
+            frame_box.add(Gtk.Label(
+                label="The strict snap cannot see block devices until these interfaces are connected:",
+                xalign=0, wrap=True))
+            command_label = Gtk.Label(xalign=0)
+            command_label.set_markup("<tt>" + GLib.markup_escape_text(commands) + "</tt>")
+            command_label.set_selectable(True)
+            command_label.set_line_wrap(False)
+            frame_box.add(command_label)
+            copy_button = Gtk.Button(label="Copy commands")
+            copy_button.set_halign(Gtk.Align.START)
+
+            def copy_commands(_button):
+                clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                clipboard.set_text(commands, -1)
+                clipboard.store()
+
+            copy_button.connect("clicked", copy_commands)
+            frame_box.add(copy_button)
+            frame_box.add(Gtk.Label(label="After connecting, click Retry.",
+                                    xalign=0))
+            frame.add(frame_box)
+            box.add(frame)
+        if SNAP_MODE:
+            note = Gtk.Label(xalign=0, wrap=True)
+            note.set_markup(
+                "Formatting, fstab mounts and system restore are only available from "
+                "the ubuntu-backup .deb packages. "
+                f'<a href="{GLib.markup_escape_text(DEB_REPO_URL)}">APT installation instructions</a>.')
+            note.set_max_width_chars(72)
+            note.connect(
+                "activate-link",
+                lambda _label, uri: (Gtk.show_uri_on_window(
+                    dialog, uri, Gtk.get_current_event_time()), True)[1])
+            box.add(note)
         box.show_all()
         dialog.present()
         response = dialog.run()
-        selected = options[chooser.get_active()][1] if options and chooser.get_active() >= 0 else None
+        selected = options[chooser.get_active()] if options and chooser.get_active() >= 0 else None
         dialog.destroy()
-        if response == 3:
+        if response == 4:
+            GLib.idle_add(lambda: (show_drive_chooser(None, then_backup), False)[1])
+            return
+        if response == 3 and not SNAP_MODE:
             run_process_window("Prepare drive", lambda: wizard_prepare_drive(),
                                cancellable=False)
             return
@@ -7485,10 +7985,13 @@ def run_tray():
                 if current_status().get("state") != "running":
                     _write_status("idle", "drive", "Backup drive forgotten")
             elif response == Gtk.ResponseType.OK and selected:
-                set_external(selected)
+                _label, target, action = selected
+                if action == "mount":
+                    target = udisks_mount_device({"path": target})
+                set_external(target)
                 drive_cache["at"] = 0
                 if current_status().get("state") != "running":
-                    _write_status("idle", "drive", "Backup drive selected: " + selected)
+                    _write_status("idle", "drive", "Backup drive selected: " + target)
                 if then_backup:
                     GLib.idle_add(lambda: (backup_action(), False)[1])
             else:
@@ -7643,8 +8146,11 @@ def run_tray():
               file=sys.stderr)
         GLib.idle_add(Gtk.main_quit)
 
-    Gio.bus_own_name(Gio.BusType.SESSION, "org.ubuntu.Backup", Gio.BusNameOwnerFlags.NONE,
-                     tray_bus_acquired, tray_name_acquired, tray_name_lost)
+    if not SNAP_MODE:
+        # The optional host-extension service needs a reviewed D-Bus slot. The
+        # stock AppIndicator menu remains fully functional without it.
+        Gio.bus_own_name(Gio.BusType.SESSION, "org.ubuntu.Backup", Gio.BusNameOwnerFlags.NONE,
+                         tray_bus_acquired, tray_name_acquired, tray_name_lost)
 
     provider = None
     try:

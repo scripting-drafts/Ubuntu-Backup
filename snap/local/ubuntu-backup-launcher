@@ -1,0 +1,44 @@
+#!/bin/sh
+# Snap launcher for Ubuntu Backup (strict confinement).
+set -eu
+
+# SNAP_REAL_HOME is the user's real home. Fall back to $HOME and strip the
+# snap-private suffix if an older snapd does not export it.
+REAL_HOME="${SNAP_REAL_HOME:-$HOME}"
+case "$REAL_HOME" in
+    */snap/*) REAL_HOME="${REAL_HOME%%/snap/*}" ;;
+esac
+WORKSPACE="${UBUNTU_BACKUP_WORKSPACE:-$REAL_HOME/Ubuntu-Backup/data}"
+
+# Keep all executables inside the snap. Host binaries are not executable from
+# a strict snap, even when they appear on the host PATH.
+export PATH="$SNAP/bin:$SNAP/usr/bin:/usr/bin:/bin"
+export HOME="$REAL_HOME"
+export PYTHONHOME="/usr"
+
+ARCH_TRIPLET=""
+for candidate in "$SNAP"/usr/lib/*-linux-gnu; do
+    if [ -d "$candidate" ]; then
+        ARCH_TRIPLET="${candidate##*/}"
+        break
+    fi
+done
+if [ -z "$ARCH_TRIPLET" ]; then
+    echo "Ubuntu Backup: cannot determine the snap library directory." >&2
+    exit 1
+fi
+
+export PYTHONPATH="$SNAP/usr/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}"
+export GI_TYPELIB_PATH="$SNAP/usr/lib/$ARCH_TRIPLET/girepository-1.0:$SNAP/usr/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+export LD_LIBRARY_PATH="$SNAP/usr/lib/$ARCH_TRIPLET:$SNAP/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="$SNAP/usr/share:/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+export GSETTINGS_SCHEMA_DIR="$SNAP/usr/share/glib-2.0/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+export GTK_EXE_PREFIX="$SNAP/usr"
+export GTK_DATA_PREFIX="$SNAP/usr"
+
+if [ -f "$SNAP/usr/lib/$ARCH_TRIPLET/gdk-pixbuf-2.0/2.10.0/loaders.cache" ]; then
+    export GDK_PIXBUF_MODULE_FILE="$SNAP/usr/lib/$ARCH_TRIPLET/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+fi
+
+exec /usr/bin/python3 -s "$SNAP/bin/ubuntu-backup.py" \
+    --workspace "$WORKSPACE" "$@"

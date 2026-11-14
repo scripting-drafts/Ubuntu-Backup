@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Ubuntu Backup — System Capture
+Comment=Capture system-wide configuration for Ubuntu Backup (administrator approval required)
+Exec=pkexec /usr/libexec/ubuntu-backup/ubuntu-backup-system capture
+Icon=drive-harddisk
+Terminal=true
+Categories=System;
+Keywords=backup;system;configuration;capture;
+StartupNotify=true

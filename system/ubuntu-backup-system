@@ -1,0 +1,4 @@
+#!/bin/sh
+# Command-line entry point for the privileged Ubuntu Backup helper.
+set -eu
+exec /usr/bin/python3 -I /usr/libexec/ubuntu-backup/ubuntu-backup-system "$@"

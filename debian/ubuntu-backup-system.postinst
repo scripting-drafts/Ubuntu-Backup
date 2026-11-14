@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    # 1.2.1 moved strict-snap autostart into snapd. Remove the obsolete
+    # package-managed XDG entry, including on same-version reinstall.
+    old_autostart=/etc/xdg/autostart/ubuntu-backup-snap-tray.desktop
+    if [ -f "$old_autostart" ] && grep -q 'ubuntu-backup-snap-tray' "$old_autostart" 2>/dev/null; then
+        rm -f "$old_autostart"
+    fi
+    # 1.3.1 removed the scheduled system-capture timer. Drop stale enablement
+    # symlinks left by 1.3.0; capture is now on-demand only.
+    for link in /etc/systemd/system/timers.target.wants/ubuntu-backup-system@*.timer; do
+        [ -L "$link" ] || [ -e "$link" ] || continue
+        unit="${link##*/}"
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        rm -f "$link"
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+#DEBHELPER#
+
+exit 0

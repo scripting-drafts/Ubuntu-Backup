@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    for link in /etc/systemd/system/timers.target.wants/ubuntu-backup-system@*.timer; do
+        [ -L "$link" ] || [ -e "$link" ] || continue
+        rm -f "$link"
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+#DEBHELPER#
+
+exit 0

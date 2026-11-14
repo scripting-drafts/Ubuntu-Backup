@@ -1,0 +1,51 @@
+Source: ubuntu-backup
+Section: utils
+Priority: optional
+Maintainer: Gerard Sala <creative.gsp@gmail.com>
+Build-Depends: debhelper-compat (= 13), build-essential, libssl-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
+
+Package: ubuntu-backup-core
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+ python3
+Description: shared application and native core for Ubuntu Backup
+ Provides the main Ubuntu Backup application, the privileged-worker entry
+ points, and the native full-/home engine used by both the GUI and the system
+ helper packages.
+
+Package: ubuntu-backup
+Architecture: all
+Depends: ubuntu-backup-core (= ${binary:Version}),
+ ${misc:Depends},
+ python3,
+ python3-gi,
+ python3-gi-cairo,
+ gir1.2-gtk-3.0,
+ libayatana-appindicator3-1,
+ gir1.2-ayatanaappindicator3-0.1
+Description: configuration and full-home backup utility for Ubuntu
+ Ubuntu Backup captures system configuration, development environments, and
+ optionally a full home directory snapshot. It provides a GTK tray interface,
+ scheduled backups, external-drive storage, and guarded restore workflows.
+ .
+ Backups may contain credentials and other private data. This application does
+ not encrypt its snapshots; keep backup drives physically secure.
+
+Package: ubuntu-backup-system
+Architecture: all
+Depends: ubuntu-backup-core (= ${binary:Version}),
+ ${misc:Depends},
+ python3,
+ pkexec | policykit-1
+Suggests: ubuntu-backup
+Description: privileged system capture helper for Ubuntu Backup
+ Captures root-owned and other-user configuration into a verified cache inside
+ the invoking user's Ubuntu Backup workspace. It is intended for the strict
+ Ubuntu Backup snap and for the packaged GUI.
+ .
+ The helper runs only through pkexec or the request watcher. It never edits
+ /etc while capturing; restore actions remain explicit. There is no scheduled
+ root timer; capture is on-demand.

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Launcher for the system-installed Ubuntu Backup application.
+set -eu
+
+exec /usr/bin/python3 -I /usr/lib/ubuntu-backup/ubuntu-backup.py \
+    --workspace "${HOME}/Ubuntu-Backup/data" "$@"

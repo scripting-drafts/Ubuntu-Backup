@@ -1,0 +1,89 @@
+name: ubackup
+title: Ubuntu Backup
+base: core22
+version: '1.3.14'
+
+summary: Back up Ubuntu configuration, development environments and home data
+
+description: |
+  Ubuntu Backup captures user configuration, development environments, and
+  optionally a full home directory snapshot. It provides a GTK tray interface,
+  scheduled backups, external-drive storage, and guarded restore workflows.
+
+  This strict snap runs as the desktop user. System-wide capture, package
+  scanning and full /home capture require the separate ubuntu-backup-system
+  .deb package, which writes a verified cache into the user's workspace.
+  APT instructions: https://github.com/scripting-drafts/Ubuntu-Backup#apt-repository
+
+  Backups may contain credentials and other private data. This application
+  does not encrypt its snapshots; keep backup drives physically secure.
+
+grade: stable
+confinement: strict
+license: MIT
+icon: ubuntu-backup.svg
+contact: https://github.com/scripting-drafts/Ubuntu-Backup/issues
+source-code: https://github.com/scripting-drafts/Ubuntu-Backup
+issues: https://github.com/scripting-drafts/Ubuntu-Backup/issues
+website: https://github.com/scripting-drafts/Ubuntu-Backup
+
+architectures:
+  - build-on: [amd64]
+    build-for: [amd64]
+
+apps:
+  ubackup:
+    command: bin/ubuntu-backup-launcher
+    desktop: share/applications/ubuntu-backup.desktop
+    autostart: ubuntu-backup.desktop
+    plugs:
+      - home
+      - desktop
+      - unity7
+      - wayland
+      - x11
+      - gsettings
+      - removable-media
+      - udisks2
+      - mount-observe
+      - hardware-observe
+
+parts:
+  ubuntu-backup:
+    plugin: nil
+    after: [ubackup-core]
+    override-build: |
+      install -Dm755 "$CRAFT_PROJECT_DIR/ubuntu-backup.py" \
+        "$CRAFT_PART_INSTALL/bin/ubuntu-backup.py"
+      /usr/bin/python3 "$CRAFT_PROJECT_DIR/snap/local/strip-root-exporter.py" \
+        "$CRAFT_PART_INSTALL/bin/ubuntu-backup.py"
+      install -Dm755 "$CRAFT_PROJECT_DIR/snap/local/ubuntu-backup-launcher" \
+        "$CRAFT_PART_INSTALL/bin/ubuntu-backup-launcher"
+      install -Dm644 "$CRAFT_PROJECT_DIR/snap/local/ubuntu-backup.desktop" \
+        "$CRAFT_PART_INSTALL/share/applications/ubuntu-backup.desktop"
+      install -Dm644 "$CRAFT_PROJECT_DIR/ubuntu-backup.svg" \
+        "$CRAFT_PART_INSTALL/share/icons/hicolor/scalable/apps/ubuntu-backup.svg"
+    stage-packages:
+      - python3-gi
+      - python3-gi-cairo
+      - gir1.2-gtk-3.0
+      - libgtk-3-0
+      - libayatana-appindicator3-1
+      - gir1.2-ayatanaappindicator3-0.1
+      - adwaita-icon-theme
+      - hicolor-icon-theme
+      - librsvg2-common
+      - gsettings-desktop-schemas
+      - libssl3
+      - util-linux
+      - udisks2
+      - libcanberra-gtk3-module
+
+  ubackup-core:
+    plugin: make
+    source: native
+    make-parameters:
+      - PREFIX=/
+    build-packages:
+      - build-essential
+      - libssl-dev
