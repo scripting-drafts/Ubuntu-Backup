@@ -4651,7 +4651,8 @@ def show_status():
         release = " ".join(value for value in (support.get("version"), support.get("name")) if value)
         ubuntu_line = (f"Ubuntu: {release or 'unknown'} "
                        f"({'supported' if support.get('supported') else 'outside tested range'})")
-    print(f"Workspace: {KIT}\nRetention: {config['keep_snapshots']} snapshots\n{ubuntu_line}")
+    print(f"Workspace: {KIT}\nStaged restores: {KIT / 'restored'}\n"
+          f"Retention: {config['keep_snapshots']} snapshots\n{ubuntu_line}")
     try:
         print("Full /home engine: " + str(native_core_path()))
     except ConfigError as exc:
