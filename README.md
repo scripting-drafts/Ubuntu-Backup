@@ -73,7 +73,10 @@ sudo apt install ubuntu-backup-system
 
 Do not install the `ubuntu-backup` GUI deb and the snap together; that creates
 two tray processes. The repository key fingerprint is
-`D924602B5792EAFD32146E903DDA7A6E98513F34`.
+`6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`.
+
+The archive signing key was rotated for 1.3.17. If `apt update` reports
+`NO_PUBKEY`, re-run the key download command above.
 
 ### Source installer
 

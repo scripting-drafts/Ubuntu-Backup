@@ -3,6 +3,7 @@
 ## v1.3.17 - 2026-11-14
 - Remove the duplicated APT warning in the drive chooser.
 - Make drive and recovery warnings link directly to the APT instructions.
+- Sync APT packages to 1.3.17 and rotate the archive signing key.
 
 ## v1.3.16 - 2026-11-14
 - Make snap warning and permission texts selectable for copy/paste.

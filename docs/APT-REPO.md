@@ -28,7 +28,7 @@ sudo apt install ubuntu-backup
 
 ## Key
 
-- Fingerprint: `D924602B5792EAFD32146E903DDA7A6E98513F34`
+- Fingerprint: `6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`
 - Public key: `ubuntu-backup-archive-key.asc` at the repository root.
 - The archive key is separate from the maintainer's personal GPG key. It signs
   only repository metadata; protect the private key and the GitHub account.
@@ -41,7 +41,7 @@ dpkg-scanpackages pool /dev/null > dists/stable/main/binary-amd64/Packages
 gzip -9c dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
 apt-ftparchive release dists/stable > /tmp/Release && mv /tmp/Release dists/stable/Release
 GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive \
-  gpg --batch --yes --clearsign -u D924602B5792EAFD32146E903DDA7A6E98513F34 \
+  gpg --batch --yes --clearsign -u 6A4A51E4A1F0BEB561ECAED0893713F390A5DC44 \
   -o dists/stable/InRelease dists/stable/Release
 ```
 
