@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.11 - 2026-11-13
+- Apply APT-only labels, links and tooltips across CLI commands, menus, tray actions and error messages.
+- Document APT-only actions in the snap description and strict-snap guide.
+
 ## v1.3.10 - 2026-11-13
 - Tag APT-only recovery phases and show their repository instructions.
 

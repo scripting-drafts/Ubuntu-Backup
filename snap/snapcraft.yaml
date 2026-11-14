@@ -1,7 +1,7 @@
 name: ubackup
 title: Ubuntu Backup
 base: core22
-version: '1.3.10'
+version: '1.3.11'
 
 summary: Back up Ubuntu configuration, development environments and home data
 
@@ -10,9 +10,10 @@ description: |
   optionally a full home directory snapshot. It provides a GTK tray interface,
   scheduled backups, external-drive storage, and guarded restore workflows.
 
-  This strict snap runs as the desktop user. System-wide capture/restore and
-  full /home capture are provided by the separate ubuntu-backup-system package,
-  which writes a verified cache into the user's workspace.
+  This strict snap runs as the desktop user. System-wide capture, package
+  scanning and full /home capture require the separate ubuntu-backup-system
+  .deb package, which writes a verified cache into the user's workspace.
+  APT instructions: https://github.com/scripting-drafts/Ubuntu-Backup#apt-repository
 
   Backups may contain credentials and other private data. This application
   does not encrypt its snapshots; keep backup drives physically secure.

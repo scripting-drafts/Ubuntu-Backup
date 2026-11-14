@@ -39,6 +39,8 @@ FORMAT = "ubuntu-configuration-v1"
 UNIT = "ubuntu-configuration-backup"
 MARKER = "# Managed by ubuntu-configuration v1"
 DEB_REPO_URL = "https://github.com/scripting-drafts/Ubuntu-Backup#apt-repository"
+APT_ONLY_HINT = "Only available from the ubuntu-backup .deb packages. " + DEB_REPO_URL
+APT_HELPER_HINT = ("Requires the ubuntu-backup-system .deb package. " + DEB_REPO_URL)
 WORKSPACE_README = '# Ubuntu configuration and backup\n\n- Live tool: `~/ubuntu-backup.py` (private, self-contained, not encrypted).\n- Workspace: keep its settings, snapshots/timelines and rollback journals.\n- Run `./ubuntu-backup.py` for the menu; `./ubuntu-backup.py --help` shows full docs.\n- One backup action captures configuration, development code and full `/home`; identical files are stored once.\n- Each development change records its time, content version and package/library references; reapply follows dependency order and never pins versions.\n- Full recovery stages configuration or full `/home`; live `/home` is never overwritten.\n- External copies use dated symlink timelines over shared baselines.\n- Full `/home` capture is manual, external-drive only, requires sudo approval, and is not auto-pruned.\n- Snapshots contain secrets and are not encrypted. Do not publish them.\n'
 ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
@@ -981,9 +983,7 @@ def wizard_restore_package_files(source=None):
 def restore_package_files(snapshot=None, apply=False, packages=None, paths=None, force=False):
     """Review or restore captured modified package files in place."""
     if SNAP_MODE:
-        raise ConfigError(
-            "Restoring package files needs the ubuntu-backup-system helper; "
-            "the strict snap cannot use sudo or write package-managed paths.")
+        raise ConfigError("Package-file restore: " + APT_ONLY_HINT)
     source = Path(snapshot).expanduser().resolve() if snapshot else latest_config_snapshot()
     verify_path(source)
     manifest_path = source / "inventory/package-integrity.json"
@@ -1379,7 +1379,7 @@ def package_scan_summary():
 def capture_root_package_scan(non_interactive=False, force=False):
     """Run the privileged package-file scan through sudo."""
     if SNAP_MODE:
-        print("Package-file scanning needs the ubuntu-backup-system helper; skipping in the strict snap.")
+        print("Package-file scanning: " + APT_HELPER_HINT)
         return False
     age = privileged_package_scan_age()
     if not force and age is not None and age <= (10 / 60):
@@ -3153,8 +3153,8 @@ def mount_drive(device, mount_point=None, recursive=False, assume_yes=False):
     """Mount a prepared Linux filesystem at boot and give it to the current user."""
     if SNAP_MODE:
         raise ConfigError(
-            "Persistent fstab mounts need root. Mount the drive with Files/Disks "
-            "or use udisks, then select it in Ubuntu Backup.")
+            "Boot/fstab mounts are APT-only; ad-hoc mounts use udisks. "
+            + APT_ONLY_HINT)
     plan = mount_plan(device, mount_point)
     if not sys.stdin.isatty():
         raise ConfigError("Mounting needs one sudo prompt; run './ubuntu-backup.py choose-drive' in a terminal.")
@@ -3280,7 +3280,8 @@ def mount_saved(check=False, quiet=False):
             return fallback
         if check or not quiet:
             print("Strict snap: no mounted backup marker; mount the drive first "
-                  "(Files/Disks or udisks), then retry.")
+                  "(Files/Disks or udisks), then retry. fstab/boot mounts are APT-only. "
+                  + APT_ONLY_HINT)
         return "absent"
 
     entries = [entry for entry in fstab_entries() if entry["managed"]]
@@ -3883,8 +3884,8 @@ def deploy(args):
     if SNAP_MODE and (args.packages or args.snaps or args.flatpaks
                       or args.desktop_settings or args.build):
         raise ConfigError(
-            "Package, snap, flatpak, desktop and build deployment are deb-only; "
-            "the strict snap only deploys user files.")
+            "Package, snap, flatpak, desktop and build deployment are APT-only; "
+            "the strict snap only deploys user files. " + APT_ONLY_HINT)
     source = Path(args.snapshot).expanduser().resolve() if args.snapshot else default_snapshot()
     manifest = verify_tree(source)
     records = [record for record in manifest["files"] if record["path"].startswith("home/")]
@@ -4412,9 +4413,7 @@ def capture_system_integration(destination):
 def restore_system_integration(snapshot):
     """Reinstall and synchronize captured system timer/helper; requires sudo."""
     if SNAP_MODE:
-        raise ConfigError(
-            "Restoring system timer/helper files is provided by the ubuntu-backup-system package; "
-            "the strict snap cannot write /etc or /usr/local/libexec.")
+        raise ConfigError("System timer/helper restore: " + APT_ONLY_HINT)
     snapshot = Path(snapshot)
     metadata = snapshot / "inventory/system-integration.json"
     if metadata.is_file():
@@ -4536,8 +4535,8 @@ def default_snapshot():
 def capture_root(non_interactive=False, install=False, replace_user_timer=False,
                  hide_followup_hint=False, package_scan=True):
     if SNAP_MODE:
-        print("System-wide capture is provided by the ubuntu-backup-system package. "
-              "Install it and use the “Ubuntu Backup — System Capture” action; "
+        print("System-wide capture: " + APT_HELPER_HINT)
+        print("Install it and use the “Ubuntu Backup — System Capture” action; "
               "the next strict-snap backup will include its cache.")
         return None
     print("System-wide configuration and local accounts' settings will be read, including sensitive configuration.")
@@ -4969,8 +4968,7 @@ def format_drive(device_path, allow_internal=False, assume_yes=False):
     """Format one explicitly selected whole disk as ext4, never a partition."""
     if SNAP_MODE:
         raise ConfigError(
-            "Formatting needs root and raw block-device access. "
-            "Use the ubuntu-backup-system helper or the Files/Disks application.")
+            "Formatting is APT-only, or use Files/Disks. " + APT_ONLY_HINT)
     if not sys.stdin.isatty():
         raise ConfigError("Formatting needs an interactive terminal.")
     path = Path(device_path)
@@ -5336,13 +5334,14 @@ def menu():
         print()
         if SNAP_MODE:
             print("Ubuntu backup — strict snap (user configuration)")
-            print("1. Back up configuration now (system cache when available)")
-            print("2. Recover user configuration or stage full /home")
+            print("1. Back up configuration (full /home capture is APT-only)")
+            print("2. Recover user configuration or stage full /home "
+                  "(system/package restore is APT-only)")
             print("3. Verify a snapshot, backup or timeline")
-            print("4. Choose/mount backup drive")
-            print("5. System capture status (on demand)")
-            print("6. Request privileged system capture")
-            print("7. Request privileged package scan")
+            print("4. Choose/mount backup drive (format/boot mount is APT-only)")
+            print("5. System capture status (requires .deb helper)")
+            print("6. Request privileged system capture (requires .deb helper)")
+            print("7. Request privileged package scan (requires .deb helper)")
             print("u. Undo restore")
             print("0. Exit")
         else:
@@ -5402,7 +5401,7 @@ def request_system(action):
     })
     print(f"Requested privileged {action.replace('-', ' ')}.")
     print("The ubuntu-backup-system watcher should ask for administrator approval.")
-    print("If no prompt appears, install ubuntu-backup-system or use its desktop action.")
+    print("If no prompt appears: " + APT_HELPER_HINT)
 
 
 def install_snap_autostart():
@@ -5460,17 +5459,18 @@ def main():
     parser.add_argument("--non-interactive", action="store_true", help="Never ask questions; use explicit command/options")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     descriptions = {
-        "menu": "Open the interactive menu (default)", "backup": "Capture a verified backup",
+        "menu": "Open the interactive menu (default)",
+        "backup": "Capture a verified backup (full /home is APT-only)",
         "status": "Show workspace, drive and scheduler status",
-        "capture-root": "Capture system-wide configuration using sudo",
-        "request-system": "Ask ubuntu-backup-system to capture or package-scan",
-        "disable-timer": "Stop scheduling; keep archives",
+        "capture-root": "Request system-wide capture (requires .deb helper)",
+        "request-system": "Request a .deb helper action (requires ubuntu-backup-system)",
+        "disable-timer": "Not used by the strict snap; no timer exists",
         "tray": "Show the backup status icon",
-        "backup-now": "Run the combined backup in this terminal",
-        "recover": "Restore configuration or full /home (interactive)",
-        "choose-drive": "Select a backup drive; can add a boot mount",
-        "prepare-drive": "Format a drive as ext4 and select it; internal disks need --allow-internal",
-        "mount-saved": "Mount the fstab-declared backup drive and verify its on-disk marker",
+        "backup-now": "Run the combined backup in this terminal (full /home is APT-only)",
+        "recover": "Restore user configuration or stage full /home (system restore is APT-only)",
+        "choose-drive": "Select/mount a backup drive (format/boot mount is APT-only)",
+        "prepare-drive": "Format a drive as ext4 (APT-only; not available in the strict snap)",
+        "mount-saved": "Mount the fstab-declared drive (fstab is APT-only; udisks works in snap)",
         "unmount-saved": "Unmount the marked backup drive; keeps the boot entry",
     }
     for command, description in descriptions.items():
@@ -5491,7 +5491,7 @@ def main():
     worker.add_argument("--plan", required=True, type=Path)
     worker = commands.add_parser("_capture-package-files-worker")
     sub = commands.add_parser("restore-package-files",
-                              help="Review or restore captured modified non-conffile package files in place")
+                              help="Restore modified package files in place (APT only)")
     sub.add_argument("snapshot", nargs="?", type=Path)
     sub.add_argument("--apply", action="store_true", help="Write in place using sudo; default is a dry run")
     sub.add_argument("--package", action="append", default=[], help="Restore only this package (repeatable)")
@@ -5502,12 +5502,12 @@ def main():
     sub.add_argument("--wizard", action="store_true",
                      help="Review interactively in a terminal before applying")
     sub = commands.add_parser("capture-package-files",
-                              help="Capture modified package files using sudo")
+                              help="Capture modified package files (requires .deb helper)")
     sub.add_argument("--force", action="store_true",
                      help="Run a fresh scan even if a recent cache exists")
     sub = commands.add_parser("restore-home", help="Stage a full /home linked snapshot into a private folder; no live changes")
     sub.add_argument("timeline", nargs="?", type=Path)
-    sub = commands.add_parser("install-timer", help="Enable daily/weekly unattended backups")
+    sub = commands.add_parser("install-timer", help="Enable unattended backups (not used by strict snap)")
     sub.add_argument("--calendar", choices=("daily", "weekly"))
     for command in ("verify", "restore"):
         sub = commands.add_parser(command, help="Verify a snapshot/archive" if command == "verify" else "Recover into a new directory")
@@ -5520,13 +5520,22 @@ def main():
     group.add_argument("--archive", type=Path)
     sub = commands.add_parser("undo-restore", help="Review and undo unchanged steps from a selective restore")
     sub.add_argument("journal", nargs="?", type=Path)
-    sub = commands.add_parser("set-external", help="Choose a backup drive; can add a boot mount, never formats disks")
+    sub = commands.add_parser("set-external", help="Choose a backup drive; boot mount is APT-only")
     sub.add_argument("mount_point", nargs="?")
     sub.add_argument("--disable", action="store_true")
-    sub = commands.add_parser("deploy", help="Preview/apply a saved configuration; dry-run by default")
+    sub = commands.add_parser("deploy", help="Preview/apply a saved configuration (package/snap/desktop options are APT-only)")
     sub.add_argument("--snapshot")
+    deploy_help = {
+        "apply": "Apply the reviewed plan",
+        "overwrite": "Replace conflicting home files",
+        "packages": "Install APT packages (APT only)",
+        "snaps": "Install snap apps (APT only)",
+        "flatpaks": "Install flatpaks (APT only)",
+        "desktop-settings": "Import desktop settings (APT only)",
+        "build": "Rebuild captured binaries (APT only)",
+    }
     for option in ("apply", "overwrite", "packages", "snaps", "flatpaks", "desktop-settings", "build"):
-        sub.add_argument("--" + option, action="store_true")
+        sub.add_argument("--" + option, action="store_true", help=deploy_help[option])
     args = parser.parse_args()
     if args.show_help:
         print(EMBEDDED_README)
@@ -6790,8 +6799,7 @@ def native_home_command(source_home, directory, run_id, owner_uid, owner_gid,
 def wizard_home_backup(run_id=None):
     global _LAST_HOME_WARNINGS
     if SNAP_MODE:
-        print("Full /home capture is provided by the ubuntu-backup-system helper; "
-              "skipping it in the strict snap.")
+        print("Full /home capture: " + APT_HELPER_HINT)
         return False
     config = settings()
     if not config["external_backup"]:
@@ -7154,9 +7162,7 @@ def home_backup_lock():
 def root_home_backup(workspace, run_id=None):
     global KIT, HOME
     if SNAP_MODE:
-        raise ConfigError(
-            "Full /home capture is provided by the ubuntu-backup-system helper; "
-            "the strict snap cannot request root.")
+        raise ConfigError("Full /home capture: " + APT_HELPER_HINT)
     if os.geteuid() != 0 or not os.environ.get("SUDO_UID"):
         raise ConfigError("Use the confirmed normal-user full /home backup action.")
     owner = pwd.getpwuid(int(os.environ["SUDO_UID"]))
@@ -7650,7 +7656,12 @@ def run_tray():
             "Greyed actions are available only from the ubuntu-backup .deb packages.")
         drive_option.set_tooltip_text(
             "Select a mounted drive or mount an unmounted Linux drive with udisks. "
-            "Formatting is deb-only.")
+            "Formatting and boot mounts are APT-only. " + APT_ONLY_HINT)
+        backup_item.set_tooltip_text(
+            "Configuration backup. Full /home capture is APT-only. " + APT_HELPER_HINT)
+        restore_option.set_tooltip_text(
+            "User configuration and /home staging are available; system/package restore is APT-only. "
+            + APT_ONLY_HINT)
     menu = Gtk.Menu()
     for item in (status_item, backup_item, Gtk.SeparatorMenuItem(), history_item,
                  restore_option, options_item):

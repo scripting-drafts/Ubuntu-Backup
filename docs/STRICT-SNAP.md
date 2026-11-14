@@ -112,3 +112,11 @@ two trays.
   locations outside `/home` need a unit drop-in.
 - `ubuntu-backup-system` is a Debian/Ubuntu artifact. Other distributions get
   the user-space snap only.
+
+## APT-only actions
+
+System-wide capture, package scanning, full `/home` capture, formatting,
+fstab/boot mounts, package-file restore and system timer/helper restore require
+the `ubuntu-backup-system` or `ubuntu-backup` .deb packages. See
+[APT-REPO.md](APT-REPO.md) or
+https://github.com/scripting-drafts/Ubuntu-Backup#apt-repository.
