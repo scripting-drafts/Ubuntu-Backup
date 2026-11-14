@@ -38,6 +38,7 @@ HOME = Path.home()
 FORMAT = "ubuntu-configuration-v1"
 UNIT = "ubuntu-configuration-backup"
 MARKER = "# Managed by ubuntu-configuration v1"
+DEB_REPO_URL = "https://github.com/scripting-drafts/Ubuntu-Backup#apt-repository"
 WORKSPACE_README = '# Ubuntu configuration and backup\n\n- Live tool: `~/ubuntu-backup.py` (private, self-contained, not encrypted).\n- Workspace: keep its settings, snapshots/timelines and rollback journals.\n- Run `./ubuntu-backup.py` for the menu; `./ubuntu-backup.py --help` shows full docs.\n- One backup action captures configuration, development code and full `/home`; identical files are stored once.\n- Each development change records its time, content version and package/library references; reapply follows dependency order and never pins versions.\n- Full recovery stages configuration or full `/home`; live `/home` is never overwritten.\n- External copies use dated symlink timelines over shared baselines.\n- Full `/home` capture is manual, external-drive only, requires sudo approval, and is not auto-pruned.\n- Snapshots contain secrets and are not encrypted. Do not publish them.\n'
 ARCHIVE_RE = re.compile(r"ubuntu-config-\d{8}T\d{6}\.\d{6}Z\.tar\.gz\Z")
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
@@ -3721,6 +3722,7 @@ def _backup_impl(skip_external=False, package_scan=True):
                       "from the ubuntu-backup-system .deb package.")
                 print("Install it with: sudo apt install ubuntu-backup-system")
                 print("Then capture with: ubuntu-backup-system capture")
+                print("APT instructions: " + DEB_REPO_URL)
             if skip_external:
                 print("External copy skipped for this run; saved target was not changed.")
             elif config["external_backup"] is None:
@@ -7611,11 +7613,15 @@ def run_tray():
              "Only available from the .deb packages or Files/Disks. The strict snap cannot format."),
         )
         options_menu.append(Gtk.SeparatorMenuItem())
-        info_item = Gtk.MenuItem(label="System-wide capture & package scan: .deb only")
-        info_item.set_sensitive(False)
+        info_item = Gtk.MenuItem(
+            label="System-wide capture & package scan: .deb only — open APT instructions")
+        info_item.connect(
+            "activate",
+            lambda _item: Gtk.show_uri_on_window(
+                None, DEB_REPO_URL, Gtk.get_current_event_time()))
         info_item.set_tooltip_text(
             "Install ubuntu-backup-system from the signed APT repository, then run "
-            "'ubuntu-backup-system capture'.")
+            "'ubuntu-backup-system capture'. " + DEB_REPO_URL)
         options_menu.append(info_item)
         for label, hint in deb_only:
             item = Gtk.MenuItem(label=label)
@@ -7908,11 +7914,16 @@ def run_tray():
             frame.add(frame_box)
             box.add(frame)
         if SNAP_MODE:
-            note = Gtk.Label(
-                label="Formatting, fstab mounts and system restore are only available "
-                      "from the ubuntu-backup .deb packages.",
-                xalign=0, wrap=True)
+            note = Gtk.Label(xalign=0, wrap=True)
+            note.set_markup(
+                "Formatting, fstab mounts and system restore are only available from "
+                "the ubuntu-backup .deb packages. "
+                f'<a href="{GLib.markup_escape_text(DEB_REPO_URL)}">APT installation instructions</a>.')
             note.set_max_width_chars(72)
+            note.connect(
+                "activate-link",
+                lambda _label, uri: (Gtk.show_uri_on_window(
+                    dialog, uri, Gtk.get_current_event_time()), True)[1])
             box.add(note)
         box.show_all()
         dialog.present()

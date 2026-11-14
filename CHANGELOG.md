@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.8 - 2026-11-13
+- Link the deb-only information message to the APT instructions in the repository.
+
 ## v1.3.7 - 2026-11-13
 - Tell end users that system-wide capture and package scanning require the ubuntu-backup-system .deb package.
 - Add a disabled tray information row for the same limitation.
