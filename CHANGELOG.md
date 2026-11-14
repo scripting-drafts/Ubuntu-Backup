@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.18-3 - 2026-11-14
+- Revert the tray cleanup scripts; uninstalling ubuntu-backup-system clears the tray icon.
+
 ## v1.3.18 - 2026-11-14
 - Remove CPU affinity/exclusion handling; backup and restore workers use the system scheduler.
 
