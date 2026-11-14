@@ -4830,8 +4830,12 @@ def is_full_home(path):
 def wizard_recover(source=None):
     if SNAP_MODE:
         choice = choose("Recovery", (
-            ("1", "Recover user configuration (stage; no system/package changes)"),
-            ("2", "Stage full /home (never changes live /home)"),
+            ("1", "Recover user configuration (stage; no system/package changes)",
+             "Warning: system-wide capture, package files, fstab and disk changes are APT-only. "
+             + DEB_REPO_URL),
+            ("2", "Stage full /home (never changes live /home)",
+             "Warning: live full /home restore and root capture are APT-only. "
+             + DEB_REPO_URL),
         ), "1")
         if choice == "0":
             return
@@ -7899,6 +7903,31 @@ def run_tray():
                                 if SNAP_MODE else "No mounted drives found")
             chooser.set_sensitive(False)
         box.add(chooser)
+        selection_warning = Gtk.Label(xalign=0, wrap=True)
+        selection_warning.set_max_width_chars(72)
+
+        def update_selection_warning(_chooser=None):
+            if not SNAP_MODE:
+                selection_warning.hide()
+                return
+            index = chooser.get_active()
+            if not (0 <= index < len(options)):
+                selection_warning.set_text("")
+                return
+            _label, _target, action = options[index]
+            if action == "mount":
+                selection_warning.set_text(
+                    "Warning: Use drive will mount this filesystem through udisks2. "
+                    "Formatting is APT-only. " + APT_ONLY_HINT)
+            else:
+                selection_warning.set_text(
+                    "Warning: boot/fstab mounts and formatting are APT-only. "
+                    + APT_ONLY_HINT)
+            selection_warning.show()
+
+        chooser.connect("changed", update_selection_warning)
+        box.add(selection_warning)
+        update_selection_warning()
         commands = "\n".join((
             "sudo snap connect ubackup:hardware-observe",
             "sudo snap connect ubackup:mount-observe",
