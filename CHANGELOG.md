@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.6 - 2026-11-13
+- Add a guided Snap permissions dialog to the drive chooser when no devices are visible.
+- Provide copyable `snap connect` commands and a Retry action.
+
 ## v1.3.5 - 2026-11-13
 - Explain missing snap interface connections when a mounted drive is unreadable.
 - Stage canberra-gtk3-module to silence the cosmetic GTK warning.

@@ -7552,7 +7552,8 @@ def run_tray():
     import ctypes
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gio, GLib, Gtk
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
 
     def read_status():
         return _read_tray_status()
@@ -7820,8 +7821,9 @@ def run_tray():
                 options.append((f"{device['path']} (unmounted {device.get('fstype')}, "
                                 f"{device.get('size', 0)} bytes) — mount with udisks",
                                 device["path"], "mount"))
+        no_drives = SNAP_MODE and not options
         dialog = Gtk.Dialog(title="Ubuntu Backup — choose backup drive", flags=Gtk.DialogFlags.MODAL)
-        dialog.set_default_size(680, 180)
+        dialog.set_default_size(720, 380 if no_drives else 180)
         dialog.set_keep_above(True)
         dialog.set_position(Gtk.WindowPosition.CENTER)
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
@@ -7833,7 +7835,11 @@ def run_tray():
             prepare_button.set_tooltip_text(
                 "Formatting is only available from the .deb packages or Files/Disks. "
                 "The strict snap cannot format a drive.")
-        dialog.add_button("Use drive", Gtk.ResponseType.OK)
+        if no_drives:
+            dialog.add_button("Retry", 4)
+        use_button = dialog.add_button("Use drive", Gtk.ResponseType.OK)
+        if no_drives:
+            use_button.set_sensitive(False)
         box = dialog.get_content_area()
         box.set_spacing(8)
         box.set_border_width(12)
@@ -7857,6 +7863,38 @@ def run_tray():
                                 if SNAP_MODE else "No mounted drives found")
             chooser.set_sensitive(False)
         box.add(chooser)
+        commands = "\n".join((
+            "sudo snap connect ubackup:hardware-observe",
+            "sudo snap connect ubackup:mount-observe",
+            "sudo snap connect ubackup:removable-media",
+            "sudo snap connect ubackup:udisks2",
+        ))
+        if no_drives:
+            frame = Gtk.Frame(label="Snap permissions required")
+            frame_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            frame_box.set_border_width(8)
+            frame_box.add(Gtk.Label(
+                label="The strict snap cannot see block devices until these interfaces are connected:",
+                xalign=0, wrap=True))
+            command_label = Gtk.Label(xalign=0)
+            command_label.set_markup("<tt>" + GLib.markup_escape_text(commands) + "</tt>")
+            command_label.set_selectable(True)
+            command_label.set_line_wrap(False)
+            frame_box.add(command_label)
+            copy_button = Gtk.Button(label="Copy commands")
+            copy_button.set_halign(Gtk.Align.START)
+
+            def copy_commands(_button):
+                clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                clipboard.set_text(commands, -1)
+                clipboard.store()
+
+            copy_button.connect("clicked", copy_commands)
+            frame_box.add(copy_button)
+            frame_box.add(Gtk.Label(label="After connecting, click Retry.",
+                                    xalign=0))
+            frame.add(frame_box)
+            box.add(frame)
         if SNAP_MODE:
             note = Gtk.Label(
                 label="Formatting, fstab mounts and system restore are only available "
@@ -7869,6 +7907,9 @@ def run_tray():
         response = dialog.run()
         selected = options[chooser.get_active()] if options and chooser.get_active() >= 0 else None
         dialog.destroy()
+        if response == 4:
+            GLib.idle_add(lambda: (show_drive_chooser(None, then_backup), False)[1])
+            return
         if response == 3 and not SNAP_MODE:
             run_process_window("Prepare drive", lambda: wizard_prepare_drive(),
                                cancellable=False)
