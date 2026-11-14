@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.18-2 - 2026-11-14
+- Stop the running tray and remove its autostart entry on apt remove.
+
 ## v1.3.18 - 2026-11-14
 - Remove CPU affinity/exclusion handling; backup and restore workers use the system scheduler.
 

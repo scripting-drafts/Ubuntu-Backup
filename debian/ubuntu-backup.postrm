@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    autostart=/etc/xdg/autostart/ubuntu-backup-tray.desktop
+    if [ -f "$autostart" ] && grep -q '^Name=Ubuntu Backup tray' "$autostart" 2>/dev/null; then
+        rm -f "$autostart"
+    fi
+    pkill -f '/usr/lib/ubuntu-backup/ubuntu-backup.py.*tray' 2>/dev/null || true
+fi
+
+#DEBHELPER#
+
+exit 0

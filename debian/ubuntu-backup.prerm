@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ] || [ "$1" = upgrade ] || [ "$1" = deconfigure ]; then
+    pkill -f '/usr/lib/ubuntu-backup/ubuntu-backup.py.*tray' 2>/dev/null || true
+fi
+
+#DEBHELPER#
+
+exit 0
