@@ -8,3 +8,4 @@ Terminal=true
 Categories=System;
 Keywords=backup;home;capture;
 StartupNotify=true
+NoDisplay=true

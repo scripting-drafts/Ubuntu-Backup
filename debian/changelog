@@ -1,3 +1,10 @@
+ubuntu-backup (1.3.17-2) jammy; urgency=medium
+
+  * Hide the helper capture actions from the application menu; they remain
+    available through pkexec and the CLI. Keep one Ubuntu Backup entry.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Sat, 14 Nov 2026 10:45:00 +0100
+
 ubuntu-backup (1.3.17) jammy; urgency=medium
 
   * Sync the APT application and system helper with the 1.3.17 snap release.

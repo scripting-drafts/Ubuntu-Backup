@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.17-2 - 2026-11-14
+- Hide the duplicate helper capture desktop entries from the application menu.
+
 ## v1.3.17 - 2026-11-14
 - Remove the duplicated APT warning in the drive chooser.
 - Make drive and recovery warnings link directly to the APT instructions.
