@@ -4829,20 +4829,12 @@ def is_full_home(path):
 
 def wizard_recover(source=None):
     if SNAP_MODE:
-        apt_hint = ("Only available from the ubuntu-backup / ubuntu-backup-system "
-                    ".deb packages. " + DEB_REPO_URL)
         choice = choose("Recovery", (
             ("1", "Recover user configuration (stage; no system/package changes)"),
             ("2", "Stage full /home (never changes live /home)"),
-            ("3", "Restore system timer/helper (APT only)", apt_hint),
-            ("4", "Restore modified package files (APT only)", apt_hint),
-            ("5", "Deploy packages/snaps/desktop settings (APT only)", apt_hint),
         ), "1")
         if choice == "0":
             return
-        if choice in ("3", "4", "5"):
-            raise ConfigError(
-                "This recovery phase is only available from the .deb package. " + apt_hint)
         if choice == "1":
             if source is not None:
                 path = source

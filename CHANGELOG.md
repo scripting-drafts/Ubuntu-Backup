@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.12 - 2026-11-13
+- Restore the previous recovery dropdown in the strict snap; keep only user configuration and full-/home staging.
+- Keep APT-only guidance in tooltips, CLI help and error messages instead of listing disabled phases.
+
 ## v1.3.11 - 2026-11-13
 - Apply APT-only labels, links and tooltips across CLI commands, menus, tray actions and error messages.
 - Document APT-only actions in the snap description and strict-snap guide.
