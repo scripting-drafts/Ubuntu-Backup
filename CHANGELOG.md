@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.7 - 2026-11-13
+- Tell end users that system-wide capture and package scanning require the ubuntu-backup-system .deb package.
+- Add a disabled tray information row for the same limitation.
+
 ## v1.3.6 - 2026-11-13
 - Add a guided Snap permissions dialog to the drive chooser when no devices are visible.
 - Provide copyable `snap connect` commands and a Retry action.

@@ -3715,6 +3715,12 @@ def _backup_impl(skip_external=False, package_scan=True):
             if _LAST_BACKUP_WARNINGS:
                 print(f"Unreadable paths: {_LAST_BACKUP_WARNINGS} "
                       "(see inventory/unreadable-files.json)")
+            if SNAP_MODE and (not report.get("system_wide_coverage", {}).get("complete")
+                              or "privileged_package_scan" not in report):
+                print("System-wide capture and package scanning are only available "
+                      "from the ubuntu-backup-system .deb package.")
+                print("Install it with: sudo apt install ubuntu-backup-system")
+                print("Then capture with: ubuntu-backup-system capture")
             if skip_external:
                 print("External copy skipped for this run; saved target was not changed.")
             elif config["external_backup"] is None:
@@ -7605,6 +7611,12 @@ def run_tray():
              "Only available from the .deb packages or Files/Disks. The strict snap cannot format."),
         )
         options_menu.append(Gtk.SeparatorMenuItem())
+        info_item = Gtk.MenuItem(label="System-wide capture & package scan: .deb only")
+        info_item.set_sensitive(False)
+        info_item.set_tooltip_text(
+            "Install ubuntu-backup-system from the signed APT repository, then run "
+            "'ubuntu-backup-system capture'.")
+        options_menu.append(info_item)
         for label, hint in deb_only:
             item = Gtk.MenuItem(label=label)
             item.set_sensitive(False)
