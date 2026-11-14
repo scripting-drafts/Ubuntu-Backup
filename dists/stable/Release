@@ -1,20 +1,20 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Sat, 14 Nov 2026 09:41:28 +0000
+Date: Sat, 14 Nov 2026 11:08:58 +0000
 Description: Ubuntu Backup APT repository
 Label: Ubuntu Backup
 Origin: Ubuntu Backup
 Suite: stable
 MD5Sum:
- 33a1ad84cd33cf35d14ece81b7228e4b             2942 main/binary-amd64/Packages
- 84a02389edbe8d378e55e3b96993c634             1332 main/binary-amd64/Packages.gz
+ 206a652572a2f94b6c7df8afc15bda63             2926 main/binary-amd64/Packages
+ 147337659e09ff58f4e9b238ee582433             1328 main/binary-amd64/Packages.gz
 SHA1:
- ea0b098293ec7cc4ae86de359fe3df956c45f611             2942 main/binary-amd64/Packages
- e59eb047b68ea3b42a6f646c09ce48e357b76069             1332 main/binary-amd64/Packages.gz
+ ef492584b562d0508a1b4dc4db9787d6ad96fadd             2926 main/binary-amd64/Packages
+ a7090b85d137e8454032bf5525a997dfb0bea086             1328 main/binary-amd64/Packages.gz
 SHA256:
- a4fd9ac08aebca18b00f92e09db945e60822a9a2ea62f6ec3062624a3910f33b             2942 main/binary-amd64/Packages
- b31857149c01bfeab43cfbaec89f574896ac2eefe1070cb97077398b2c931f31             1332 main/binary-amd64/Packages.gz
+ 2c2166e32ee1c35a7a78f5899abb18e8dd7725de1636d6944bc68ee388826af5             2926 main/binary-amd64/Packages
+ 7e5374e9c1f88684656306801d48b273bce4b647319a1bd11566ca9d6f5a121f             1328 main/binary-amd64/Packages.gz
 SHA512:
- da267a00d1fa1a921d0626161fc086e85bdc21ee5ccea5cd995c04a7f0e68759385319d5eaa6fca1d0123f8815a0a708a5393c6e9f5684c8252e0d9320107c24             2942 main/binary-amd64/Packages
- 2988cc50dd35d97aca59cca158b8251a8798b45171162bb47a314a84376bd7652df420b308d1214d923379d3b9e5348fda48cb5d5b0bb29bb697d7a120f99d52             1332 main/binary-amd64/Packages.gz
+ 62eadd0b378ea4b61001e9dfb534eee4b38e2ce58ebd298d2e965172a09263a73b6ffdcb72300dfe4e4ef0d0ce5b113e9de7f6df6ad258c53b050d30a7880f7b             2926 main/binary-amd64/Packages
+ e0c433fd36e08188ed79322a2dbd08c2ed0a939ccfcd424b46d0cb7e7adcdfa92537313c796b41c85a2d50a2dd78694c3835d439b0262ac6965ca2353e940c45             1328 main/binary-amd64/Packages.gz
