@@ -1,9 +1,3 @@
-ubuntu-backup (1.3.18-2) jammy; urgency=medium
-
-  * Stop the running tray on removal and remove its autostart entry.
-
- -- Gerard Sala <creative.gsp@gmail.com>  Sat, 14 Nov 2026 12:20:00 +0100
-
 ubuntu-backup (1.3.18) jammy; urgency=medium
 
   * Remove CPU affinity/exclusion restrictions; backups use the system scheduler.

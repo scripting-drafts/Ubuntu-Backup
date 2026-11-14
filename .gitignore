@@ -50,5 +50,3 @@
 !system/
 !system/*
 !docs/STRICT-SNAP.md
-!debian/ubuntu-backup.prerm
-!debian/ubuntu-backup.postrm
