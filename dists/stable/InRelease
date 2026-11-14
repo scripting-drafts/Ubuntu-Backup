@@ -4,36 +4,36 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Sat, 14 Nov 2026 09:11:48 +0000
+Date: Sat, 14 Nov 2026 09:41:28 +0000
 Description: Ubuntu Backup APT repository
 Label: Ubuntu Backup
 Origin: Ubuntu Backup
 Suite: stable
 MD5Sum:
- f2e8c6b26aa4f031b209128e99a324ff             2926 main/binary-amd64/Packages
- 368b188b914fb093d00bc981a0e3e3ff             1328 main/binary-amd64/Packages.gz
+ 33a1ad84cd33cf35d14ece81b7228e4b             2942 main/binary-amd64/Packages
+ 84a02389edbe8d378e55e3b96993c634             1332 main/binary-amd64/Packages.gz
 SHA1:
- 5c90f060a7ee6b68b4a25880489f76a931160a77             2926 main/binary-amd64/Packages
- 133e2e420ff8246ada100c0146a022d5ac71c782             1328 main/binary-amd64/Packages.gz
+ ea0b098293ec7cc4ae86de359fe3df956c45f611             2942 main/binary-amd64/Packages
+ e59eb047b68ea3b42a6f646c09ce48e357b76069             1332 main/binary-amd64/Packages.gz
 SHA256:
- e5c9285c71a620edee5fbc3a3dd837089ff23a016b098a9fd1c79cb02f93f67c             2926 main/binary-amd64/Packages
- c274ce74723d256fc7164910cd37f4113bebf097ddd25e4154ac69becb990b57             1328 main/binary-amd64/Packages.gz
+ a4fd9ac08aebca18b00f92e09db945e60822a9a2ea62f6ec3062624a3910f33b             2942 main/binary-amd64/Packages
+ b31857149c01bfeab43cfbaec89f574896ac2eefe1070cb97077398b2c931f31             1332 main/binary-amd64/Packages.gz
 SHA512:
- 04fcf11317b98270d9bb318885c8ac7d7034d38343bce9cf845909ae5f2ea7996761a3cc913b84889b06b8faf00a58608732128ce0377f69ab259aa4cfb2910f             2926 main/binary-amd64/Packages
- e37549c6a102dae428aa8769d78502e6f0d3945f5b2bc1cdbc2a23304020d99a7d224a2049ca6c2d3ec828d1e9ed5644dcc715fa4179f15f29e2540c15e4f478             1328 main/binary-amd64/Packages.gz
+ da267a00d1fa1a921d0626161fc086e85bdc21ee5ccea5cd995c04a7f0e68759385319d5eaa6fca1d0123f8815a0a708a5393c6e9f5684c8252e0d9320107c24             2942 main/binary-amd64/Packages
+ 2988cc50dd35d97aca59cca158b8251a8798b45171162bb47a314a84376bd7652df420b308d1214d923379d3b9e5348fda48cb5d5b0bb29bb697d7a120f99d52             1332 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEEakpR5KHwvrVh7K7QiTcT85Cl3EQFAmr4JdQACgkQiTcT85Cl
-3ER8+g//SYphErGxfRYTJtH2YHkq7Rw27XoZzlmNBWgkzGvuyc7KeGiaWieT/Sh9
-dtk03v1VnCax8E+YP56Asr+XNqOXn2+/nRNJ7w2WnG/mKS82lR1CxBdOQHPNG01Q
-FZdx5qYDqjagcZ+giZkeokETIZmOmYqCQ2xm5X7RO7030v2brV5o+xiCsIq8v/fS
-9UZVPI4TebrOwgyI3Ed+6dUPViiKkkjAkWjFYnvffvSLrF54vAvgFoykYaEwlU79
-EA2NFZ8RzhMyfd47x24fXefHqtrGKfca2WGL++EtWFfJ/qKpaHvPAJG8js85dAHY
-6Sj6JZBQf3veXypbT/6ZYweyVZC9HNQNj2+hoWFQShIS50m0Wy0dbSZ31I2Sz6zP
-Uyyai3+yTJlbu9cBgHVCllmWNAcHJy8ENnhq6zqPeCwqUUDQII7a6nZvRPDG8XX9
-G4Dqjsw+HNorfcFQ+xUDyfpIsAbl61cMGI0J6f67hScoxcEpg0lCDlpnoQGcwGwh
-eQ84e30XwsxExu/8erpjzXe8ZcFIYJC5sNynh7OYdgbBe19pGpAa/Ko5k8+sxkYf
-mxj/9pjwarr25lcqVD2P40QV6t3MCjRs+ydHqaEv3XtsZUI1gZrUKTDTY7MKHMH4
-WJv9tHPLkADPXQP3LHJcDaMo8Puysk80JKpX9V3sATUvdEp+Cng=
-=a/sW
+iQIzBAEBCgAdFiEEakpR5KHwvrVh7K7QiTcT85Cl3EQFAmr4LMgACgkQiTcT85Cl
+3ESASQ/8CiTfH/Fn0FqUV8ZZVIQ/UYdr7oAm6epN1E7btkifoEHF2Pli8d5zeh39
+sWlaD5+Tr4GtKPPL2NqTqaob3cqwQ9TSRZK1fwoL6lOFu5yfRA5CstiStH2dnMhE
+ZXTSMgHZ67UXIXxMr+6czXuSBApxFbz3ZBLOnxraHG++plPSys8AG6qwni1y5zOk
+STz9vUSJSjjoWvTsPts4XQ2DaNm75sMi3UWxmSjINeUGAXgLTZWgnZDe6GAdWehg
+bcfEbC2OsCk34C9efakn4PoyLUJQOOy/6K0Rnk8XwGiDsKQDm/JEaDlZLxykudVZ
+43PE3SkXUw4SYhnK+Br2/YqkVfaRtLBAsxHiQPCbEUqCrgPzx/xZUdHf2459THLd
+rTOLbULZznlSwuCdGnsEhjPSLJAl6G6GgsK8aThsU4TM7Ysq4x6KxYB3aclDaxBV
+QkMkFFr7TPgCzbh23RZundrFE3DadO8FiGZRdqiRzVa2r3WQ+hWLkM/+/cUL7t+F
+3Z4dz0yRztSEE2jgkmMU7Yzmeu63gaZuoS0G6/M4+UkoAYUOA52BfBFaxjnx+Wsu
+u2gzW0dMaEO++1SNubrvvzhzvWc79uOCn6AKOQYqz8NySQAl00t5zpJtEzRQ7t9h
+27C4gUqQhRVn9tOUHaXZE6p2/p2w/xxHylNYx1XL3MctSIWCnCQ=
+=xXEe
 -----END PGP SIGNATURE-----
