@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.18 - 2026-11-14
+- Remove CPU affinity/exclusion handling; backup and restore workers use the system scheduler.
+
 ## v1.3.17-2 - 2026-11-14
 - Hide the duplicate helper capture desktop entries from the application menu.
 

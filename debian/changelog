@@ -1,3 +1,9 @@
+ubuntu-backup (1.3.18) jammy; urgency=medium
+
+  * Remove CPU affinity/exclusion restrictions; backups use the system scheduler.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Sat, 14 Nov 2026 11:10:00 +0100
+
 ubuntu-backup (1.3.17-2) jammy; urgency=medium
 
   * Hide the helper capture actions from the application menu; they remain

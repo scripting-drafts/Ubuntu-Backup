@@ -245,58 +245,6 @@ class CaptureRootTests(unittest.TestCase):
             self.assertIn("_capture-root-worker", calls[0])
 
 
-class CpuGuardTests(unittest.TestCase):
-    def test_excluded_smt_siblings_are_removed(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            kit = Path(directory)
-            (kit / "config").mkdir()
-            (kit / "config/settings.json").write_text(
-                json.dumps({"keep_snapshots": 30, "exclude_cpus": [2]}))
-            saved = backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity
-            backup.KIT = kit
-            backup.cpu_siblings = lambda cpu: {2, 8}
-            backup.os.sched_getaffinity = lambda _pid: {0, 1, 2, 3, 8}
-            try:
-                self.assertEqual(backup.allowed_backup_cpus(), {0, 1, 3})
-            finally:
-                backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity = saved
-
-    def test_rejects_a_set_that_excludes_everything(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            kit = Path(directory)
-            (kit / "config").mkdir()
-            (kit / "config/settings.json").write_text(
-                json.dumps({"keep_snapshots": 30, "exclude_cpus": [2]}))
-            saved = backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity
-            backup.KIT = kit
-            backup.cpu_siblings = lambda cpu: {2, 8}
-            backup.os.sched_getaffinity = lambda _pid: {2, 8}
-            try:
-                with self.assertRaises(backup.ConfigError):
-                    backup.allowed_backup_cpus()
-            finally:
-                backup.KIT, backup.cpu_siblings, backup.os.sched_getaffinity = saved
-
-    def test_no_exclusions_uses_every_available_cpu_without_pinning(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            kit = Path(directory)
-            (kit / "config").mkdir()
-            (kit / "config/settings.json").write_text(
-                json.dumps({"keep_snapshots": 30, "exclude_cpus": []}))
-            available = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-            calls = []
-            saved = backup.KIT, backup.os.sched_getaffinity, backup.os.sched_setaffinity
-            backup.KIT = kit
-            backup.os.sched_getaffinity = lambda _pid: set(available)
-            backup.os.sched_setaffinity = lambda pid, cpus: calls.append((pid, set(cpus)))
-            try:
-                self.assertEqual(backup.allowed_backup_cpus(), available)
-                self.assertEqual(backup.restrict_backup_cpus(), available)
-                self.assertEqual(calls, [])
-            finally:
-                backup.KIT, backup.os.sched_getaffinity, backup.os.sched_setaffinity = saved
-
-
 class StagingCleanupTests(unittest.TestCase):
     def test_remove_staging_removes_tree_and_symlink_without_following(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -1713,8 +1661,7 @@ class PrepareDriveIntegrationTests(unittest.TestCase):
                       "external_backup": None, "home_snapshot": "off",
                       "coverage": "system-wide-configuration", "development_include": [],
                       "home_include": [], "home_reference_only": [],
-                      "system_reference_only": [], "exclude": [], "apt_review_only": [],
-                      "exclude_cpus": []}
+                      "system_reference_only": [], "exclude": [], "apt_review_only": []}
             saved = backup.KIT
             backup.KIT = root
             calls = []
@@ -1932,7 +1879,7 @@ class AtomicFailureTests(unittest.TestCase):
                 "coverage": "system-wide-configuration", "backup_calendar": "daily",
                 "development_include": [], "home_include": [], "home_reference_only": [],
                 "system_reference_only": [], "exclude": [], "apt_review_only": [],
-                "exclude_cpus": [], "external_backup": None,
+                "external_backup": None,
             }))
             saved = backup.KIT, backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS
             backup.KIT = kit
@@ -2080,7 +2027,7 @@ class BackupRestoreFlowTests(unittest.TestCase):
                 "coverage": "system-wide-configuration", "backup_calendar": "daily",
                 "development_include": [], "home_include": [], "home_reference_only": [],
                 "system_reference_only": [], "exclude": [], "apt_review_only": [],
-                "exclude_cpus": [], "external_backup": None,
+                "external_backup": None,
             }))
             saved = backup.KIT, backup._LAST_BACKUP_RUN_ID, backup._LAST_BACKUP_WARNINGS
             backup.KIT = kit
