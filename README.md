@@ -25,4 +25,4 @@ sudo apt install ubuntu-backup-system
 sudo apt install ubuntu-backup
 ```
 
-Key fingerprint: `D924602B5792EAFD32146E903DDA7A6E98513F34`
+Key fingerprint: `6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`
