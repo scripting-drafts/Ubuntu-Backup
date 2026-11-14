@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.10 - 2026-11-13
+- Tag APT-only recovery phases and show their repository instructions.
+
 ## v1.3.9 - 2026-11-13
 - Do not flag strict-snap capability omissions (for example root-owned files under $HOME) as tray warnings or exit status 3.
 - Keep the full details in capture-report.json and unreadable-files.json.
