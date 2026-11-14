@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.15 - 2026-11-14
+- Include the merged staged-restore status reference and APT-aware help in the strict snap.
+- Keep APT CLI help free of snap-only tags.
+
 ## v1.3.14 - 2026-11-13
 - Restore the previous tray Options menu; remove the extra APT-only rows.
 
