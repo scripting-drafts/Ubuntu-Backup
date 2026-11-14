@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.9 - 2026-11-13
+- Do not flag strict-snap capability omissions (for example root-owned files under $HOME) as tray warnings or exit status 3.
+- Keep the full details in capture-report.json and unreadable-files.json.
+
 ## v1.3.8 - 2026-11-13
 - Link the deb-only information message to the APT instructions in the repository.
 

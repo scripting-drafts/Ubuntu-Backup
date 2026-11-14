@@ -3686,7 +3686,14 @@ def _backup_impl(skip_external=False, package_scan=True):
             _check_cancel()
             report = build_snapshot(stage, config)
             _check_cancel()
-            _LAST_BACKUP_WARNINGS = len(report.get("unreadable_files", []))
+            unreadable = report.get("unreadable_files", [])
+            if SNAP_MODE:
+                # Non-owned files under $HOME are a strict-confinement limitation,
+                # not a user-actionable backup warning. Keep them in the report,
+                # but do not mark the tray icon or exit status as warning.
+                unreadable = [entry for entry in unreadable
+                              if entry.get("uid") in (None, os.geteuid())]
+            _LAST_BACKUP_WARNINGS = len(unreadable)
             verify_tree(stage)
             keep_local = bool(config.get("keep_local_backups", False))
             external_enabled = not skip_external and config["external_backup"] is not None
