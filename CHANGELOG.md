@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.17 - 2026-11-14
+- Remove the duplicated APT warning in the drive chooser.
+- Make drive and recovery warnings link directly to the APT instructions.
+
 ## v1.3.16 - 2026-11-14
 - Make snap warning and permission texts selectable for copy/paste.
 

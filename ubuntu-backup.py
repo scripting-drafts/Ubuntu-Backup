@@ -4832,11 +4832,11 @@ def wizard_recover(source=None):
     if SNAP_MODE:
         choice = choose("Recovery", (
             ("1", "Recover user configuration (stage; no system/package changes)",
-             "Warning: system-wide capture, package files, fstab and disk changes are APT-only. "
-             + DEB_REPO_URL),
+             "Warning: system-wide capture, package files, fstab and disk changes are APT-only.",
+             DEB_REPO_URL),
             ("2", "Stage full /home (never changes live /home)",
-             "Warning: live full /home restore and root capture are APT-only. "
-             + DEB_REPO_URL),
+             "Warning: live full /home restore and root capture are APT-only.",
+             DEB_REPO_URL),
         ), "1")
         if choice == "0":
             return
@@ -7431,14 +7431,23 @@ def run_process_window(title, target, cancellable=True):
                     index = chooser.get_active()
                     detail = (items[index][2] if 0 <= index < len(items)
                               and len(items[index]) > 2 else "")
+                    link = (items[index][3] if 0 <= index < len(items)
+                            and len(items[index]) > 3 else None)
                     if detail:
-                        detail_label.set_markup(
-                            "<small>" + GLib.markup_escape_text(detail) + "</small>")
+                        markup = "<small>" + GLib.markup_escape_text(detail)
+                        if link:
+                            markup += (' <a href="' + GLib.markup_escape_text(str(link)) +
+                                       '">APT installation instructions</a>')
+                        detail_label.set_markup(markup + "</small>")
                         detail_label.show()
                     else:
                         detail_label.set_text("")
                         detail_label.hide()
 
+                detail_label.connect(
+                    "activate-link",
+                    lambda _label, uri: (Gtk.show_uri_on_window(
+                        dialog, uri, Gtk.get_current_event_time()), True)[1])
                 chooser.connect("changed", update_detail)
                 box.add(chooser)
                 box.add(detail_label)
@@ -7912,15 +7921,20 @@ def run_tray():
                 return
             _label, _target, action = options[index]
             if action == "mount":
-                selection_warning.set_text(
-                    "Warning: Use drive will mount this filesystem through udisks2. "
-                    "Formatting is APT-only. " + APT_ONLY_HINT)
+                text = ("Warning: Use drive will mount this filesystem through udisks2. "
+                        "Formatting is APT-only.")
             else:
-                selection_warning.set_text(
-                    "Warning: boot/fstab mounts and formatting are APT-only. "
-                    + APT_ONLY_HINT)
+                text = "Warning: boot/fstab mounts and formatting are APT-only."
+            selection_warning.set_markup(
+                GLib.markup_escape_text(text) +
+                ' <a href="' + GLib.markup_escape_text(DEB_REPO_URL) +
+                '">APT installation instructions</a>.')
             selection_warning.show()
 
+        selection_warning.connect(
+            "activate-link",
+            lambda _label, uri: (Gtk.show_uri_on_window(
+                dialog, uri, Gtk.get_current_event_time()), True)[1])
         chooser.connect("changed", update_selection_warning)
         box.add(selection_warning)
         update_selection_warning()
@@ -7958,19 +7972,6 @@ def run_tray():
                                     xalign=0))
             frame.add(frame_box)
             box.add(frame)
-        if SNAP_MODE:
-            note = Gtk.Label(xalign=0, wrap=True)
-            note.set_selectable(True)
-            note.set_markup(
-                "Formatting, fstab mounts and system restore are only available from "
-                "the ubuntu-backup .deb packages. "
-                f'<a href="{GLib.markup_escape_text(DEB_REPO_URL)}">APT installation instructions</a>.')
-            note.set_max_width_chars(72)
-            note.connect(
-                "activate-link",
-                lambda _label, uri: (Gtk.show_uri_on_window(
-                    dialog, uri, Gtk.get_current_event_time()), True)[1])
-            box.add(note)
         box.show_all()
         dialog.present()
         response = dialog.run()
