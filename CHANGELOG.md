@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.14 - 2026-11-13
+- Restore the previous tray Options menu; remove the extra APT-only rows.
+
 ## v1.3.13 - 2026-11-13
 - Show per-selection APT-only warnings in the recovery and drive-chooser dropdowns.
 

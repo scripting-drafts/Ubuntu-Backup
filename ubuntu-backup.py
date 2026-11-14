@@ -7618,38 +7618,9 @@ def run_tray():
     options_menu = Gtk.Menu()
     options_menu.append(drive_option)
     options_menu.append(purge_item)
-    if SNAP_MODE:
-        deb_only = (
-            ("Full /home capture (deb only)",
-             "Only available from ubuntu-backup-system. Run: ubuntu-backup-system home-capture"),
-            ("System configuration restore (deb only)",
-             "Only available from the ubuntu-backup / ubuntu-backup-system .deb packages."),
-            ("Package-file restore (deb only)",
-             "Only available from the ubuntu-backup / ubuntu-backup-system .deb packages."),
-            ("Format a drive (deb only)",
-             "Only available from the .deb packages or Files/Disks. The strict snap cannot format."),
-        )
-        options_menu.append(Gtk.SeparatorMenuItem())
-        info_item = Gtk.MenuItem(
-            label="System-wide capture & package scan: .deb only — open APT instructions")
-        info_item.connect(
-            "activate",
-            lambda _item: Gtk.show_uri_on_window(
-                None, DEB_REPO_URL, Gtk.get_current_event_time()))
-        info_item.set_tooltip_text(
-            "Install ubuntu-backup-system from the signed APT repository, then run "
-            "'ubuntu-backup-system capture'. " + DEB_REPO_URL)
-        options_menu.append(info_item)
-        for label, hint in deb_only:
-            item = Gtk.MenuItem(label=label)
-            item.set_sensitive(False)
-            item.set_tooltip_text(hint)
-            options_menu.append(item)
     options_item = Gtk.MenuItem(label="Options")
     options_item.set_submenu(options_menu)
     if SNAP_MODE:
-        options_item.set_tooltip_text(
-            "Greyed actions are available only from the ubuntu-backup .deb packages.")
         drive_option.set_tooltip_text(
             "Select a mounted drive or mount an unmounted Linux drive with udisks. "
             "Formatting and boot mounts are APT-only. " + APT_ONLY_HINT)
