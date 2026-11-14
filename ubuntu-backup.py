@@ -7425,6 +7425,7 @@ def run_process_window(title, target, cancellable=True):
                     chooser.set_active(active)
                 detail_label = Gtk.Label(xalign=0, wrap=True)
                 detail_label.set_max_width_chars(72)
+                detail_label.set_selectable(True)
 
                 def update_detail(_chooser=None):
                     index = chooser.get_active()
@@ -7899,6 +7900,7 @@ def run_tray():
         box.add(chooser)
         selection_warning = Gtk.Label(xalign=0, wrap=True)
         selection_warning.set_max_width_chars(72)
+        selection_warning.set_selectable(True)
 
         def update_selection_warning(_chooser=None):
             if not SNAP_MODE:
@@ -7932,9 +7934,11 @@ def run_tray():
             frame = Gtk.Frame(label="Snap permissions required")
             frame_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             frame_box.set_border_width(8)
-            frame_box.add(Gtk.Label(
+            intro = Gtk.Label(
                 label="The strict snap cannot see block devices until these interfaces are connected:",
-                xalign=0, wrap=True))
+                xalign=0, wrap=True)
+            intro.set_selectable(True)
+            frame_box.add(intro)
             command_label = Gtk.Label(xalign=0)
             command_label.set_markup("<tt>" + GLib.markup_escape_text(commands) + "</tt>")
             command_label.set_selectable(True)
@@ -7956,6 +7960,7 @@ def run_tray():
             box.add(frame)
         if SNAP_MODE:
             note = Gtk.Label(xalign=0, wrap=True)
+            note.set_selectable(True)
             note.set_markup(
                 "Formatting, fstab mounts and system restore are only available from "
                 "the ubuntu-backup .deb packages. "
