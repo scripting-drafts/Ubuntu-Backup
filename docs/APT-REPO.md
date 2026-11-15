@@ -21,9 +21,8 @@ sudo apt update
 ## Install
 
 ```bash
-sudo apt install ubuntu-backup-system
-# GUI package, only when not using the strict snap:
 sudo apt install ubuntu-backup
+# ubuntu-backup-system is chained and installed automatically
 ```
 
 ## Key

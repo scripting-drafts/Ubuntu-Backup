@@ -36,18 +36,18 @@ secure.
 
 ```bash
 snap install ubackup
-sudo apt install ./ubuntu-backup-system_1.3.1_all.deb
 ```
 
-The debs are also available from the signed APT repository documented in
-[APT-REPO.md](APT-REPO.md):
+APT is the alternative complete installation:
 
 ```bash
-sudo apt install ubuntu-backup-system
+sudo apt install ubuntu-backup
 ```
 
-Install the `ubuntu-backup` GUI deb only when **not** using the snap; installing
-both creates two tray processes. Use `ubuntu-backup-system` alongside the snap.
+`ubuntu-backup` and `ubuntu-backup-system` are chained: installing either pulls
+both, and removing either removes both. There is no standalone APT helper for
+snap-only use. Do not install the APT packages and the snap together; choose one
+distribution method. The debs are documented in [APT-REPO.md](APT-REPO.md).
 
 The strict snap declares `autostart: ubuntu-backup.desktop` and creates
 `$SNAP_USER_DATA/.config/autostart/ubuntu-backup.desktop` on first run. snapd's
@@ -102,9 +102,9 @@ two trays.
 
 ## Boundaries and limitations
 
-- The strict snap does not capture dotfiles or `/etc` itself; install the deb
-  for system-wide coverage. Without it, the snapshot records an explicit
-  `SYSTEM-WIDE COVERAGE INCOMPLETE` warning.
+- The strict snap does not capture dotfiles or `/etc` itself. System-wide
+  coverage requires the APT installation (GUI + chained helper); without it, the
+  snapshot records an explicit `SYSTEM-WIDE COVERAGE INCOMPLETE` warning.
 - Full `/home` **restore**, package-file restore, system `/etc` restore,
   fstab/boot mounts, and drive formatting are explicit deb-only operations.
   The strict snap UI does not offer them.

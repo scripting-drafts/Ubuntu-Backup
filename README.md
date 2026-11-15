@@ -65,14 +65,12 @@ sudo apt update
 sudo apt install ubuntu-backup
 ```
 
-For the strict `ubackup` snap, install the privileged helper instead:
+`ubuntu-backup` and `ubuntu-backup-system` are chained: installing either
+pulls both, and removing either removes both. There is no standalone APT
+helper for snap-only use.
 
-```bash
-sudo apt install ubuntu-backup-system
-```
-
-Do not install the `ubuntu-backup` GUI deb and the snap together; that creates
-two tray processes. The repository key fingerprint is
+Do not install the APT packages and the snap together; choose one distribution
+method. The repository key fingerprint is
 `6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`.
 
 The archive signing key was rotated for 1.3.17. If `apt update` reports

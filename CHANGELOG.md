@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.18-4 - 2026-11-14
+- Chain ubuntu-backup and ubuntu-backup-system: installing or removing either
+  applies to both packages.
+
 ## v1.3.18-3 - 2026-11-14
 - Revert the tray cleanup scripts; uninstalling ubuntu-backup-system clears the tray icon.
 

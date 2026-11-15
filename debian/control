@@ -19,6 +19,7 @@ Description: shared application and native core for Ubuntu Backup
 Package: ubuntu-backup
 Architecture: all
 Depends: ubuntu-backup-core (= ${binary:Version}),
+ ubuntu-backup-system (= ${binary:Version}),
  ${misc:Depends},
  python3,
  python3-gi,
@@ -37,14 +38,15 @@ Description: configuration and full-home backup utility for Ubuntu
 Package: ubuntu-backup-system
 Architecture: all
 Depends: ubuntu-backup-core (= ${binary:Version}),
+ ubuntu-backup (= ${binary:Version}),
  ${misc:Depends},
  python3,
  pkexec | policykit-1
-Suggests: ubuntu-backup
 Description: privileged system capture helper for Ubuntu Backup
  Captures root-owned and other-user configuration into a verified cache inside
- the invoking user's Ubuntu Backup workspace. It is intended for the strict
- Ubuntu Backup snap and for the packaged GUI.
+ the invoking user's Ubuntu Backup workspace. It is installed as a dependency
+ of the Ubuntu Backup GUI package; the two packages install and remove as one
+ unit.
  .
  The helper runs only through pkexec or the request watcher. It never edits
  /etc while capturing; restore actions remain explicit. There is no scheduled
