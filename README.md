@@ -50,14 +50,15 @@ sudo apt install \
 
 ## Install on Linux
 
-| System | Method |
-| --- | --- |
-| Ubuntu 22.04 (jammy) | signed packages from the Launchpad PPA |
-| Other Linux distributions | `./install.sh` from source |
+| Method | System | Notes |
+| --- | --- | --- |
+| Launchpad PPA | Ubuntu 22.04 (jammy) | signed packages, automatic updates |
+| Local `.deb` | Ubuntu/Debian | offline or pinned version |
+| Snap | any Linux with snapd | strict snap, no root or full-`/home` capture |
+| Source installer | any Linux | development and releases without prebuilt packages |
 
-Ubuntu 22.04 is the only series with prebuilt packages. Both paths install the
-same three components: `ubuntu-backup`, `ubuntu-backup-core` and
-`ubuntu-backup-system`.
+The three deb components — `ubuntu-backup`, `ubuntu-backup-core` and
+`ubuntu-backup-system` — install and remove as one unit.
 
 ### Ubuntu 22.04 (PPA)
 
@@ -115,6 +116,29 @@ sudo apt update
 ```
 
 If `apt update` reports `NO_PUBKEY`, re-run the key download command above.
+
+### Local .deb
+
+Build the three packages from a checkout, then install them together:
+
+```bash
+dpkg-buildpackage -b -us -uc
+sudo apt install ./ubuntu-backup_*.deb ./ubuntu-backup-core_*.deb ./ubuntu-backup-system_*.deb
+```
+
+### Snap
+
+```bash
+sudo snap install ubackup
+sudo snap connect ubackup:removable-media
+sudo snap connect ubackup:udisks2
+sudo snap connect ubackup:hardware-observe
+sudo snap connect ubackup:mount-observe
+```
+
+The snap is strict: it never captures root-owned state or a full `/home`. The
+deb packages are chained, so do not install them alongside the snap. Details in
+[docs/STRICT-SNAP.md](docs/STRICT-SNAP.md).
 
 ### Other Linux distributions (source installer)
 
