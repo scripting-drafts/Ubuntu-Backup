@@ -10,8 +10,13 @@ curl -fsSL https://scripting-drafts.github.io/Ubuntu-Backup/ubuntu-backup-archiv
 echo 'deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main' \
   | sudo tee /etc/apt/sources.list.d/ubuntu-backup.list
 sudo apt update
-sudo apt install ubuntu-backup-system
+sudo apt install ubuntu-backup
+# remove, keeping conffiles/autostart:
+sudo apt remove ubuntu-backup
+# or remove conffiles/autostart too:
+sudo apt purge ubuntu-backup
 </pre>
+<p>The three packages install and remove together. Backups are not removed.</p>
 <p>Key fingerprint: <code>6A4A51E4A1F0BEB561ECAED0893713F390A5DC44</code></p>
 <p><a href="README.md">README</a></p>
 </body>

@@ -20,9 +20,23 @@ sudo apt update
 ## Install
 
 ```bash
-sudo apt install ubuntu-backup-system
-# Optional GUI package (do not combine with the strict snap):
 sudo apt install ubuntu-backup
 ```
+
+`ubuntu-backup`, `ubuntu-backup-system` and `ubuntu-backup-core` are chained:
+installing or removing any one applies to all three. Do not combine the APT
+packages with the strict snap.
+
+## Remove
+
+```bash
+# Keep conffiles and the tray autostart entry
+sudo apt remove ubuntu-backup
+
+# Also remove conffiles and the tray autostart entry
+sudo apt purge ubuntu-backup
+```
+
+Backups in `~/Ubuntu-Backup` and on external drives are not removed.
 
 Key fingerprint: `6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`
