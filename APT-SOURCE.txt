@@ -1,3 +1,7 @@
-Ubuntu Backup APT repository
+Ubuntu Backup APT repository (retired)
 
-deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main
+The debs are now published from the Launchpad PPA:
+
+deb [signed-by=/etc/apt/keyrings/toomanypatterns-ubuntu-backup.gpg] https://ppa.launchpadcontent.net/toomanypatterns/ubuntu-backup/ubuntu/ jammy main
+
+PPA key fingerprint: DD690D4A9810E29DE3824FF2FBD3F68940827DC3

@@ -1,42 +1,16 @@
-# Ubuntu Backup APT repository
+# Ubuntu Backup APT repository (retired)
 
-Signed `stable` repository for the Ubuntu Backup debs.
-
-## Install the archive key
+The debs are now published from the Launchpad PPA:
 
 ```bash
-curl -fsSL https://scripting-drafts.github.io/Ubuntu-Backup/ubuntu-backup-archive-key.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/ubuntu-backup-archive-keyring.gpg
-```
-
-## Add the repository
-
-```bash
-echo 'deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main' \
-  | sudo tee /etc/apt/sources.list.d/ubuntu-backup.list
+sudo add-apt-repository ppa:toomanypatterns/ubuntu-backup
 sudo apt update
-```
-
-## Install
-
-```bash
 sudo apt install ubuntu-backup
 ```
 
-`ubuntu-backup`, `ubuntu-backup-system` and `ubuntu-backup-core` are chained:
-installing or removing any one applies to all three. Do not combine the APT
-packages with the strict snap.
+- PPA key fingerprint: `DD690D4A9810E29DE3824FF2FBD3F68940827DC3`
+- Source: <https://github.com/scripting-drafts/Ubuntu-Backup>
 
-## Remove
-
-```bash
-# Keep conffiles and the tray autostart entry
-sudo apt remove ubuntu-backup
-
-# Also remove conffiles and the tray autostart entry
-sudo apt purge ubuntu-backup
-```
-
-Backups in `~/Ubuntu-Backup` and on external drives are not removed.
-
-Key fingerprint: `6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`
+The `pool/` and `dists/` trees here are a historical archive and no longer
+receive updates. If `/etc/apt/sources.list.d/ubuntu-backup.list` still points
+at this site, remove it.

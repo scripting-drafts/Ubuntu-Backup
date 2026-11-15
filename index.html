@@ -1,23 +1,21 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Ubuntu Backup APT repository</title></head>
+<head><meta charset="utf-8"><title>Ubuntu Backup — repository retired</title></head>
 <body>
-<h1>Ubuntu Backup APT repository</h1>
-<p>Signed <code>stable</code> repository for the Ubuntu Backup debs.</p>
+<h1>This APT repository is retired</h1>
+<p>Ubuntu Backup debs are published from the Launchpad PPA:</p>
 <pre>
-curl -fsSL https://scripting-drafts.github.io/Ubuntu-Backup/ubuntu-backup-archive-key.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/ubuntu-backup-archive-keyring.gpg
-echo 'deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main' \
-  | sudo tee /etc/apt/sources.list.d/ubuntu-backup.list
+sudo add-apt-repository ppa:toomanypatterns/ubuntu-backup
 sudo apt update
 sudo apt install ubuntu-backup
-# remove, keeping conffiles/autostart:
-sudo apt remove ubuntu-backup
-# or remove conffiles/autostart too:
-sudo apt purge ubuntu-backup
 </pre>
-<p>The three packages install and remove together. Backups are not removed.</p>
-<p>Key fingerprint: <code>6A4A51E4A1F0BEB561ECAED0893713F390A5DC44</code></p>
-<p><a href="README.md">README</a></p>
+<p>PPA key fingerprint: <code>DD690D4A9810E29DE3824FF2FBD3F68940827DC3</code></p>
+<p>Remove the old GitHub Pages source before switching:</p>
+<pre>
+sudo rm -f /etc/apt/sources.list.d/ubuntu-backup.list
+</pre>
+<p>The <code>pool/</code> and <code>dists/</code> trees below are a historical
+archive. They no longer receive updates.</p>
+<p><a href="https://github.com/scripting-drafts/Ubuntu-Backup">Source</a></p>
 </body>
 </html>
