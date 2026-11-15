@@ -1,20 +1,20 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Sun, 15 Nov 2026 10:07:14 +0000
+Date: Sun, 15 Nov 2026 10:43:32 +0000
 Description: Ubuntu Backup APT repository
 Label: Ubuntu Backup
 Origin: Ubuntu Backup
 Suite: stable
 MD5Sum:
- f6777b6d20871717e32201d733e3b904             3022 main/binary-amd64/Packages
- 92c93183850587f617a50583f5c8f7ca             1349 main/binary-amd64/Packages.gz
+ 3743cd3721368743b7fe5c8c64aac6df             3114 main/binary-amd64/Packages
+ d5c6fdc4de5263a58ed3e6eab3913b78             1362 main/binary-amd64/Packages.gz
 SHA1:
- 89dc8d56b11c7394de4bae66266af302a7305df4             3022 main/binary-amd64/Packages
- 02d706486f3b246351316a8fd94641524aec2977             1349 main/binary-amd64/Packages.gz
+ 2232ce61176fb3e725b2d29be6f8ebdb15ec084c             3114 main/binary-amd64/Packages
+ d58e5ee70f93542dcb0c329fad6ec7708ba51e70             1362 main/binary-amd64/Packages.gz
 SHA256:
- 92a96f4cadf61a36dacb5d25657c327d9c54cee7dc0cf9782e229656c5ae9f10             3022 main/binary-amd64/Packages
- bba40410b92047c88c90f486af2f48d02f6bd60a3d7ab1b35b9685b858aa01d5             1349 main/binary-amd64/Packages.gz
+ 5d4c9ea7fc7d08d9a5c78247653ed4f29b182a219e6f921cd4b4c2c1ea6ab284             3114 main/binary-amd64/Packages
+ e5d378c9055349bb6a47f53a12f8100e6589da6a79d27e14f324fa9ee22b55cc             1362 main/binary-amd64/Packages.gz
 SHA512:
- 54a66980ce19be196afced99856df7d1aba9cbbcfee415360f61706e232c1b902a8be261b81abc6c8828140eeccd8c7c0c1c1cc854ff770a0b6a3cb8a5cc43a7             3022 main/binary-amd64/Packages
- 2ca0fca49977e3ba60def0c922a36c65f7d935e7cf163ddfe4a4d7de396c2314bbf4fb622a8eb285872e3883d525a7ef62de068936ccfe8dafc50dfedc63ec08             1349 main/binary-amd64/Packages.gz
+ 3057bebba1249b322c45b8fbe4d6ee0fa4ca47cba13fa1a1d91f81beb295143d5d52a04a3c9b4762646feb6a9124ce3081f20aaca68c2fc1be2dc1b963a0b39d             3114 main/binary-amd64/Packages
+ f96d58cd9aff77b6385d365d3ed33b2abd4e52f860e014b6682dbc9280b389411b8d6cbd1d025a45172aedf7dd9ccb52bc1cc2ca5dc8b65d3f9203ab6016b7d6             1362 main/binary-amd64/Packages.gz
