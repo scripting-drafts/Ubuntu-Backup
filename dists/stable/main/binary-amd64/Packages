@@ -1,14 +1,14 @@
 Package: ubuntu-backup
-Version: 1.3.18-3
+Version: 1.3.18-4
 Architecture: all
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
 Installed-Size: 24
-Depends: ubuntu-backup-core (= 1.3.18-3), python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, libayatana-appindicator3-1, gir1.2-ayatanaappindicator3-0.1
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup_1.3.18-3_all.deb
-Size: 4094
-MD5sum: c6a3756215a3464ea333aa031bc4956f
-SHA1: 7eadf53f23e53887716b488918d4f0fa40c2cfcf
-SHA256: 742ac4361c418050949442d73e764d1b0b26b7089bdf3ba221db40d648a3f37f
+Depends: ubuntu-backup-core (= 1.3.18-4), ubuntu-backup-system (= 1.3.18-4), python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, libayatana-appindicator3-1, gir1.2-ayatanaappindicator3-0.1
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup_1.3.18-4_all.deb
+Size: 4142
+MD5sum: 63d26a197192adab553d4cad34ccbb4e
+SHA1: 6b3649c0f77592f41eb354219ea0c3e9c50c1237
+SHA256: 61729d09b053c90ced8df67fc51b46a999184bd84d7c1fb6721d192dac17243a
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
@@ -22,16 +22,16 @@ Description: configuration and full-home backup utility for Ubuntu
 
 Package: ubuntu-backup-core
 Source: ubuntu-backup
-Version: 1.3.18-3
+Version: 1.3.18-4
 Architecture: amd64
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
 Installed-Size: 536
 Depends: libc6 (>= 2.34), libssl3 (>= 3.0.0~~alpha1), python3
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup-core_1.3.18-3_amd64.deb
-Size: 109550
-MD5sum: ca7f6b99b7837d876b608e2f1fb7b298
-SHA1: bbb9c323c2579e5a0c9874590bc080fe316e6ad1
-SHA256: 45a0617bdeab869e7df383d20ce87a4bcf67306435b8d092a19a13518056d25a
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup-core_1.3.18-4_amd64.deb
+Size: 109572
+MD5sum: 68ff304da7bb60ea98827b493de00195
+SHA1: 289097fabfae5c711483b8f7445fa33bd119b016
+SHA256: 433b77a4bfe7d0bda357193cf862403729eaddc6dbbd2f1194bcd67ccb4378dc
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
@@ -42,24 +42,24 @@ Description: shared application and native core for Ubuntu Backup
 
 Package: ubuntu-backup-system
 Source: ubuntu-backup
-Version: 1.3.18-3
+Version: 1.3.18-4
 Architecture: all
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
 Installed-Size: 66
-Depends: ubuntu-backup-core (= 1.3.18-3), init-system-helpers (>= 1.52), python3, pkexec | policykit-1
-Suggests: ubuntu-backup
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup-system_1.3.18-3_all.deb
-Size: 13250
-MD5sum: 52349c222291dc3f9d5050d360320634
-SHA1: c5aca344c26784d1c17d707e4acd286153a11c38
-SHA256: 62e812cbf8167ad1ef43ec128933280c520a922b920a2fbe21b9b1b1a3c90d8a
+Depends: ubuntu-backup-core (= 1.3.18-4), ubuntu-backup (= 1.3.18-4), init-system-helpers (>= 1.52), python3, pkexec | policykit-1
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup-system_1.3.18-4_all.deb
+Size: 13300
+MD5sum: 50b63b4533b2b4fdd3f1111fbc5a49e1
+SHA1: 962b9e6c4b25f4d329fa6e842f4e92d8d616d732
+SHA256: 5e9e7d711d906e0d9c86891be9f94bd03293c1f73c41206764a0a353a13295e5
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
 Description: privileged system capture helper for Ubuntu Backup
  Captures root-owned and other-user configuration into a verified cache inside
- the invoking user's Ubuntu Backup workspace. It is intended for the strict
- Ubuntu Backup snap and for the packaged GUI.
+ the invoking user's Ubuntu Backup workspace. It is installed as a dependency
+ of the Ubuntu Backup GUI package; the two packages install and remove as one
+ unit.
  .
  The helper runs only through pkexec or the request watcher. It never edits
  /etc while capturing; restore actions remain explicit. There is no scheduled
