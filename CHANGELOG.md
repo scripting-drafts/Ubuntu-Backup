@@ -3,6 +3,7 @@
 ## v1.3.20 - 2026-11-15
 - Publish the debs from the Launchpad PPA `ppa:toomanypatterns/ubuntu-backup`;
   the GitHub Pages APT repository is retired.
+- Build-depend on `python3`, required by the native-core test target.
 
 ## v1.3.19 - 2026-11-15
 - Center the green status dot in the Ubuntu Backup icon.
