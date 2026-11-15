@@ -10,11 +10,13 @@ Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
 Package: ubuntu-backup-core
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends},
+ ubuntu-backup (= ${binary:Version}),
+ ubuntu-backup-system (= ${binary:Version}),
  python3
 Description: shared application and native core for Ubuntu Backup
  Provides the main Ubuntu Backup application, the privileged-worker entry
- points, and the native full-/home engine used by both the GUI and the system
- helper packages.
+ points, and the native full-/home engine for the GUI and system helper. The
+ three packages install and remove as one unit.
 
 Package: ubuntu-backup
 Architecture: all

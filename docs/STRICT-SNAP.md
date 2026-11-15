@@ -44,9 +44,9 @@ APT is the alternative complete installation:
 sudo apt install ubuntu-backup
 ```
 
-`ubuntu-backup` and `ubuntu-backup-system` are chained: installing either pulls
-both, and removing either removes both. There is no standalone APT helper for
-snap-only use. Do not install the APT packages and the snap together; choose one
+`ubuntu-backup`, `ubuntu-backup-system` and `ubuntu-backup-core` are chained:
+installing or removing any one applies to all three. There is no standalone
+APT helper for snap-only use. Do not install the APT packages and the snap together; choose one
 distribution method. The debs are documented in [APT-REPO.md](APT-REPO.md).
 
 The strict snap declares `autostart: ubuntu-backup.desktop` and creates

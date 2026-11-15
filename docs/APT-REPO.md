@@ -22,7 +22,7 @@ sudo apt update
 
 ```bash
 sudo apt install ubuntu-backup
-# ubuntu-backup-system is chained and installed automatically
+# core and system are chained and installed automatically
 ```
 
 ## Key

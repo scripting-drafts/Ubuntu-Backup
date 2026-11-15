@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.18-5 - 2026-11-15
+- Link ubuntu-backup-core with the GUI and system helper; installing or removing
+  any of the three applies to all three.
+
 ## v1.3.18-4 - 2026-11-14
 - Chain ubuntu-backup and ubuntu-backup-system: installing or removing either
   applies to both packages.
