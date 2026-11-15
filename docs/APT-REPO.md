@@ -1,77 +1,55 @@
-# Signed APT repository
+# APT publishing
 
-The debs are published from a signed `stable` repository on GitHub Pages:
+Ubuntu Backup is published from the Launchpad PPA:
 
 ```text
-https://scripting-drafts.github.io/Ubuntu-Backup/
+ppa:toomanypatterns/ubuntu-backup
+https://ppa.launchpadcontent.net/toomanypatterns/ubuntu-backup/ubuntu/ jammy main
 ```
 
-## Add the key and repository
-
-```bash
-curl -fsSL https://scripting-drafts.github.io/Ubuntu-Backup/ubuntu-backup-archive-key.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/ubuntu-backup-archive-keyring.gpg
-
-echo 'deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main' \
-  | sudo tee /etc/apt/sources.list.d/ubuntu-backup.list
-
-sudo apt update
-```
+Launchpad signs the archive with `DD690D4A9810E29DE3824FF2FBD3F68940827DC3`;
+each upload is signed with the maintainer key registered on Launchpad.
 
 ## Install
 
 ```bash
+sudo add-apt-repository ppa:toomanypatterns/ubuntu-backup
+sudo apt update
 sudo apt install ubuntu-backup
-# core and system are chained and installed automatically
 ```
 
-## Key
+`ubuntu-backup`, `ubuntu-backup-core` and `ubuntu-backup-system` are chained and
+install or remove as one unit.
 
-- Fingerprint: `6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`
-- Public key: `ubuntu-backup-archive-key.asc` at the repository root.
-- The archive key is separate from the maintainer's personal GPG key. It signs
-  only repository metadata; protect the private key and the GitHub account.
+## Publish an update
 
-## Publishing an update
-
-Run from the repository root.
+`debian/source/format` is `3.0 (native)`, so the version carries no Debian
+revision and `debian/changelog` must target `jammy`.
 
 ```bash
-# Build the debs, copy them into pool/main/u/ubuntu-backup/, then keep only
-# the version being published so superseded debs are not republished.
-VERSION=<version>
-find pool/main/u/ubuntu-backup -maxdepth 1 -name '*.deb' \
-  -not -name "*_${VERSION}_*" -delete
+# 1. Add a debian/changelog entry; the tree must be clean.
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+dpkg-buildpackage -S -sa -kF104A3F1CE9A23540AEB8F24F31978E49E85DDCA
 
-# Index; gzip -n keeps Packages.gz reproducible.
-dpkg-scanpackages pool /dev/null > dists/stable/main/binary-amd64/Packages
-gzip -9nc dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
-
-# Release; drop the old metadata first, and write outside the tree, so it
-# does not checksum its own output.
-rm -f dists/stable/Release dists/stable/Release.gpg dists/stable/InRelease
-apt-ftparchive \
-  -o APT::FTPArchive::Release::Origin="Ubuntu Backup" \
-  -o APT::FTPArchive::Release::Label="Ubuntu Backup" \
-  -o APT::FTPArchive::Release::Suite=stable \
-  -o APT::FTPArchive::Release::Codename=stable \
-  -o APT::FTPArchive::Release::Architectures=amd64 \
-  -o APT::FTPArchive::Release::Components=main \
-  -o APT::FTPArchive::Release::Description="Ubuntu Backup APT repository" \
-  release dists/stable > /tmp/Release
-mv /tmp/Release dists/stable/Release
-
-# Sign both the inline and the detached metadata.
-GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive \
-  gpg --batch --yes --clearsign -u 6A4A51E4A1F0BEB561ECAED0893713F390A5DC44 \
-  -o dists/stable/InRelease dists/stable/Release
-GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive \
-  gpg --batch --yes --armor --detach-sign -u 6A4A51E4A1F0BEB561ECAED0893713F390A5DC44 \
-  -o dists/stable/Release.gpg dists/stable/Release
-
-# Verify before pushing.
-GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive gpg --verify dists/stable/InRelease
-GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive gpg --verify dists/stable/Release.gpg dists/stable/Release
+# 2. Upload; the target comes from ~/.dput.cf.
+dput ubuntu-backup ../ubuntu-backup_<version>_source.changes
 ```
 
-Commit and push the `gh-pages` branch. GitHub Pages rebuilds automatically.
+Launchpad builds the three binary packages for jammy, then publishes them. Watch
+the queue before announcing the release:
+
+```bash
+curl -fsS "https://api.launchpad.net/1.0/~toomanypatterns/+archive/ubuntu/ubuntu-backup?ws.op=getPublishedSources&source_name=ubuntu-backup"
+```
+
+Verify on a client that the candidate resolves from the PPA:
+
+```bash
+apt-cache policy ubuntu-backup
+```
+
+## Retired origin
+
+The GitHub Pages repository at `scripting-drafts.github.io/Ubuntu-Backup` is no
+longer updated. Its `gh-pages` branch is kept as a historical archive only; do
+not add it to new systems and do not publish new debs there.

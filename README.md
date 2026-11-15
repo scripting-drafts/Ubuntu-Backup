@@ -50,16 +50,24 @@ sudo apt install \
 
 ## Installation
 
-### APT repository
+### APT repository (Launchpad PPA)
 
-Ubuntu Backup is available from the signed APT repository:
+Ubuntu Backup is published from the signed Launchpad PPA:
 
 ```bash
-curl -fsSL https://scripting-drafts.github.io/Ubuntu-Backup/ubuntu-backup-archive-key.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/ubuntu-backup-archive-keyring.gpg
+sudo add-apt-repository ppa:toomanypatterns/ubuntu-backup
+sudo apt update
+sudo apt install ubuntu-backup
+```
 
-echo 'deb [signed-by=/usr/share/keyrings/ubuntu-backup-archive-keyring.gpg] https://scripting-drafts.github.io/Ubuntu-Backup/ stable main' \
-  | sudo tee /etc/apt/sources.list.d/ubuntu-backup.list
+Without `add-apt-repository`, add the key and source by hand:
+
+```bash
+curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xDD690D4A9810E29DE3824FF2FBD3F68940827DC3" \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/toomanypatterns-ubuntu-backup.gpg
+
+echo 'deb [signed-by=/etc/apt/keyrings/toomanypatterns-ubuntu-backup.gpg] https://ppa.launchpadcontent.net/toomanypatterns/ubuntu-backup/ubuntu/ jammy main' \
+  | sudo tee /etc/apt/sources.list.d/toomanypatterns-ubuntu-backup.list
 
 sudo apt update
 sudo apt install ubuntu-backup
@@ -70,8 +78,8 @@ installing or removing any one applies to all three. There is no standalone
 APT helper for snap-only use.
 
 Do not install the APT packages and the snap together; choose one distribution
-method. The repository key fingerprint is
-`6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`.
+method. The PPA key fingerprint is
+`DD690D4A9810E29DE3824FF2FBD3F68940827DC3`.
 
 Removal is also chained. Choose whether to keep configuration files and the
 tray autostart entry:
@@ -87,8 +95,17 @@ sudo apt purge ubuntu-backup
 Backups under `~/Ubuntu-Backup` and on external drives are not removed by
 either command.
 
-The archive signing key was rotated for 1.3.17. If `apt update` reports
-`NO_PUBKEY`, re-run the key download command above.
+The former GitHub Pages repository
+(`https://scripting-drafts.github.io/Ubuntu-Backup/`) is retired and no longer
+updated. If it is still configured, switch to the PPA:
+
+```bash
+sudo rm -f /etc/apt/sources.list.d/ubuntu-backup.list
+sudo add-apt-repository ppa:toomanypatterns/ubuntu-backup
+sudo apt update
+```
+
+If `apt update` reports `NO_PUBKEY`, re-run the key download command above.
 
 ### Source installer
 
