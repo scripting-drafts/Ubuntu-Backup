@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.19 - 2026-11-15
+- Center the green status dot in the Ubuntu Backup icon.
+
 ## v1.3.18-5 - 2026-11-15
 - Link ubuntu-backup-core with the GUI and system helper; installing or removing
   any of the three applies to all three.
