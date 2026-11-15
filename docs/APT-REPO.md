@@ -34,14 +34,44 @@ sudo apt install ubuntu-backup
 
 ## Publishing an update
 
+Run from the repository root.
+
 ```bash
-# Build the debs, copy them into pool/main/u/ubuntu-backup/, then:
+# Build the debs, copy them into pool/main/u/ubuntu-backup/, then keep only
+# the version being published so superseded debs are not republished.
+VERSION=<version>
+find pool/main/u/ubuntu-backup -maxdepth 1 -name '*.deb' \
+  -not -name "*_${VERSION}_*" -delete
+
+# Index; gzip -n keeps Packages.gz reproducible.
 dpkg-scanpackages pool /dev/null > dists/stable/main/binary-amd64/Packages
-gzip -9c dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
-apt-ftparchive release dists/stable > /tmp/Release && mv /tmp/Release dists/stable/Release
+gzip -9nc dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
+
+# Release; drop the old metadata first, and write outside the tree, so it
+# does not checksum its own output.
+rm -f dists/stable/Release dists/stable/Release.gpg dists/stable/InRelease
+apt-ftparchive \
+  -o APT::FTPArchive::Release::Origin="Ubuntu Backup" \
+  -o APT::FTPArchive::Release::Label="Ubuntu Backup" \
+  -o APT::FTPArchive::Release::Suite=stable \
+  -o APT::FTPArchive::Release::Codename=stable \
+  -o APT::FTPArchive::Release::Architectures=amd64 \
+  -o APT::FTPArchive::Release::Components=main \
+  -o APT::FTPArchive::Release::Description="Ubuntu Backup APT repository" \
+  release dists/stable > /tmp/Release
+mv /tmp/Release dists/stable/Release
+
+# Sign both the inline and the detached metadata.
 GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive \
   gpg --batch --yes --clearsign -u 6A4A51E4A1F0BEB561ECAED0893713F390A5DC44 \
   -o dists/stable/InRelease dists/stable/Release
+GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive \
+  gpg --batch --yes --armor --detach-sign -u 6A4A51E4A1F0BEB561ECAED0893713F390A5DC44 \
+  -o dists/stable/Release.gpg dists/stable/Release
+
+# Verify before pushing.
+GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive gpg --verify dists/stable/InRelease
+GNUPGHOME=/home/gerard/.gnupg-ubuntu-backup-archive gpg --verify dists/stable/Release.gpg dists/stable/Release
 ```
 
 Commit and push the `gh-pages` branch. GitHub Pages rebuilds automatically.
