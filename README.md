@@ -73,6 +73,20 @@ Do not install the APT packages and the snap together; choose one distribution
 method. The repository key fingerprint is
 `6A4A51E4A1F0BEB561ECAED0893713F390A5DC44`.
 
+Removal is also chained. Choose whether to keep configuration files and the
+tray autostart entry:
+
+```bash
+# Keep conffiles and autostart (packages remain in rc state)
+sudo apt remove ubuntu-backup
+
+# Remove packages plus conffiles and autostart
+sudo apt purge ubuntu-backup
+```
+
+Backups under `~/Ubuntu-Backup` and on external drives are not removed by
+either command.
+
 The archive signing key was rotated for 1.3.17. If `apt update` reports
 `NO_PUBKEY`, re-run the key download command above.
 
