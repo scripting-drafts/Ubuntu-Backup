@@ -48,9 +48,18 @@ sudo apt install \
   build-essential libssl-dev
 ```
 
-## Installation
+## Install on Linux
 
-### APT repository
+| System | Method |
+| --- | --- |
+| Ubuntu 22.04 (jammy) | signed packages from the Launchpad PPA |
+| Other Linux distributions | `./install.sh` from source |
+
+Ubuntu 22.04 is the only series with prebuilt packages. Both paths install the
+same three components: `ubuntu-backup`, `ubuntu-backup-core` and
+`ubuntu-backup-system`.
+
+### Ubuntu 22.04 (PPA)
 
 Ubuntu Backup is published from the signed Launchpad PPA:
 
@@ -107,7 +116,7 @@ sudo apt update
 
 If `apt update` reports `NO_PUBKEY`, re-run the key download command above.
 
-### Source installer
+### Other Linux distributions (source installer)
 
 Clone the repository and run the installer as your regular desktop user. Do **not** run the installer with `sudo`.
 
