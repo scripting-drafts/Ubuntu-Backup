@@ -50,7 +50,7 @@ sudo apt install \
 
 ## Installation
 
-### APT repository (Launchpad PPA)
+### APT repository
 
 Ubuntu Backup is published from the signed Launchpad PPA:
 
