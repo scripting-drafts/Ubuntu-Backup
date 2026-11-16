@@ -7858,18 +7858,6 @@ def run_process_window(title, target, cancellable=True):
     outer.pack_start(scroll, True, True, 0)
     buffer = view.get_buffer()
     autoscroll_mark = buffer.create_mark("autoscroll-end", buffer.get_end_iter(), False)
-    scroll_state = {"follow": True, "last": 0.0}
-
-    def on_scroll_changed(adjustment):
-        value = adjustment.get_value()
-        maximum = adjustment.get_upper() - adjustment.get_page_size()
-        if value >= maximum - 8:
-            scroll_state["follow"] = True
-        elif value < scroll_state["last"] - 1:
-            scroll_state["follow"] = False
-        scroll_state["last"] = value
-
-    scroll.get_vadjustment().connect("value-changed", on_scroll_changed)
     controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     output = queue.Queue()
     state = {"active": True, "ok": False, "cancelled": False}
@@ -7890,17 +7878,6 @@ def run_process_window(title, target, cancellable=True):
     close_button.set_sensitive(False)
     close_button.connect("clicked", lambda _button: window.destroy())
     controls.pack_end(close_button, False, False, 0)
-    expand_button = Gtk.Button(label="Expand")
-    expand_button.set_tooltip_text("Show the complete log at maximum window size.")
-    def toggle_expand(_button):
-        if window.is_maximized():
-            window.unmaximize()
-            expand_button.set_label("Expand")
-        else:
-            window.maximize()
-            expand_button.set_label("Restore size")
-    expand_button.connect("clicked", toggle_expand)
-    controls.pack_start(expand_button, False, False, 0)
     outer.pack_start(controls, False, False, 0)
 
     class Writer:
@@ -7915,8 +7892,7 @@ def run_process_window(title, target, cancellable=True):
     def append(text):
         buffer.insert(buffer.get_end_iter(), text)
         buffer.move_mark(autoscroll_mark, buffer.get_end_iter())
-        if scroll_state["follow"]:
-            view.scroll_to_mark(autoscroll_mark, 0.0, True, 0.0, 1.0)
+        view.scroll_to_mark(autoscroll_mark, 0.0, True, 0.0, 1.0)
 
     def drain():
         if not window.get_visible():

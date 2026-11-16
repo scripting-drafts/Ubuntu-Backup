@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.26 - 2026-11-16
+- Keep the process log autoscrolling when it is not the focused view.
+- Remove the Expand button.
+
 ## v1.3.25 - 2026-11-16
 - Require the broker client PID to match the connected socket peer.
 
