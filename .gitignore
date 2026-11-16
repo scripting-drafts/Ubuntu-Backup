@@ -50,3 +50,5 @@
 !system/
 !system/*
 !docs/STRICT-SNAP.md
+!scripts/
+!scripts/*
