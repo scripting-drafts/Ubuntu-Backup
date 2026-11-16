@@ -1,3 +1,12 @@
+ubuntu-backup (1.3.23) jammy; urgency=medium
+
+  * Run every privileged Backup/Restore step through one sudo broker session,
+    so each process window asks for the password at most once.
+  * Keep the broker's actions fixed and validated, stream worker output, and
+    stop the active worker group when the operation is cancelled.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Mon, 16 Nov 2026 18:00:00 +0100
+
 ubuntu-backup (1.3.22) jammy; urgency=medium
 
   * Merge live status into the Backup and Restore process windows, add an

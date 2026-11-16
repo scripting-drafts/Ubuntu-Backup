@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.23 - 2026-11-16
+- Ask for the sudo password at most once per Backup or Restore process window.
+- Route capture, scan, full /home, system restore, package files, APT, snap and
+  system Flatpak steps through one validated root broker.
+- Stream broker output into the process log and stop the worker group on cancel.
+
 ## v1.3.22 - 2026-11-16
 - Merge Live status into the Backup and Restore windows.
 - Add an Expand control so the full process log can use the whole screen.

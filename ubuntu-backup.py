@@ -20,6 +20,7 @@ import posixpath
 import pwd
 import queue
 import re
+import select
 import shutil
 import signal
 import socket
@@ -995,7 +996,12 @@ def restore_package_files(snapshot=None, apply=False, packages=None, paths=None,
     })
     command = ["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
                "_restore-package-files-worker", "--plan", str(plan_path)]
-    result = subprocess.run(command, check=False)
+    if _PRIVILEGE_BROKER is not None:
+        result = _PRIVILEGE_BROKER.run("package_restore", {"plan": str(plan_path)})
+        for line in result.stdout.splitlines():
+            print(line)
+    else:
+        result = subprocess.run(command, check=False)
     if result.returncode:
         raise ConfigError("Package-file restore worker failed; inspect the result file.")
     return plan
@@ -1342,7 +1348,10 @@ def capture_root_package_scan(non_interactive=False, force=False):
     command = ["sudo"] + (["-n"] if non_interactive else [])
     command += ["/usr/bin/python3", "-I", str(SCRIPT_PATH), "--workspace", str(KIT),
                 "_capture-package-files-worker"]
-    result = run_cancellable(command)
+    if _PRIVILEGE_BROKER is not None:
+        result = _PRIVILEGE_BROKER.run("package_scan")
+    else:
+        result = run_cancellable(command)
     for line in result.stdout.splitlines():
         print(line)
     for line in result.stderr.splitlines():
@@ -3945,8 +3954,14 @@ def deploy(args):
         return
     if args.packages and supported:
         # Newer candidates and missing optional packages must not block code reapply.
-        result = subprocess.run(["sudo", "apt-get", "install", "--no-remove", "--no-install-recommends",
-                                 "--", *supported], check=False)
+        if _PRIVILEGE_BROKER is not None:
+            result = _PRIVILEGE_BROKER.run(
+                "apt_install", {"packages": supported},
+                on_output=lambda text: print(text, end="", flush=True))
+        else:
+            result = subprocess.run(["sudo", "apt-get", "install", "--no-remove",
+                                     "--no-install-recommends", "--", *supported],
+                                    check=False)
         if result.returncode:
             print(f"Warning: APT returned {result.returncode}; continuing with development reapply.")
     if args.snaps:
@@ -3965,10 +3980,18 @@ def deploy(args):
                     or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name)
                     or not re.fullmatch(r"[A-Za-z0-9./_-]+", channel)):
                 raise ConfigError("Invalid snap inventory.")
-            command = ["sudo", "snap", "install", name, "--channel=" + channel]
-            if app.get("classic"):
-                command.append("--classic")
-            subprocess.run(command, check=True)
+            if _PRIVILEGE_BROKER is not None:
+                result = _PRIVILEGE_BROKER.run(
+                    "snap_install",
+                    {"name": name, "channel": channel, "classic": bool(app.get("classic"))},
+                    on_output=lambda text: print(text, end="", flush=True))
+                if result.returncode:
+                    raise ConfigError(f"Snap installation failed for {name}.")
+            else:
+                command = ["sudo", "snap", "install", name, "--channel=" + channel]
+                if app.get("classic"):
+                    command.append("--classic")
+                subprocess.run(command, check=True)
     if args.flatpaks:
         flatpak_path = source / "inventory/flatpak-apps.tsv"
         try:
@@ -3998,12 +4021,24 @@ def deploy(args):
             if remote not in remotes_for(scope):
                 print(f"Skipping Flatpak app: configure its trusted {installation} remote first.")
                 continue
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", app) or not re.fullmatch(r"[A-Za-z0-9_.-]+", branch):
+            if (not re.fullmatch(r"[A-Za-z0-9_.-]+", remote)
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]+", app)
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]+", branch)):
                 raise ConfigError("Invalid Flatpak inventory.")
-            command = ["flatpak", "install", scope, "--noninteractive", "--", remote, app + "//" + branch]
-            if installation == "system":
-                command = ["sudo"] + command
-            subprocess.run(command, check=True)
+            if installation == "system" and _PRIVILEGE_BROKER is not None:
+                result = _PRIVILEGE_BROKER.run(
+                    "flatpak_install",
+                    {"installation": "system", "remote": remote,
+                     "app": app, "branch": branch},
+                    on_output=lambda text: print(text, end="", flush=True))
+                if result.returncode:
+                    raise ConfigError(f"Flatpak installation failed for {app}.")
+            else:
+                command = ["flatpak", "install", scope, "--noninteractive",
+                           "--", remote, app + "//" + branch]
+                if installation == "system":
+                    command = ["sudo"] + command
+                subprocess.run(command, check=True)
     rollback = KIT / "rollback" / timestamp()
     development_paths = {item.get("path") for item in developments.get("files", [])}
     for relative in ordered_changed:
@@ -4107,6 +4142,120 @@ _CANCEL_CHILDREN = set()
 _CANCEL_LOCK = threading.Lock()
 _GUI_PROMPT_HANDLER = None
 _GUI_PROCESS_ACTIVE = False
+_PRIVILEGE_BROKER = None
+
+
+class PrivilegeBroker:
+    """One sudo session that runs fixed privileged actions for this process window."""
+
+    def __init__(self):
+        self.process = None
+        self.counter = 0
+        self.lock = threading.Lock()
+
+    def start(self):
+        helper = next((path for path in (
+            SCRIPT_PATH.parent / "ubuntu-backup-askpass",
+            SCRIPT_PATH.parent / "ubuntu-backup-askpass.py",
+        ) if path.is_file() and os.access(path, os.X_OK)), None)
+        env = dict(os.environ)
+        if helper is not None:
+            env["SUDO_ASKPASS"] = str(helper)
+            env["SUDO_ASKPASS_REQUIRE"] = "force"
+        command = ["sudo", "-A", "/usr/bin/python3", "-I", str(SCRIPT_PATH),
+                   "--workspace", str(KIT), "--privilege-broker"]
+        self.process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env,
+            start_new_session=True)
+        line = self.process.stdout.readline()
+        if not line:
+            self.stop()
+            raise ConfigError("The privileged broker did not start; sudo was cancelled or failed.")
+        try:
+            ready = json.loads(line)
+        except ValueError:
+            self.stop()
+            raise ConfigError("The privileged broker returned an invalid startup response.") from None
+        if not ready.get("ready"):
+            self.stop()
+            raise ConfigError("The privileged broker failed to start: " +
+                              str(ready.get("error", "unknown error")))
+
+    def run(self, action, arguments=None, on_output=None):
+        """Run one fixed action, streaming merged output to an optional callback."""
+        with self.lock:
+            if self.process is None or self.process.poll() is not None:
+                raise ConfigError("The privileged broker is no longer running.")
+            self.counter += 1
+            request = {"id": self.counter, "action": action,
+                       "args": arguments or {}}
+            try:
+                self.process.stdin.write(json.dumps(request) + "\n")
+                self.process.stdin.flush()
+            except (OSError, ValueError) as exc:
+                raise ConfigError(f"Privileged broker request failed: {exc}") from None
+            collected = []
+            while True:
+                try:
+                    line = self.process.stdout.readline()
+                except (OSError, ValueError) as exc:
+                    raise ConfigError(f"Privileged broker response failed: {exc}") from None
+                if not line:
+                    raise ConfigError("The privileged broker exited during the request.")
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    raise ConfigError("The privileged broker returned invalid output.") from None
+                if event.get("id") != self.counter:
+                    raise ConfigError("The privileged broker response was out of sequence.")
+                kind = event.get("event")
+                if kind == "output":
+                    text = event.get("data", "")
+                    collected.append(text)
+                    if on_output is not None:
+                        on_output(text)
+                elif kind == "done":
+                    return subprocess.CompletedProcess(
+                        action, int(event.get("returncode", 1)),
+                        "".join(collected), "")
+                elif kind == "error":
+                    raise ConfigError("The privileged broker failed: " +
+                                      str(event.get("error", "unknown error")))
+                else:
+                    raise ConfigError("The privileged broker sent an unknown event.")
+
+    def stop(self):
+        process, self.process = self.process, None
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.stdin.write(json.dumps({"action": "exit"}) + "\n")
+                process.stdin.flush()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except OSError:
+                process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except OSError:
+                    process.kill()
+                process.wait()
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 def _cancel_path():
@@ -4364,10 +4513,15 @@ def capture_system_integration(destination):
     write_json(destination / "inventory/system-integration.json", data)
 
 
-def restore_system_integration(snapshot):
-    """Reinstall and synchronize captured system timer/helper; requires sudo."""
-    if SNAP_MODE:
-        raise ConfigError("System timer/helper restore: " + APT_ONLY_HINT)
+SYSTEM_INTEGRATION_TARGETS = {
+    "service": Path("/etc/systemd/system/ubuntu-configuration-system.service"),
+    "timer": Path("/etc/systemd/system/ubuntu-configuration-system.timer"),
+    "helper": Path("/usr/local/libexec/ubuntu-configuration-system-capture.py"),
+}
+
+
+def _system_integration_records(snapshot):
+    """Resolve captured metadata and the entries that can be reinstalled."""
     snapshot = Path(snapshot)
     metadata = snapshot / "inventory/system-integration.json"
     if metadata.is_file():
@@ -4377,25 +4531,70 @@ def restore_system_integration(snapshot):
         metadata = fallback / "system-integration.json"
         if not metadata.is_file():
             print("No captured system-integration metadata.")
-            return False
+            return None, []
         snapshot = fallback
     data = json.loads(metadata.read_text())
-    targets = {
-        "service": Path("/etc/systemd/system/ubuntu-configuration-system.service"),
-        "timer": Path("/etc/systemd/system/ubuntu-configuration-system.timer"),
-        "helper": Path("/usr/local/libexec/ubuntu-configuration-system-capture.py"),
-    }
     present = [item for item in data.get("items", []) if item.get("present")]
     recoverable = [item for item in present if item.get("stored")]
     if not recoverable:
         print("Backup contains no recoverable system timer/helper contents.")
-        return False
+        return None, []
     if len(recoverable) != len(present):
         print("Warning: some system-integration files were not captured and will be skipped.")
+    return snapshot, recoverable
+
+
+def _install_system_integration_file(role, content):
+    """Atomically install one verified, marker-managed root file."""
+    target = SYSTEM_INTEGRATION_TARGETS[role]
+    mode = 0o700 if role == "helper" else 0o644
+    temporary = target.parent / ("." + target.name + ".ubuntu-backup-" + uuid.uuid4().hex)
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fchmod(output.fileno(), mode)
+                os.fchown(output.fileno(), 0, 0)
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as exc:
+        raise ConfigError(f"Cannot install system-integration {role}: {exc}") from None
+    try:
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        pass
+
+
+def restore_system_integration_root(snapshot, workspace=None):
+    """Root-side verified install of the captured timer/helper."""
+    global KIT
+    if os.geteuid() != 0:
+        raise ConfigError("The system-integration worker must run as root.")
+    if workspace is not None:
+        workspace = Path(workspace).absolute()
+        try:
+            info = workspace.lstat()
+        except OSError:
+            raise ConfigError("Invalid workspace for system-integration restore.") from None
+        if (workspace.is_symlink() or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid == 0):
+            raise ConfigError("Refusing an invalid system-integration workspace.")
+        KIT = workspace
+    snapshot, recoverable = _system_integration_records(snapshot)
+    if snapshot is None:
+        return 3
     marker = b"Managed by ubuntu-configuration"
     for item in recoverable:
         role = item.get("role")
-        if role not in targets or not item.get("stored"):
+        if role not in SYSTEM_INTEGRATION_TARGETS or not item.get("stored"):
             raise ConfigError("Incomplete captured system-integration entry: " + str(role))
         source = checked_path(snapshot, item["stored"])
         content = source.read_bytes()
@@ -4403,32 +4602,45 @@ def restore_system_integration(snapshot):
             raise ConfigError("Captured system-integration checksum mismatch: " + str(role))
         if marker not in content:
             raise ConfigError("Refusing to restore an unmanaged system-integration file: " + str(role))
-        target = targets[role]
+        target = SYSTEM_INTEGRATION_TARGETS[role]
         if target.is_symlink():
             raise ConfigError("Refusing symlinked system-integration target: " + str(target))
         if target.exists():
-            current = target.read_bytes()
-            if marker not in current:
+            if marker not in target.read_bytes():
                 raise ConfigError("Refusing to overwrite unmanaged file: " + str(target))
-        temporary = Path(tempfile.mkdtemp(prefix=".system-integration-", dir=snapshot))
-        staged = temporary / role
-        try:
-            staged.write_bytes(content)
-            staged.chmod(0o700 if role == "helper" else 0o644)
-            subprocess.run(["sudo", "install", "-o", "root", "-g", "root",
-                            "-m", "0700" if role == "helper" else "0644",
-                            str(staged), str(target)], check=True)
-        finally:
-            shutil.rmtree(temporary, ignore_errors=True)
-    subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+        _install_system_integration_file(role, content)
+    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
     timer = next((item for item in recoverable if item.get("role") == "timer"), None)
     if timer is not None:
         if timer.get("enabled") == "enabled":
-            subprocess.run(["sudo", "systemctl", "enable", "--now", "ubuntu-configuration-system.timer"], check=True)
+            subprocess.run(["/usr/bin/systemctl", "enable", "--now",
+                            "ubuntu-configuration-system.timer"], check=True)
         else:
-            subprocess.run(["sudo", "systemctl", "disable", "--now", "ubuntu-configuration-system.timer"], check=False)
+            subprocess.run(["/usr/bin/systemctl", "disable", "--now",
+                            "ubuntu-configuration-system.timer"], check=False)
     print("System-wide timer/helper restored; enabled state synchronized.")
-    return True
+    return 0
+
+
+def restore_system_integration(snapshot):
+    """Reinstall and synchronize captured system timer/helper; requires sudo."""
+    if SNAP_MODE:
+        raise ConfigError("System timer/helper restore: " + APT_ONLY_HINT)
+    snapshot = Path(snapshot)
+    command = ["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH),
+               "--workspace", str(KIT), "_restore-system-integration-worker",
+               "--snapshot", str(snapshot)]
+    if _PRIVILEGE_BROKER is not None:
+        result = _PRIVILEGE_BROKER.run("system_integration", {"snapshot": str(snapshot)})
+    else:
+        result = run_cancellable(command)
+    for line in result.stdout.splitlines():
+        print(line)
+    for line in result.stderr.splitlines():
+        print(line, file=sys.stderr)
+    if result.returncode not in (0, 3):
+        raise ConfigError("System-integration restore worker failed.")
+    return result.returncode == 0
 
 
 def build_snapshot(destination, config):
@@ -4500,7 +4712,13 @@ def capture_root(non_interactive=False, install=False, replace_user_timer=False,
         command.append("--install-system-timer")
     if replace_user_timer:
         command.append("--replace-user-timer")
-    result = run_cancellable(command)
+    if _PRIVILEGE_BROKER is not None:
+        result = _PRIVILEGE_BROKER.run("capture_root", {
+            "install": bool(install),
+            "replace_user_timer": bool(replace_user_timer),
+        })
+    else:
+        result = run_cancellable(command)
     for line in result.stdout.splitlines():
         if hide_followup_hint and line.startswith("Now run the normal backup command without sudo."):
             continue
@@ -4515,7 +4733,8 @@ def capture_root(non_interactive=False, install=False, replace_user_timer=False,
         return
     if result.returncode:
         detail = "System-wide capture failed"
-        errors = [line for line in result.stderr.splitlines() if line.strip()]
+        errors = [line for line in (result.stderr or result.stdout).splitlines()
+                  if line.strip()]
         if errors:
             detail += ": " + errors[-1]
         raise ConfigError(detail)
@@ -5396,6 +5615,232 @@ def preferred_workspace():
     return canonical
 
 
+def _broker_send(message):
+    print(json.dumps(message, separators=(",", ":")), flush=True)
+
+
+def _broker_workspace(workspace, owner_uid):
+    """Accept only the caller's real, user-owned workspace below their home."""
+    try:
+        workspace = Path(workspace)
+        if not workspace.is_absolute() or workspace.is_symlink():
+            return None
+        real = workspace.resolve()
+        home = Path(pwd.getpwuid(owner_uid).pw_dir).resolve()
+        info = real.stat()
+    except (OSError, KeyError, ValueError):
+        return None
+    if not stat.S_ISDIR(info.st_mode) or home not in real.parents:
+        return None
+    if info.st_uid != owner_uid:
+        return None
+    return real
+
+
+def _broker_run(command, request_id, cancel_path, env=None):
+    """Run one fixed worker, stream merged output, and stop it on cancellation."""
+    try:
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, start_new_session=True, env=env)
+    except (OSError, ValueError) as exc:
+        _broker_send({"id": request_id, "event": "error", "error": str(exc)})
+        return None
+    fd = process.stdout.fileno()
+    os.set_blocking(fd, False)
+    cancelled = False
+    killed = False
+    cancel_deadline = 0.0
+    try:
+        while True:
+            if not cancelled and cancel_path.is_file():
+                cancelled = True
+                cancel_deadline = time.monotonic() + 3
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except OSError:
+                    pass
+            elif cancelled and not killed and time.monotonic() >= cancel_deadline:
+                killed = True
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                readable, _, _ = select.select([fd], [], [], 0.2)
+            except InterruptedError:
+                continue
+            if not readable:
+                if process.poll() is not None:
+                    break
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            _broker_send({"id": request_id, "event": "output",
+                          "data": chunk.decode("utf-8", "replace")})
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except OSError:
+                process.kill()
+        process.stdout.close()
+        returncode = process.wait()
+    return returncode
+
+
+def _privilege_broker_loop(workspace):
+    if os.geteuid() != 0:
+        raise ConfigError("The privileged broker must run as root.")
+    owner = os.environ.get("SUDO_UID") or os.environ.get("PKEXEC_UID")
+    if not owner:
+        raise ConfigError("The privileged broker needs SUDO_UID or PKEXEC_UID.")
+    try:
+        owner_uid = int(owner)
+    except ValueError:
+        raise ConfigError("The privileged broker owner is invalid.") from None
+    workspace = _broker_workspace(workspace, owner_uid)
+    if workspace is None:
+        raise ConfigError("The privileged broker workspace is outside the caller's home.")
+    cancel_path = workspace / ".cancel"
+    print(json.dumps({"ready": True}), flush=True)
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+        except ValueError:
+            break
+        if not isinstance(request, dict):
+            continue
+        action = request.get("action")
+        if action == "exit":
+            break
+        request_id = request.get("id")
+        args = request.get("args") if isinstance(request.get("args"), dict) else {}
+        command = ["/usr/bin/python3", "-I", str(SCRIPT_PATH),
+                   "--workspace", str(workspace)]
+        run_env = None
+        if action == "capture_root":
+            if set(args) - {"install", "replace_user_timer"}:
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Unsupported capture-root arguments."})
+                continue
+            command.append("_capture-root-worker")
+            if args.get("install") is True:
+                command.append("--install-system-timer")
+            if args.get("replace_user_timer") is True:
+                command.append("--replace-user-timer")
+        elif action == "package_scan":
+            if args:
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Unsupported package-scan arguments."})
+                continue
+            command.append("_capture-package-files-worker")
+        elif action == "home_capture":
+            run_id = args.get("run_id")
+            if (set(args) != {"run_id"} or not isinstance(run_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", run_id)
+                    or run_id in (".", "..")):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Invalid full /home run identifier."})
+                continue
+            command.extend(["_backup-home-worker", "--run-id", run_id])
+        elif action == "package_restore":
+            if set(args) != {"plan"}:
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Unsupported package-restore arguments."})
+                continue
+            try:
+                plan = Path(str(args.get("plan")))
+                plans = (workspace / "plans").resolve()
+                real_plan = plan.resolve()
+                info = real_plan.lstat()
+            except (OSError, ValueError):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "The package restore plan is invalid."})
+                continue
+            if (real_plan.parent != plans
+                    or real_plan.name != "package-files-restore.json"
+                    or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "The package restore plan is outside the managed plans folder."})
+                continue
+            command.extend(["_restore-package-files-worker", "--plan", str(real_plan)])
+        elif action == "system_integration":
+            if set(args) != {"snapshot"}:
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Unsupported system-integration arguments."})
+                continue
+            try:
+                snapshot = Path(str(args.get("snapshot")))
+                if not snapshot.is_absolute() or snapshot.is_symlink():
+                    raise OSError("not absolute or symlinked")
+                real_snapshot = snapshot.resolve()
+                info = real_snapshot.stat()
+            except (OSError, ValueError):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "The system-integration snapshot is invalid."})
+                continue
+            if (not stat.S_ISDIR(info.st_mode)
+                    or (info.st_uid != owner_uid and workspace not in real_snapshot.parents)):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "The system-integration snapshot is not owned by the caller."})
+                continue
+            command.extend(["_restore-system-integration-worker",
+                            "--snapshot", str(real_snapshot)])
+        elif action == "apt_install":
+            packages = args.get("packages")
+            if (set(args) != {"packages"} or not isinstance(packages, list)
+                    or not packages or len(packages) > 500
+                    or any(not isinstance(name, str) or len(name) > 200
+                           or not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?", name)
+                           for name in packages)):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Invalid APT package list."})
+                continue
+            command = ["/usr/bin/apt-get", "install", "--no-remove",
+                       "--no-install-recommends", "--", *packages]
+            run_env = dict(os.environ)
+            run_env["DEBIAN_FRONTEND"] = "noninteractive"
+        elif action == "snap_install":
+            name, channel = args.get("name"), args.get("channel")
+            classic = args.get("classic", False)
+            if (set(args) - {"name", "channel", "classic"}
+                    or not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name)
+                    or not isinstance(channel, str) or not re.fullmatch(r"[A-Za-z0-9./_-]+", channel)
+                    or not isinstance(classic, bool)):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Invalid snap installation request."})
+                continue
+            command = ["/usr/bin/snap", "install", name, "--channel=" + channel]
+            if classic:
+                command.append("--classic")
+        elif action == "flatpak_install":
+            installation = args.get("installation")
+            remote, app, branch = args.get("remote"), args.get("app"), args.get("branch")
+            if (set(args) != {"installation", "remote", "app", "branch"}
+                    or installation != "system"
+                    or not all(isinstance(value, str) and re.fullmatch(
+                        r"[A-Za-z0-9_.-]+", value)
+                        for value in (remote, app, branch))):
+                _broker_send({"id": request_id, "event": "error",
+                              "error": "Invalid system Flatpak installation request."})
+                continue
+            command = ["/usr/bin/flatpak", "install", "--system", "--noninteractive",
+                       "--", remote, app + "//" + branch]
+        else:
+            _broker_send({"id": request_id, "event": "error",
+                          "error": "Unsupported privileged action."})
+            continue
+        returncode = _broker_run(command, request_id, cancel_path, env=run_env)
+        if returncode is not None:
+            _broker_send({"id": request_id, "event": "done",
+                          "returncode": returncode})
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(
@@ -5408,6 +5853,7 @@ def main():
                         help="Private working folder (default: ~/Ubuntu-Backup/data; "
                              "legacy ~/ubuntu-backup/data is reused when present)")
     parser.add_argument("--non-interactive", action="store_true", help="Never ask questions; use explicit command/options")
+    parser.add_argument("--privilege-broker", action="store_true", help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     descriptions = {
         "menu": "Open the interactive menu (default)",
@@ -5453,6 +5899,8 @@ def main():
     worker = commands.add_parser("_restore-package-files-worker")
     worker.add_argument("--plan", required=True, type=Path)
     worker = commands.add_parser("_capture-package-files-worker")
+    worker = commands.add_parser("_restore-system-integration-worker")
+    worker.add_argument("--snapshot", required=True, type=Path)
     sub = commands.add_parser("restore-package-files",
                               help=("Restore modified package files in place (APT only)"
                                     if SNAP_MODE else
@@ -5516,12 +5964,18 @@ def main():
         parser.print_help()
         return
     workspace = args.workspace or preferred_workspace()
+    if args.privilege_broker:
+        _privilege_broker_loop(workspace)
+        return
     if SNAP_MODE and args.command in (
             "_capture-root-worker", "_backup-home-worker",
-            "_restore-package-files-worker", "_capture-package-files-worker"):
+            "_restore-package-files-worker", "_capture-package-files-worker",
+            "_restore-system-integration-worker"):
         raise ConfigError(
             "Privileged workers are provided by the ubuntu-backup-system package; "
             "the strict snap cannot run them.")
+    if args.command == "_restore-system-integration-worker":
+        sys.exit(restore_system_integration_root(args.snapshot, workspace))
     if args.command == "_capture-root-worker":
         namespace = {"__name__": "root_reference_worker", "__file__": str(workspace.absolute() / "scripts/capture-root-configs.py"), "SELF_SOURCE": EMBEDDED_ROOT_EXPORTER}
         exec(compile(EMBEDDED_ROOT_EXPORTER, "<embedded root-reference exporter>", "exec"), namespace)
@@ -6725,9 +7179,31 @@ def run_logged(command, log_path):
         raise ConfigError(message)
 
 
-def run_home_worker(command, log_path):
+def run_home_worker(command, log_path, run_id=None):
     """Run the mandatory native full-/home worker and report its failures."""
-    run_logged(command, log_path)
+    broker = _PRIVILEGE_BROKER
+    if broker is None or run_id is None:
+        run_logged(command, log_path)
+        return
+    log_path = Path(log_path)
+    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with log_path.open("w") as log:
+        log_path.chmod(0o600)
+
+        def write_output(text):
+            sys.stderr.write(text)
+            sys.stderr.flush()
+            log.write(text)
+            log.flush()
+
+        result = broker.run("home_capture", {"run_id": run_id}, on_output=write_output)
+        _check_cancel()
+    if result.returncode:
+        detail = log_path.read_text(errors="replace")[-2000:].strip()
+        message = f"Full /home worker exited with status {result.returncode}. Log: {log_path}"
+        if detail:
+            message += "\n" + detail
+        raise ConfigError(message)
 
 
 def native_core_path():
@@ -6799,12 +7275,13 @@ def wizard_home_backup(run_id=None):
     if changed:
         print("Hardware/mount layout recorded for this backup.")
         write_json(baseline, identity)
-    print("Starting the sudo, read-only full /home capture.")
+    print("Starting the privileged, read-only full /home capture.")
     run_id = run_id_value(run_id)
     _check_cancel()
     command = ["sudo", "/usr/bin/python3", "-I", str(SCRIPT_PATH),
                "--workspace", str(KIT), "_backup-home-worker", "--run-id", run_id]
-    run_home_worker(command, KIT / "logs" / ("home-worker-" + run_id + ".log"))
+    run_home_worker(command, KIT / "logs" / ("home-worker-" + run_id + ".log"),
+                    run_id=run_id)
     _check_cancel()
     timeline = directory / "timeline" / "home" / ("home-full-" + run_id)
     manifest = verify_home_timeline(timeline)
@@ -7467,8 +7944,9 @@ def run_process_window(title, target, cancellable=True):
         return result["value"]
 
     def worker():
-        global _GUI_PROMPT_HANDLER
+        global _GUI_PROMPT_HANDLER, _PRIVILEGE_BROKER
         _GUI_PROMPT_HANDLER = prompt
+        broker = None
         saved_env = {key: os.environ.get(key)
                      for key in ("SUDO_ASKPASS", "SUDO_ASKPASS_REQUIRE")}
         helper = next((path for path in (
@@ -7482,6 +7960,11 @@ def run_process_window(title, target, cancellable=True):
         ok = False
         cancelled = False
         try:
+            if title in ("Backup", "Restore") and not SNAP_MODE:
+                broker = PrivilegeBroker()
+                broker.start()
+                _PRIVILEGE_BROKER = broker
+                output.put("Privileged session started; one password prompt for this operation.\n")
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                 target()
             ok = True
@@ -7499,6 +7982,9 @@ def run_process_window(title, target, cancellable=True):
         except BaseException as exc:
             output.put(f"\n{type(exc).__name__}: {exc}\n")
         finally:
+            if broker is not None:
+                broker.stop()
+            _PRIVILEGE_BROKER = None
             _finish_operation_cancel(keep_request=cancelled)
             _GUI_PROMPT_HANDLER = None
             for key, value in saved_env.items():

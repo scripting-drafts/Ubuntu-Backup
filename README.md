@@ -18,7 +18,7 @@ The tool also provides package scanning as part of the backup workflow and an op
 
 - GTK desktop interface and tray indicator.
 - Dedicated Backup and Restore process windows with live output, status/history, and cancellation.
-- GUI password prompts for privileged operations.
+- One GUI password prompt per Backup or Restore process window.
 - External backup-drive selection and saved-drive mount management.
 - Scheduled backups.
 - Shared-baseline external storage with dated timeline entries.
