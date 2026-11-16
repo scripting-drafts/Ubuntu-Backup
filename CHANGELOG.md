@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.25 - 2026-11-16
+- Require the broker client PID to match the connected socket peer.
+
 ## v1.3.24 - 2026-11-16
 - Move the privileged broker protocol to a private Unix socket.
 - Verify the client UID, reject unsafe socket paths, and clean up stale sockets.

@@ -129,7 +129,7 @@ class BrokerSocketTests(unittest.TestCase):
                                             {"SUDO_UID": str(uid)}), \
                             mock.patch.object(backup, "_broker_run",
                                               side_effect=fake_run):
-                        backup._privilege_broker_loop(workspace)
+                        backup._privilege_broker_loop(workspace, os.getpid())
                 except BaseException as exc:  # pragma: no cover - surfaced below
                     errors.append(exc)
 

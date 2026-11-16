@@ -4182,7 +4182,8 @@ class PrivilegeBroker:
             path.unlink()
         self.socket_path = path
         command = ["sudo", "-A", "/usr/bin/python3", "-I", str(SCRIPT_PATH),
-                   "--workspace", str(KIT), "--privilege-broker"]
+                   "--workspace", str(KIT), "--privilege-broker",
+                   "--broker-client-pid", str(os.getpid())]
         try:
             self.process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -5871,12 +5872,14 @@ def _broker_request(action, args, workspace, owner_uid):
     return command, run_env
 
 
-def _privilege_broker_loop(workspace):
+def _privilege_broker_loop(workspace, client_pid=None):
     if os.geteuid() != 0:
         raise ConfigError("The privileged broker must run as root.")
     owner = os.environ.get("SUDO_UID") or os.environ.get("PKEXEC_UID")
     if not owner:
         raise ConfigError("The privileged broker needs SUDO_UID or PKEXEC_UID.")
+    if not isinstance(client_pid, int) or client_pid <= 1:
+        raise ConfigError("The privileged broker needs the client process identifier.")
     try:
         owner_uid = int(owner)
     except ValueError:
@@ -5910,8 +5913,8 @@ def _privilege_broker_loop(workspace):
         credentials = connection.getsockopt(
             socket.SOL_SOCKET, getattr(socket, "SO_PEERCRED", 17),
             struct.calcsize("3i"))
-        _, peer_uid, _ = struct.unpack("3i", credentials)
-        if peer_uid != owner_uid:
+        peer_pid, peer_uid, _ = struct.unpack("3i", credentials)
+        if peer_uid != owner_uid or peer_pid != client_pid:
             raise ConfigError("The privileged broker client identity is invalid.")
         reader = connection.makefile("r", encoding="utf-8", newline="\n")
         writer = connection.makefile("w", encoding="utf-8", newline="\n")
@@ -5974,6 +5977,7 @@ def main():
                              "legacy ~/ubuntu-backup/data is reused when present)")
     parser.add_argument("--non-interactive", action="store_true", help="Never ask questions; use explicit command/options")
     parser.add_argument("--privilege-broker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--broker-client-pid", type=int, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     descriptions = {
         "menu": "Open the interactive menu (default)",
@@ -6085,7 +6089,7 @@ def main():
         return
     workspace = args.workspace or preferred_workspace()
     if args.privilege_broker:
-        _privilege_broker_loop(workspace)
+        _privilege_broker_loop(workspace, args.broker_client_pid)
         return
     if SNAP_MODE and args.command in (
             "_capture-root-worker", "_backup-home-worker",
