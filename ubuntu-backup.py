@@ -7501,6 +7501,11 @@ def run_process_window(title, target, cancellable=True):
     thread.start()
 
 
+def _installation_missing():
+    """True when the file this process started from has been removed (package purged)."""
+    return not SCRIPT_PATH.exists()
+
+
 def _tray_lock_paths():
     for variable in ("XDG_RUNTIME_DIR", "XDG_STATE_HOME"):
         value = os.environ.get(variable)
@@ -8205,7 +8210,21 @@ def run_tray():
                      "dialog-warning-symbolic" if state == "cancelled" else "media-record-symbolic")
         return True
 
+    missing_checks = [0]
+
+    def package_removed():
+        if not _installation_missing():
+            missing_checks[0] = 0
+            return True
+        missing_checks[0] += 1
+        if missing_checks[0] < 2:
+            return True
+        print("Ubuntu Backup package files are gone; closing the tray.", file=sys.stderr)
+        Gtk.main_quit()
+        return False
+
     GLib.timeout_add(750, refresh)
+    GLib.timeout_add_seconds(3, package_removed)
     refresh()
     Gtk.main()
     if tray_failed[0]:

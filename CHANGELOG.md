@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.21 - 2026-11-16
+- Close the tray when the installed package files disappear, so purging no
+  longer leaves a ghost indicator for the rest of the session.
+
 ## v1.3.20 - 2026-11-15
 - Publish the debs from the Launchpad PPA `ppa:toomanypatterns/ubuntu-backup`;
   the GitHub Pages APT repository is retired.

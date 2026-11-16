@@ -156,6 +156,19 @@ class TraySingletonTests(unittest.TestCase):
             finally:
                 self._restore(saved)
 
+    def test_installation_missing_tracks_the_running_script(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            script = Path(directory) / "ubuntu-backup.py"
+            script.write_text("# tray entry point\n")
+            saved = backup.SCRIPT_PATH
+            backup.SCRIPT_PATH = script
+            try:
+                self.assertFalse(backup._installation_missing())
+                script.unlink()
+                self.assertTrue(backup._installation_missing())
+            finally:
+                backup.SCRIPT_PATH = saved
+
 
 class DriveGuardTests(unittest.TestCase):
     def test_low_space_is_rejected_before_probe(self):
