@@ -102,6 +102,9 @@ two trays.
 
 ## Boundaries and limitations
 
+- The snap payload is built without the APT-only privilege broker and embedded
+  root exporter. It contains no broker socket, hidden broker command, or
+  `sudo -A` path; the deb packages retain them.
 - The strict snap does not capture dotfiles or `/etc` itself. System-wide
   coverage requires the APT installation (GUI + chained helper); without it, the
   snapshot records an explicit `SYSTEM-WIDE COVERAGE INCOMPLETE` warning.

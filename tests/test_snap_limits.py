@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,6 +72,22 @@ module.capture_root()
         self.assertIn(URL, output)
         self.assertIn("ubuntu-backup-system", output)
         self.assertIn("False", output)  # wizard_home_backup returns False
+
+    def test_snap_payload_strips_privileged_broker(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            target = Path(directory) / "ubuntu-backup.py"
+            target.write_bytes(SCRIPT.read_bytes())
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "snap/local/strip-root-exporter.py"),
+                 str(target)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            body = target.read_text()
+            for forbidden in ("PrivilegeBroker", "--privilege-broker",
+                              "--broker-client-pid", "_privilege_broker_loop",
+                              "_privilege_socket_path", '"sudo", "-A"'):
+                self.assertNotIn(forbidden, body)
+            compile(body, str(target), "exec")
 
     def test_help_tags_only_apply_to_snap(self):
         env = dict(os.environ)

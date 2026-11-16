@@ -1,14 +1,19 @@
 # Changelog
 
+## v1.3.27 - 2026-11-17
+- Strip the APT-only privilege broker and root exporter from the strict snap
+  payload. The snap contains no broker socket, sudo -A path, or hidden broker
+  command; the deb packages retain the broker.
+
 ## v1.3.26 - 2026-11-16
 - Keep the process log autoscrolling when it is not the focused view.
 - Remove the Expand button.
 
 ## v1.3.25 - 2026-11-16
-- Require the broker client PID to match the connected socket peer.
+- Require the APT-only broker client PID to match the connected socket peer.
 
 ## v1.3.24 - 2026-11-16
-- Move the privileged broker protocol to a private Unix socket.
+- Move the APT-only privileged broker protocol to a private Unix socket.
 - Verify the client UID, reject unsafe socket paths, and clean up stale sockets.
 - Stop the active worker when the broker client disconnects.
 
@@ -16,6 +21,7 @@
 - Ask for the sudo password at most once per Backup or Restore process window.
 - Route capture, scan, full /home, system restore, package files, APT, snap and
   system Flatpak steps through one validated root broker.
+  The broker is APT-only; the strict snap does not use it.
 - Stream broker output into the process log and stop the worker group on cancel.
 
 ## v1.3.22 - 2026-11-16
