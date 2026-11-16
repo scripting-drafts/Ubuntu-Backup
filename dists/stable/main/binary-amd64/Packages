@@ -1,14 +1,14 @@
 Package: ubuntu-backup
-Version: 1.3.19
+Version: 1.3.22
 Architecture: all
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
 Installed-Size: 24
-Depends: ubuntu-backup-core (= 1.3.19), ubuntu-backup-system (= 1.3.19), python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, libayatana-appindicator3-1, gir1.2-ayatanaappindicator3-0.1
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup_1.3.19_all.deb
-Size: 4232
-MD5sum: 8dbcd9381b3a3f898c4a333a2ac3a002
-SHA1: b4e8a7b16cb4d56679673b0ad37487e27115ccb5
-SHA256: b65a1abf18ff053f7d19bb08448f56544fce6eed2c4c3008a4393587d9563d13
+Depends: ubuntu-backup-core (= 1.3.22), ubuntu-backup-system (= 1.3.22), python3, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, libayatana-appindicator3-1, gir1.2-ayatanaappindicator3-0.1
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup_1.3.22_all.deb
+Size: 4512
+MD5sum: d53729f3e2f5a3c604c461898e82b2a8
+SHA1: c23bf3f415c37cb3a08c06785d29d7f7f559e106
+SHA256: 7c4ea9555ecce94630b0548ac765b9bf81bd461807d167b2af9823621b2680a3
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
@@ -22,16 +22,16 @@ Description: configuration and full-home backup utility for Ubuntu
 
 Package: ubuntu-backup-core
 Source: ubuntu-backup
-Version: 1.3.19
+Version: 1.3.22
 Architecture: amd64
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
-Installed-Size: 536
-Depends: libc6 (>= 2.34), libssl3 (>= 3.0.0~~alpha1), ubuntu-backup (= 1.3.19), ubuntu-backup-system (= 1.3.19), python3
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup-core_1.3.19_amd64.deb
-Size: 109704
-MD5sum: e849074d60ba21b0bc79e5e45da5fb25
-SHA1: 2c7dfffc15cc12c9d6501f1a658dac86ad0966c7
-SHA256: 423c721876dd669aea22195ab4357ac545fbd97b47dc1885aed450b3fdfc7ca9
+Installed-Size: 538
+Depends: libc6 (>= 2.34), libssl3 (>= 3.0.0~~alpha1), ubuntu-backup (= 1.3.22), ubuntu-backup-system (= 1.3.22), python3
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup-core_1.3.22_amd64.deb
+Size: 110352
+MD5sum: 0750c459530002f1f0deacc62eaece3d
+SHA1: 7640ea81dcb4de55feb716550dac5ca878ab2a80
+SHA256: 4c8aa11a92a8f5f7a4643beef749f2798dcd5315c4f673182381a8397d7e8605
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
@@ -42,16 +42,16 @@ Description: shared application and native core for Ubuntu Backup
 
 Package: ubuntu-backup-system
 Source: ubuntu-backup
-Version: 1.3.19
+Version: 1.3.22
 Architecture: all
 Maintainer: Gerard Sala <creative.gsp@gmail.com>
 Installed-Size: 66
-Depends: ubuntu-backup-core (= 1.3.19), ubuntu-backup (= 1.3.19), init-system-helpers (>= 1.52), python3, pkexec | policykit-1
-Filename: pool/main/u/ubuntu-backup/ubuntu-backup-system_1.3.19_all.deb
-Size: 13408
-MD5sum: 462b72f750a51fb6b0c17875b78f8048
-SHA1: c19dd001f8ccfdc1cbbb6658f605229337800020
-SHA256: ea988a7411b05a278ce38cea91c54cc85ec6cfd903c988a23878813de9e49a9f
+Depends: ubuntu-backup-core (= 1.3.22), ubuntu-backup (= 1.3.22), init-system-helpers (>= 1.52), python3, pkexec | policykit-1
+Filename: pool/main/u/ubuntu-backup/ubuntu-backup-system_1.3.22_all.deb
+Size: 13712
+MD5sum: 0aa8a990bb81fd3ac5c7a49fbbd0cf3e
+SHA1: 3726741869d40fb824b4df2500a8bb0f8d03065c
+SHA256: bb25b65c87a524b17bebb3479793074106b1a6d3e9149ac45156c4f7ea8b4927
 Section: utils
 Priority: optional
 Homepage: https://github.com/scripting-drafts/Ubuntu-Backup
