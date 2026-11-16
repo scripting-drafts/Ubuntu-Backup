@@ -7857,7 +7857,7 @@ def run_process_window(title, target, cancellable=True):
     scroll.add(view)
     outer.pack_start(scroll, True, True, 0)
     buffer = view.get_buffer()
-    autoscroll_mark = buffer.create_mark("autoscroll-end", buffer.get_end_iter(), False)
+    scroll_state = {"pending": False}
     controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     output = queue.Queue()
     state = {"active": True, "ok": False, "cancelled": False}
@@ -7889,10 +7889,22 @@ def run_process_window(title, target, cancellable=True):
         def flush(self):
             pass
 
+    def scroll_to_end():
+        scroll_state["pending"] = False
+        if window.get_visible():
+            adjustment = scroll.get_vadjustment()
+            adjustment.set_value(adjustment.get_upper())
+        return False
+
+    def schedule_scroll():
+        if scroll_state["pending"]:
+            return
+        scroll_state["pending"] = True
+        GLib.timeout_add(10, scroll_to_end)
+
     def append(text):
         buffer.insert(buffer.get_end_iter(), text)
-        buffer.move_mark(autoscroll_mark, buffer.get_end_iter())
-        view.scroll_to_mark(autoscroll_mark, 0.0, True, 0.0, 1.0)
+        schedule_scroll()
 
     def drain():
         if not window.get_visible():
