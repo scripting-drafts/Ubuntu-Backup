@@ -1,3 +1,12 @@
+ubuntu-backup (1.3.24) jammy; urgency=medium
+
+  * Carry the privileged broker protocol over a private Unix socket instead
+    of sudo's stdio, so a sudo pseudo-terminal cannot corrupt requests.
+  * Verify the broker peer UID, reject unsafe socket paths, stop the worker
+    when the client disconnects, and remove stale sockets on failure.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Mon, 16 Nov 2026 19:30:00 +0100
+
 ubuntu-backup (1.3.23) jammy; urgency=medium
 
   * Run every privileged Backup/Restore step through one sudo broker session,

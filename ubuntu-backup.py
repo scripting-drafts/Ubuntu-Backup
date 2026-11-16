@@ -25,6 +25,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -3959,7 +3960,7 @@ def deploy(args):
                 "apt_install", {"packages": supported},
                 on_output=lambda text: print(text, end="", flush=True))
         else:
-            result = subprocess.run(["sudo", "apt-get", "install", "--no-remove",
+            result = subprocess.run(["sudo", "apt-get", "install", "-y", "--no-remove",
                                      "--no-install-recommends", "--", *supported],
                                     check=False)
         if result.returncode:
@@ -4145,11 +4146,19 @@ _GUI_PROCESS_ACTIVE = False
 _PRIVILEGE_BROKER = None
 
 
+def _privilege_socket_path():
+    return KIT / ".privileged-broker.sock"
+
+
 class PrivilegeBroker:
     """One sudo session that runs fixed privileged actions for this process window."""
 
     def __init__(self):
         self.process = None
+        self.socket = None
+        self.reader = None
+        self.writer = None
+        self.socket_path = None
         self.counter = 0
         self.lock = threading.Lock()
 
@@ -4162,43 +4171,70 @@ class PrivilegeBroker:
         if helper is not None:
             env["SUDO_ASKPASS"] = str(helper)
             env["SUDO_ASKPASS_REQUIRE"] = "force"
+        path = _privilege_socket_path()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISSOCK(info.st_mode):
+                raise ConfigError("Refusing an unsafe privileged broker socket path.")
+            path.unlink()
+        self.socket_path = path
         command = ["sudo", "-A", "/usr/bin/python3", "-I", str(SCRIPT_PATH),
                    "--workspace", str(KIT), "--privilege-broker"]
-        self.process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env,
-            start_new_session=True)
-        line = self.process.stdout.readline()
-        if not line:
-            self.stop()
-            raise ConfigError("The privileged broker did not start; sudo was cancelled or failed.")
         try:
-            ready = json.loads(line)
-        except ValueError:
-            self.stop()
-            raise ConfigError("The privileged broker returned an invalid startup response.") from None
-        if not ready.get("ready"):
-            self.stop()
-            raise ConfigError("The privileged broker failed to start: " +
-                              str(ready.get("error", "unknown error")))
+            self.process = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        except OSError as exc:
+            self.stop(force=True)
+            raise ConfigError(f"Cannot start the privileged broker: {exc}") from None
+        deadline = time.monotonic() + 300
+        while True:
+            if _cancel_requested():
+                self.stop(force=True)
+                raise OperationCancelled("Privileged session cancelled.")
+            if self.process.poll() is not None:
+                self.stop(force=True)
+                raise ConfigError("The privileged broker did not start; sudo was cancelled or failed.")
+            candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                candidate.connect(str(path))
+            except (FileNotFoundError, ConnectionRefusedError, PermissionError):
+                candidate.close()
+                if time.monotonic() >= deadline:
+                    self.stop(force=True)
+                    raise ConfigError("Timed out waiting for the privileged broker.")
+                time.sleep(0.1)
+                continue
+            except OSError as exc:
+                candidate.close()
+                self.stop(force=True)
+                raise ConfigError(f"Cannot connect to the privileged broker: {exc}") from None
+            self.socket = candidate
+            self.reader = candidate.makefile("r", encoding="utf-8", newline="\n")
+            self.writer = candidate.makefile("w", encoding="utf-8", newline="\n")
+            return
 
     def run(self, action, arguments=None, on_output=None):
         """Run one fixed action, streaming merged output to an optional callback."""
         with self.lock:
-            if self.process is None or self.process.poll() is not None:
+            if (self.process is None or self.process.poll() is not None
+                    or self.reader is None or self.writer is None):
                 raise ConfigError("The privileged broker is no longer running.")
             self.counter += 1
             request = {"id": self.counter, "action": action,
                        "args": arguments or {}}
             try:
-                self.process.stdin.write(json.dumps(request) + "\n")
-                self.process.stdin.flush()
+                self.writer.write(json.dumps(request) + "\n")
+                self.writer.flush()
             except (OSError, ValueError) as exc:
                 raise ConfigError(f"Privileged broker request failed: {exc}") from None
             collected = []
             while True:
                 try:
-                    line = self.process.stdout.readline()
+                    line = self.reader.readline()
                 except (OSError, ValueError) as exc:
                     raise ConfigError(f"Privileged broker response failed: {exc}") from None
                 if not line:
@@ -4225,37 +4261,70 @@ class PrivilegeBroker:
                 else:
                     raise ConfigError("The privileged broker sent an unknown event.")
 
-    def stop(self):
+    def stop(self, force=False):
         process, self.process = self.process, None
-        if process is None:
-            return
-        try:
-            if process.poll() is None:
-                process.stdin.write(json.dumps({"action": "exit"}) + "\n")
-                process.stdin.flush()
-        except (OSError, ValueError):
-            pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+        writer, self.writer = self.writer, None
+        reader, self.reader = self.reader, None
+        connection, self.socket = self.socket, None
+        path, self.socket_path = self.socket_path, None
+        if writer is not None and not force:
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except OSError:
-                process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except OSError:
-                    process.kill()
-                process.wait()
-        for stream in (process.stdin, process.stdout):
+                writer.write(json.dumps({"action": "exit"}) + "\n")
+                writer.flush()
+            except (OSError, ValueError):
+                pass
+        for stream in (writer, reader):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        if path is not None:
+            try:
+                info = path.lstat()
+                if stat.S_ISSOCK(info.st_mode):
+                    path.unlink()
+            except OSError:
+                pass
+        if process is None:
+            return
+        if force:
+            self._terminate_broker(process)
+            return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                _cancel_path().write_text("stop\n")
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._terminate_broker(process)
+
+    @staticmethod
+    def _terminate_broker(process):
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except OSError:
+                process.kill()
+            process.wait()
 
 
 def _cancel_path():
@@ -5615,10 +5684,6 @@ def preferred_workspace():
     return canonical
 
 
-def _broker_send(message):
-    print(json.dumps(message, separators=(",", ":")), flush=True)
-
-
 def _broker_workspace(workspace, owner_uid):
     """Accept only the caller's real, user-owned workspace below their home."""
     try:
@@ -5637,14 +5702,14 @@ def _broker_workspace(workspace, owner_uid):
     return real
 
 
-def _broker_run(command, request_id, cancel_path, env=None):
+def _broker_run(command, request_id, cancel_path, send, env=None, watch=None):
     """Run one fixed worker, stream merged output, and stop it on cancellation."""
     try:
         process = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, start_new_session=True, env=env)
     except (OSError, ValueError) as exc:
-        _broker_send({"id": request_id, "event": "error", "error": str(exc)})
+        send({"id": request_id, "event": "error", "error": str(exc)})
         return None
     fd = process.stdout.fileno()
     os.set_blocking(fd, False)
@@ -5666,13 +5731,30 @@ def _broker_run(command, request_id, cancel_path, env=None):
                     os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                 except OSError:
                     pass
+            watch_fd = watch.fileno() if watch is not None else None
             try:
-                readable, _, _ = select.select([fd], [], [], 0.2)
+                readable, _, _ = select.select(
+                    [fd] + ([watch_fd] if watch_fd is not None else []),
+                    [], [], 0.2)
             except InterruptedError:
                 continue
+            if watch_fd is not None and watch_fd in readable:
+                try:
+                    disconnected = not watch.recv(1, socket.MSG_PEEK)
+                except OSError:
+                    disconnected = True
+                if disconnected and not cancelled:
+                    cancelled = True
+                    cancel_deadline = time.monotonic() + 3
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    except OSError:
+                        pass
             if not readable:
                 if process.poll() is not None:
                     break
+                continue
+            if fd not in readable:
                 continue
             try:
                 chunk = os.read(fd, 65536)
@@ -5680,8 +5762,8 @@ def _broker_run(command, request_id, cancel_path, env=None):
                 continue
             if not chunk:
                 break
-            _broker_send({"id": request_id, "event": "output",
-                          "data": chunk.decode("utf-8", "replace")})
+            send({"id": request_id, "event": "output",
+                  "data": chunk.decode("utf-8", "replace")})
     finally:
         if process.poll() is None:
             try:
@@ -5691,6 +5773,102 @@ def _broker_run(command, request_id, cancel_path, env=None):
         process.stdout.close()
         returncode = process.wait()
     return returncode
+
+
+def _broker_request(action, args, workspace, owner_uid):
+    """Translate one validated request into a fixed worker or install command."""
+    command = ["/usr/bin/python3", "-I", str(SCRIPT_PATH),
+               "--workspace", str(workspace)]
+    run_env = None
+    if action == "capture_root":
+        if set(args) - {"install", "replace_user_timer"}:
+            raise ConfigError("Unsupported capture-root arguments.")
+        command.append("_capture-root-worker")
+        if args.get("install") is True:
+            command.append("--install-system-timer")
+        if args.get("replace_user_timer") is True:
+            command.append("--replace-user-timer")
+    elif action == "package_scan":
+        if args:
+            raise ConfigError("Unsupported package-scan arguments.")
+        command.append("_capture-package-files-worker")
+    elif action == "home_capture":
+        run_id = args.get("run_id")
+        if (set(args) != {"run_id"} or not isinstance(run_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", run_id)
+                or run_id in (".", "..")):
+            raise ConfigError("Invalid full /home run identifier.")
+        command.extend(["_backup-home-worker", "--run-id", run_id])
+    elif action == "package_restore":
+        if set(args) != {"plan"}:
+            raise ConfigError("Unsupported package-restore arguments.")
+        try:
+            plan = Path(str(args.get("plan")))
+            plans = (workspace / "plans").resolve()
+            real_plan = plan.resolve()
+            info = real_plan.lstat()
+        except (OSError, ValueError):
+            raise ConfigError("The package restore plan is invalid.") from None
+        if (real_plan.parent != plans
+                or real_plan.name != "package-files-restore.json"
+                or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)):
+            raise ConfigError("The package restore plan is outside the managed plans folder.")
+        command.extend(["_restore-package-files-worker", "--plan", str(real_plan)])
+    elif action == "system_integration":
+        if set(args) != {"snapshot"}:
+            raise ConfigError("Unsupported system-integration arguments.")
+        try:
+            snapshot = Path(str(args.get("snapshot")))
+            if not snapshot.is_absolute() or snapshot.is_symlink():
+                raise OSError("not absolute or symlinked")
+            real_snapshot = snapshot.resolve()
+            info = real_snapshot.stat()
+        except (OSError, ValueError):
+            raise ConfigError("The system-integration snapshot is invalid.") from None
+        if (not stat.S_ISDIR(info.st_mode)
+                or (info.st_uid != owner_uid and workspace not in real_snapshot.parents)):
+            raise ConfigError("The system-integration snapshot is not owned by the caller.")
+        command.extend(["_restore-system-integration-worker",
+                        "--snapshot", str(real_snapshot)])
+    elif action == "apt_install":
+        packages = args.get("packages")
+        if (set(args) != {"packages"} or not isinstance(packages, list)
+                or not packages or len(packages) > 500
+                or any(not isinstance(name, str) or len(name) > 200
+                       or not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?", name)
+                       for name in packages)):
+            raise ConfigError("Invalid APT package list.")
+        command = ["/usr/bin/apt-get", "install", "-y", "--no-remove",
+                   "--no-install-recommends", "--", *packages]
+        run_env = dict(os.environ)
+        run_env["DEBIAN_FRONTEND"] = "noninteractive"
+    elif action == "snap_install":
+        name, channel = args.get("name"), args.get("channel")
+        classic = args.get("classic", False)
+        if (set(args) - {"name", "channel", "classic"}
+                or not isinstance(name, str)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name)
+                or not isinstance(channel, str)
+                or not re.fullmatch(r"[A-Za-z0-9./_-]+", channel)
+                or not isinstance(classic, bool)):
+            raise ConfigError("Invalid snap installation request.")
+        command = ["/usr/bin/snap", "install", name, "--channel=" + channel]
+        if classic:
+            command.append("--classic")
+    elif action == "flatpak_install":
+        installation = args.get("installation")
+        remote, app, branch = args.get("remote"), args.get("app"), args.get("branch")
+        if (set(args) != {"installation", "remote", "app", "branch"}
+                or installation != "system"
+                or not all(isinstance(value, str)
+                           and re.fullmatch(r"[A-Za-z0-9_.-]+", value)
+                           for value in (remote, app, branch))):
+            raise ConfigError("Invalid system Flatpak installation request.")
+        command = ["/usr/bin/flatpak", "install", "--system", "--noninteractive",
+                   "--", remote, app + "//" + branch]
+    else:
+        raise ConfigError("Unsupported privileged action.")
+    return command, run_env
 
 
 def _privilege_broker_loop(workspace):
@@ -5707,139 +5885,81 @@ def _privilege_broker_loop(workspace):
     if workspace is None:
         raise ConfigError("The privileged broker workspace is outside the caller's home.")
     cancel_path = workspace / ".cancel"
-    print(json.dumps({"ready": True}), flush=True)
-    for line in sys.stdin:
+    socket_path = workspace / ".privileged-broker.sock"
+    try:
+        info = socket_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISSOCK(info.st_mode):
+            raise ConfigError("Refusing an unsafe privileged broker socket path.")
+        socket_path.unlink()
+    account = pwd.getpwuid(owner_uid)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection = reader = writer = None
+    try:
+        server.bind(str(socket_path))
+        os.chown(socket_path, owner_uid, account.pw_gid)
+        os.chmod(socket_path, 0o600)
+        server.listen(1)
+        server.settimeout(60)
         try:
-            request = json.loads(line)
-        except ValueError:
-            break
-        if not isinstance(request, dict):
-            continue
-        action = request.get("action")
-        if action == "exit":
-            break
-        request_id = request.get("id")
-        args = request.get("args") if isinstance(request.get("args"), dict) else {}
-        command = ["/usr/bin/python3", "-I", str(SCRIPT_PATH),
-                   "--workspace", str(workspace)]
-        run_env = None
-        if action == "capture_root":
-            if set(args) - {"install", "replace_user_timer"}:
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Unsupported capture-root arguments."})
-                continue
-            command.append("_capture-root-worker")
-            if args.get("install") is True:
-                command.append("--install-system-timer")
-            if args.get("replace_user_timer") is True:
-                command.append("--replace-user-timer")
-        elif action == "package_scan":
-            if args:
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Unsupported package-scan arguments."})
-                continue
-            command.append("_capture-package-files-worker")
-        elif action == "home_capture":
-            run_id = args.get("run_id")
-            if (set(args) != {"run_id"} or not isinstance(run_id, str)
-                    or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", run_id)
-                    or run_id in (".", "..")):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Invalid full /home run identifier."})
-                continue
-            command.extend(["_backup-home-worker", "--run-id", run_id])
-        elif action == "package_restore":
-            if set(args) != {"plan"}:
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Unsupported package-restore arguments."})
-                continue
-            try:
-                plan = Path(str(args.get("plan")))
-                plans = (workspace / "plans").resolve()
-                real_plan = plan.resolve()
-                info = real_plan.lstat()
-            except (OSError, ValueError):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "The package restore plan is invalid."})
-                continue
-            if (real_plan.parent != plans
-                    or real_plan.name != "package-files-restore.json"
-                    or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "The package restore plan is outside the managed plans folder."})
-                continue
-            command.extend(["_restore-package-files-worker", "--plan", str(real_plan)])
-        elif action == "system_integration":
-            if set(args) != {"snapshot"}:
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Unsupported system-integration arguments."})
-                continue
-            try:
-                snapshot = Path(str(args.get("snapshot")))
-                if not snapshot.is_absolute() or snapshot.is_symlink():
-                    raise OSError("not absolute or symlinked")
-                real_snapshot = snapshot.resolve()
-                info = real_snapshot.stat()
-            except (OSError, ValueError):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "The system-integration snapshot is invalid."})
-                continue
-            if (not stat.S_ISDIR(info.st_mode)
-                    or (info.st_uid != owner_uid and workspace not in real_snapshot.parents)):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "The system-integration snapshot is not owned by the caller."})
-                continue
-            command.extend(["_restore-system-integration-worker",
-                            "--snapshot", str(real_snapshot)])
-        elif action == "apt_install":
-            packages = args.get("packages")
-            if (set(args) != {"packages"} or not isinstance(packages, list)
-                    or not packages or len(packages) > 500
-                    or any(not isinstance(name, str) or len(name) > 200
-                           or not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?", name)
-                           for name in packages)):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Invalid APT package list."})
-                continue
-            command = ["/usr/bin/apt-get", "install", "--no-remove",
-                       "--no-install-recommends", "--", *packages]
-            run_env = dict(os.environ)
-            run_env["DEBIAN_FRONTEND"] = "noninteractive"
-        elif action == "snap_install":
-            name, channel = args.get("name"), args.get("channel")
-            classic = args.get("classic", False)
-            if (set(args) - {"name", "channel", "classic"}
-                    or not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name)
-                    or not isinstance(channel, str) or not re.fullmatch(r"[A-Za-z0-9./_-]+", channel)
-                    or not isinstance(classic, bool)):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Invalid snap installation request."})
-                continue
-            command = ["/usr/bin/snap", "install", name, "--channel=" + channel]
-            if classic:
-                command.append("--classic")
-        elif action == "flatpak_install":
-            installation = args.get("installation")
-            remote, app, branch = args.get("remote"), args.get("app"), args.get("branch")
-            if (set(args) != {"installation", "remote", "app", "branch"}
-                    or installation != "system"
-                    or not all(isinstance(value, str) and re.fullmatch(
-                        r"[A-Za-z0-9_.-]+", value)
-                        for value in (remote, app, branch))):
-                _broker_send({"id": request_id, "event": "error",
-                              "error": "Invalid system Flatpak installation request."})
-                continue
-            command = ["/usr/bin/flatpak", "install", "--system", "--noninteractive",
-                       "--", remote, app + "//" + branch]
-        else:
-            _broker_send({"id": request_id, "event": "error",
-                          "error": "Unsupported privileged action."})
-            continue
-        returncode = _broker_run(command, request_id, cancel_path, env=run_env)
-        if returncode is not None:
-            _broker_send({"id": request_id, "event": "done",
-                          "returncode": returncode})
+            connection, _ = server.accept()
+        except socket.timeout:
+            raise ConfigError("The privileged broker client did not connect.") from None
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, getattr(socket, "SO_PEERCRED", 17),
+            struct.calcsize("3i"))
+        _, peer_uid, _ = struct.unpack("3i", credentials)
+        if peer_uid != owner_uid:
+            raise ConfigError("The privileged broker client identity is invalid.")
+        reader = connection.makefile("r", encoding="utf-8", newline="\n")
+        writer = connection.makefile("w", encoding="utf-8", newline="\n")
 
+        def send(message):
+            writer.write(json.dumps(message, separators=(",", ":")) + "\n")
+            writer.flush()
+
+        for line in reader:
+            try:
+                request = json.loads(line)
+            except ValueError:
+                break
+            if not isinstance(request, dict):
+                continue
+            action = request.get("action")
+            if action == "exit":
+                break
+            request_id = request.get("id")
+            args = request.get("args") if isinstance(request.get("args"), dict) else {}
+            try:
+                command, run_env = _broker_request(action, args, workspace, owner_uid)
+            except ConfigError as exc:
+                send({"id": request_id, "event": "error", "error": str(exc)})
+                continue
+            returncode = _broker_run(command, request_id, cancel_path, send,
+                                     env=run_env, watch=connection)
+            if returncode is not None:
+                send({"id": request_id, "event": "done", "returncode": returncode})
+    finally:
+        for stream in (writer, reader):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        server.close()
+        try:
+            info = socket_path.lstat()
+            if stat.S_ISSOCK(info.st_mode):
+                socket_path.unlink()
+        except OSError:
+            pass
 
 def main():
     os.umask(0o077)

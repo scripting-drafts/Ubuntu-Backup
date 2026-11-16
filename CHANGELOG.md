@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.24 - 2026-11-16
+- Move the privileged broker protocol to a private Unix socket.
+- Verify the client UID, reject unsafe socket paths, and clean up stale sockets.
+- Stop the active worker when the broker client disconnects.
+
 ## v1.3.23 - 2026-11-16
 - Ask for the sudo password at most once per Backup or Restore process window.
 - Route capture, scan, full /home, system restore, package files, APT, snap and
