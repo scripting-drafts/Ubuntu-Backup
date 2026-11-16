@@ -20,7 +20,7 @@ PPA_HOST="https://ppa.launchpadcontent.net/toomanypatterns/ubuntu-backup/ubuntu"
 DIST="jammy"
 DPUT_TARGET="${DPUT_TARGET:-ubuntu-backup}"
 SIGN_KEY="${SIGN_KEY:-F104A3F1CE9A23540AEB8F24F31978E49E85DDCA}"
-WAIT_MAX="${WAIT_MAX:-5400}"
+WAIT_MAX="${WAIT_MAX:-10800}"
 WAIT_STEP="${WAIT_STEP:-60}"
 
 case "$REPO" in
