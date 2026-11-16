@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.22 - 2026-11-16
+- Merge Live status into the Backup and Restore windows.
+- Add an Expand control so the full process log can use the whole screen.
+- Disable AT-SPI in the sudo askpass to silence the accessibility-bus warning.
+
 ## v1.3.21 - 2026-11-16
 - Close the tray when the installed package files disappear, so purging no
   longer leaves a ghost indicator for the rest of the session.

@@ -1,6 +1,10 @@
 #!/usr/bin/python3 -I
 """GTK askpass helper used by sudo for privileged Ubuntu Backup steps."""
+import os
 import sys
+
+# The sudo askpass process has no user accessibility bus; disable AT-SPI.
+os.environ.setdefault("NO_AT_BRIDGE", "1")
 
 
 def main():

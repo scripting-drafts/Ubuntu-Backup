@@ -7240,13 +7240,17 @@ def run_process_window(title, target, cancellable=True):
     _GUI_PROCESS_ACTIVE = True
 
     window = Gtk.Window(title="Ubuntu Backup — " + title)
-    window.set_default_size(760, 460)
+    window.set_default_size(920, 620)
     window.set_icon_name("ubuntu-backup")
     window.set_border_width(12)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     window.add(outer)
     progress = Gtk.ProgressBar()
     outer.pack_start(progress, False, False, 0)
+    status_label = Gtk.Label(xalign=0, yalign=0)
+    status_label.set_selectable(True)
+    status_label.set_line_wrap(True)
+    outer.pack_start(status_label, False, False, 0)
     view = Gtk.TextView(editable=False, monospace=True)
     scroll = Gtk.ScrolledWindow()
     scroll.add(view)
@@ -7285,6 +7289,17 @@ def run_process_window(title, target, cancellable=True):
     close_button.set_sensitive(False)
     close_button.connect("clicked", lambda _button: window.destroy())
     controls.pack_end(close_button, False, False, 0)
+    expand_button = Gtk.Button(label="Expand")
+    expand_button.set_tooltip_text("Show the complete log at maximum window size.")
+    def toggle_expand(_button):
+        if window.is_maximized():
+            window.unmaximize()
+            expand_button.set_label("Expand")
+        else:
+            window.maximize()
+            expand_button.set_label("Restore size")
+    expand_button.connect("clicked", toggle_expand)
+    controls.pack_start(expand_button, False, False, 0)
     outer.pack_start(controls, False, False, 0)
 
     class Writer:
@@ -7324,16 +7339,25 @@ def run_process_window(title, target, cancellable=True):
         close_button.set_label("Close")
         cancel_button.set_sensitive(False)
         cancel_button.set_visible(False)
+        status_label.set_text("Process cancelled." if cancelled else
+                              "Process finished." if ok else "Process failed.")
         if cancelled:
             append("\nProcess cancelled.\n")
         else:
             append("\nProcess finished.\n" if ok else "\nProcess failed.\n")
         return False
 
-    def pulse():
+    def update_process_status():
         if not state["active"] or not window.get_visible():
             return False
-        progress.pulse()
+        data = _read_tray_status()
+        phase = data.get("phase") or "idle"
+        message = data.get("message") or ""
+        status_label.set_text(f"State: {data.get('state', 'idle')} | Phase: {phase}\n{message}")
+        if data.get("state") == "running":
+            progress.pulse()
+        elif data.get("state") == "complete":
+            progress.set_fraction(1.0)
         return True
 
     def prompt(kind, message, default, choices=None):
@@ -7496,7 +7520,7 @@ def run_process_window(title, target, cancellable=True):
     window.connect("delete-event", close_requested)
     window.show_all()
     GLib.timeout_add(100, drain)
-    GLib.timeout_add(250, pulse)
+    GLib.timeout_add(500, update_process_status)
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
@@ -7735,12 +7759,9 @@ def run_tray():
                 _status_history("cancelled", message)
             GLib.idle_add(lambda: (show_drive_chooser(then_backup=True), False)[1])
             return
-        show_status()
         run_process_window("Backup", lambda: backup_everything())
 
     def restore_action(_item=None):
-        show_status()
-
         def run_restore():
             _write_status("running", "recovery", "Recovery started")
             _status_history("started", "Recovery started")
