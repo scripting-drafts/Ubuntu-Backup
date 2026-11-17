@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.31 - 2026-11-17
+- Reduce the Backup/Restore process-window default to 720x420.
+
 ## v1.3.30 - 2026-11-17
 - Stop restoring maximized state; Backup/Restore windows reopen at the last
   normal size.

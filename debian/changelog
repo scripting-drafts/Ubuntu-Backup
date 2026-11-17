@@ -1,3 +1,10 @@
+ubuntu-backup (1.3.31) jammy; urgency=medium
+
+  * Reduce the Backup/Restore process-window default to 720x420 with tighter
+    spacing and borders.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Tue, 17 Nov 2026 13:30:00 +0100
+
 ubuntu-backup (1.3.30) jammy; urgency=medium
 
   * Stop restoring the maximized state. Backup/Restore process windows reopen

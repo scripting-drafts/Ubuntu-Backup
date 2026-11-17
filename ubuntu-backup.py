@@ -7828,7 +7828,7 @@ def _root_home_backup_locked(workspace, run_id=None):
         os.close(fd)
 
 
-PROCESS_WINDOW_DEFAULT = (920, 620)
+PROCESS_WINDOW_DEFAULT = (720, 420)
 PROCESS_WINDOW_STATE = "config/process-window.json"
 
 
@@ -7869,8 +7869,8 @@ def run_process_window(title, target, cancellable=True):
     window = Gtk.Window(title="Ubuntu Backup — " + title)
     window.set_default_size(geometry["width"], geometry["height"])
     window.set_icon_name("ubuntu-backup")
-    window.set_border_width(12)
-    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    window.set_border_width(10)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     window.add(outer)
     geometry_pending = {"id": None}
 

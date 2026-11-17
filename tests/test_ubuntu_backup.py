@@ -2692,7 +2692,7 @@ class ProcessWindowGeometryTests(unittest.TestCase):
 
     def test_missing_state_uses_default(self):
         self.assertEqual(backup._read_process_window_geometry(), {
-            "width": 920, "height": 620})
+            "width": 720, "height": 420})
 
     def test_round_trip(self):
         backup._write_process_window_geometry(1280, 800)
@@ -2711,7 +2711,7 @@ class ProcessWindowGeometryTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps({"width": 100, "height": 100}))
         self.assertEqual(backup._read_process_window_geometry(), {
-            "width": 920, "height": 620})
+            "width": 720, "height": 420})
 
 
 if __name__ == "__main__":
