@@ -7828,6 +7828,36 @@ def _root_home_backup_locked(workspace, run_id=None):
         os.close(fd)
 
 
+PROCESS_WINDOW_DEFAULT = (920, 620)
+PROCESS_WINDOW_STATE = "config/process-window.json"
+
+
+def _read_process_window_geometry():
+    """Return the last Backup/Restore window size, or the safe default."""
+    try:
+        data = json.loads((KIT / PROCESS_WINDOW_STATE).read_text())
+    except (OSError, ValueError):
+        data = {}
+    width = data.get("width") if isinstance(data, dict) else None
+    height = data.get("height") if isinstance(data, dict) else None
+    maximized = data.get("maximized", False) if isinstance(data, dict) else False
+    if (type(width) is not int or type(height) is not int
+            or not 400 <= width <= 10000 or not 300 <= height <= 10000):
+        width, height = PROCESS_WINDOW_DEFAULT
+        maximized = False
+    if not isinstance(maximized, bool):
+        maximized = False
+    return {"width": width, "height": height, "maximized": maximized}
+
+
+def _write_process_window_geometry(width, height, maximized):
+    write_json(KIT / PROCESS_WINDOW_STATE, {
+        "width": int(width),
+        "height": int(height),
+        "maximized": bool(maximized),
+    })
+
+
 def run_process_window(title, target, cancellable=True):
     """Run a Python action in a GTK log window with GUI prompts and sudo askpass."""
     global _GUI_PROMPT_HANDLER, _GUI_PROCESS_ACTIVE
@@ -7840,12 +7870,49 @@ def run_process_window(title, target, cancellable=True):
     _reset_operation_cancel()
     _GUI_PROCESS_ACTIVE = True
 
+    geometry = _read_process_window_geometry()
+    start_maximized = geometry["maximized"]
     window = Gtk.Window(title="Ubuntu Backup — " + title)
-    window.set_default_size(920, 620)
+    window.set_default_size(geometry["width"], geometry["height"])
     window.set_icon_name("ubuntu-backup")
     window.set_border_width(12)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     window.add(outer)
+    geometry_pending = {"id": None}
+
+    def save_geometry():
+        source_id = geometry_pending["id"]
+        geometry_pending["id"] = None
+        if source_id is not None:
+            try:
+                GLib.source_remove(source_id)
+            except (GLib.Error, ValueError):
+                pass
+        try:
+            _write_process_window_geometry(geometry["width"], geometry["height"],
+                                           geometry["maximized"])
+        except (OSError, ValueError):
+            pass
+        return False
+
+    def schedule_geometry_save():
+        if geometry_pending["id"] is None:
+            geometry_pending["id"] = GLib.timeout_add(400, save_geometry)
+
+    def on_configure(_window, _event):
+        if window.is_maximized():
+            geometry["maximized"] = True
+        else:
+            width, height = window.get_size()
+            if width > 1 and height > 1:
+                geometry["width"] = width
+                geometry["height"] = height
+                geometry["maximized"] = False
+        schedule_geometry_save()
+        return False
+
+    window.connect("configure-event", on_configure)
+    window.connect("destroy", lambda _window: save_geometry())
     progress = Gtk.ProgressBar()
     outer.pack_start(progress, False, False, 0)
     status_label = Gtk.Label(xalign=0, yalign=0)
@@ -8117,6 +8184,8 @@ def run_process_window(title, target, cancellable=True):
 
     window.connect("delete-event", close_requested)
     window.show_all()
+    if start_maximized:
+        window.maximize()
     GLib.timeout_add(100, drain)
     GLib.timeout_add(500, update_process_status)
     thread = threading.Thread(target=worker, daemon=True)

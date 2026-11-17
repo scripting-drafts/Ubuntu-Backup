@@ -2680,5 +2680,32 @@ class DeployCompatibilityTests(unittest.TestCase):
             self.assertTrue((kit / "plans/last-deploy.json").is_file())
 
 
+class ProcessWindowGeometryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
+        self.saved = backup.KIT
+        backup.KIT = Path(self.temporary.name)
+
+    def tearDown(self):
+        backup.KIT = self.saved
+        self.temporary.cleanup()
+
+    def test_missing_state_uses_default(self):
+        self.assertEqual(backup._read_process_window_geometry(), {
+            "width": 920, "height": 620, "maximized": False})
+
+    def test_round_trip(self):
+        backup._write_process_window_geometry(1280, 800, True)
+        self.assertEqual(backup._read_process_window_geometry(), {
+            "width": 1280, "height": 800, "maximized": True})
+
+    def test_invalid_dimensions_use_default(self):
+        path = backup.KIT / backup.PROCESS_WINDOW_STATE
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"width": 100, "height": 100, "maximized": True}))
+        self.assertEqual(backup._read_process_window_geometry(), {
+            "width": 920, "height": 620, "maximized": False})
+
+
 if __name__ == "__main__":
     unittest.main()

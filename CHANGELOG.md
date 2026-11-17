@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.28 - 2026-11-17
+- Remember the last Backup/Restore process-window size and maximized state.
+
 ## v1.3.27 - 2026-11-17
 - Strip the APT-only privilege broker and root exporter from the strict snap
   payload. The snap contains no broker socket, sudo -A path, or hidden broker

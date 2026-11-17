@@ -1,3 +1,10 @@
+ubuntu-backup (1.3.28) jammy; urgency=medium
+
+  * Remember the last Backup/Restore process-window size and maximized state
+    and restore it when the next process window opens.
+
+ -- Gerard Sala <creative.gsp@gmail.com>  Tue, 17 Nov 2026 10:00:00 +0100
+
 ubuntu-backup (1.3.27) jammy; urgency=medium
 
   * Strip the APT-only privilege broker and root exporter from the strict snap
