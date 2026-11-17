@@ -7840,21 +7840,16 @@ def _read_process_window_geometry():
         data = {}
     width = data.get("width") if isinstance(data, dict) else None
     height = data.get("height") if isinstance(data, dict) else None
-    maximized = data.get("maximized", False) if isinstance(data, dict) else False
     if (type(width) is not int or type(height) is not int
             or not 400 <= width <= 10000 or not 300 <= height <= 10000):
         width, height = PROCESS_WINDOW_DEFAULT
-        maximized = False
-    if not isinstance(maximized, bool):
-        maximized = False
-    return {"width": width, "height": height, "maximized": maximized}
+    return {"width": width, "height": height}
 
 
-def _write_process_window_geometry(width, height, maximized):
+def _write_process_window_geometry(width, height):
     write_json(KIT / PROCESS_WINDOW_STATE, {
         "width": int(width),
         "height": int(height),
-        "maximized": bool(maximized),
     })
 
 
@@ -7871,7 +7866,6 @@ def run_process_window(title, target, cancellable=True):
     _GUI_PROCESS_ACTIVE = True
 
     geometry = _read_process_window_geometry()
-    start_maximized = geometry["maximized"]
     window = Gtk.Window(title="Ubuntu Backup — " + title)
     window.set_default_size(geometry["width"], geometry["height"])
     window.set_icon_name("ubuntu-backup")
@@ -7889,8 +7883,7 @@ def run_process_window(title, target, cancellable=True):
             except (GLib.Error, ValueError):
                 pass
         try:
-            _write_process_window_geometry(geometry["width"], geometry["height"],
-                                           geometry["maximized"])
+            _write_process_window_geometry(geometry["width"], geometry["height"])
         except (OSError, ValueError):
             pass
         return False
@@ -7900,14 +7893,13 @@ def run_process_window(title, target, cancellable=True):
             geometry_pending["id"] = GLib.timeout_add(400, save_geometry)
 
     def on_configure(_window, _event):
-        if window.is_maximized():
-            geometry["maximized"] = True
-        else:
+        # Keep the normal size: a maximized/tiled configure event must not
+        # replace it with the screen dimensions.
+        if not window.is_maximized():
             width, height = window.get_size()
             if width > 1 and height > 1:
                 geometry["width"] = width
                 geometry["height"] = height
-                geometry["maximized"] = False
         schedule_geometry_save()
         return False
 
@@ -8187,8 +8179,6 @@ def run_process_window(title, target, cancellable=True):
 
     window.connect("delete-event", close_requested)
     window.show_all()
-    if start_maximized:
-        window.maximize()
     GLib.timeout_add(100, drain)
     GLib.timeout_add(500, update_process_status)
     thread = threading.Thread(target=worker, daemon=True)

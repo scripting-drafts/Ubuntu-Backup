@@ -2692,19 +2692,26 @@ class ProcessWindowGeometryTests(unittest.TestCase):
 
     def test_missing_state_uses_default(self):
         self.assertEqual(backup._read_process_window_geometry(), {
-            "width": 920, "height": 620, "maximized": False})
+            "width": 920, "height": 620})
 
     def test_round_trip(self):
-        backup._write_process_window_geometry(1280, 800, True)
+        backup._write_process_window_geometry(1280, 800)
         self.assertEqual(backup._read_process_window_geometry(), {
-            "width": 1280, "height": 800, "maximized": True})
+            "width": 1280, "height": 800})
+
+    def test_old_maximized_flag_is_not_restored(self):
+        path = backup.KIT / backup.PROCESS_WINDOW_STATE
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"width": 1400, "height": 968, "maximized": True}))
+        self.assertEqual(backup._read_process_window_geometry(), {
+            "width": 1400, "height": 968})
 
     def test_invalid_dimensions_use_default(self):
         path = backup.KIT / backup.PROCESS_WINDOW_STATE
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({"width": 100, "height": 100, "maximized": True}))
+        path.write_text(json.dumps({"width": 100, "height": 100}))
         self.assertEqual(backup._read_process_window_geometry(), {
-            "width": 920, "height": 620, "maximized": False})
+            "width": 920, "height": 620})
 
 
 if __name__ == "__main__":
