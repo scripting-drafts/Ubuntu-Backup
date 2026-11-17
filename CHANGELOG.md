@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.29 - 2026-11-17
+- Wrap process-window logging to the window width and keep the log pane
+  expanding with the restored window size.
+
 ## v1.3.28 - 2026-11-17
 - Remember the last Backup/Restore process-window size and maximized state.
 
